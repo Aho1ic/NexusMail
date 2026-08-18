@@ -1,0 +1,425 @@
+openapi: 3.1.0
+info:
+  title: NexusMail API
+  version: 0.1.0
+  description: Single-user unified mail gateway. Browser clients use a session cookie and CSRF token; external clients use X-API-Key.
+servers:
+  - url: /
+security:
+  - apiKey: []
+  - sessionCookie: []
+paths:
+  /api/v1/auth/session:
+    post:
+      security: []
+      summary: Exchange the deployment API key for a browser session
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [api_key]
+              properties:
+                api_key: { type: string, minLength: 32 }
+      responses:
+        '201':
+          description: Session created
+          headers:
+            Set-Cookie: { schema: { type: string } }
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  csrf_token: { type: string }
+                  expires_at: { type: integer, format: int64 }
+        '401': { $ref: '#/components/responses/Error' }
+    delete:
+      summary: End the browser session
+      responses:
+        '204': { description: Session deleted }
+  /api/v1/accounts:
+    get:
+      summary: List accounts and connection health
+      responses:
+        '200':
+          description: Account list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/Account' } }
+    post:
+      summary: Add a password account or begin an OAuth flow
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AccountInput' }
+      responses:
+        '201':
+          description: Password account created
+          content: { application/json: { schema: { $ref: '#/components/schemas/Account' } } }
+        '202':
+          description: OAuth authorization required
+          content:
+            application/json:
+              schema:
+                type: object
+                properties: { authorization_url: { type: string, format: uri } }
+        '400': { $ref: '#/components/responses/Error' }
+  /api/v1/oauth/{provider}/callback:
+    get:
+      security: []
+      summary: Complete Google or Microsoft OAuth authorization
+      parameters:
+        - { $ref: '#/components/parameters/Provider' }
+        - { in: query, name: state, required: true, schema: { type: string } }
+        - { in: query, name: code, required: true, schema: { type: string } }
+      responses:
+        '302': { description: Redirect to the SPA }
+        '400': { $ref: '#/components/responses/Error' }
+  /api/v1/accounts/{id}/mailboxes:
+    get:
+      summary: List account mailboxes
+      parameters: [ { $ref: '#/components/parameters/ID' } ]
+      responses:
+        '200':
+          description: Mailboxes
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/Mailbox' } }
+  /api/v1/messages:
+    get:
+      summary: Query the unified message feed
+      parameters:
+        - { in: query, name: account_id, schema: { type: integer, format: int64 } }
+        - { in: query, name: mailbox_id, schema: { type: integer, format: int64 } }
+        - { in: query, name: folder, schema: { type: string } }
+        - { in: query, name: is_read, schema: { type: boolean } }
+        - { in: query, name: query, schema: { type: string } }
+        - { in: query, name: cursor, schema: { type: string } }
+        - { in: query, name: limit, schema: { type: integer, minimum: 1, maximum: 100, default: 50 } }
+      responses:
+        '200':
+          description: Keyset page
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/Message' } }
+                  next_cursor: { type: string }
+  /api/v1/messages/{id}:
+    get:
+      summary: Read a message; queues body retrieval when necessary
+      parameters: [ { $ref: '#/components/parameters/ID' } ]
+      responses:
+        '200': { $ref: '#/components/responses/MessageDetail' }
+        '202': { $ref: '#/components/responses/MessageDetail' }
+        '404': { $ref: '#/components/responses/Error' }
+    patch:
+      summary: Change read/starred state or archive remotely
+      parameters: [ { $ref: '#/components/parameters/ID' } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                is_read: { type: boolean }
+                is_starred: { type: boolean }
+                archive: { type: boolean }
+      responses:
+        '200':
+          description: Updated message
+          content: { application/json: { schema: { $ref: '#/components/schemas/Message' } } }
+  /api/v1/messages/{id}/attachments/{attachment_id}:
+    get:
+      summary: Fetch and stream an attachment
+      parameters:
+        - { $ref: '#/components/parameters/ID' }
+        - { in: path, name: attachment_id, required: true, schema: { type: integer, format: int64 } }
+      responses:
+        '200':
+          description: Attachment bytes
+          content: { application/octet-stream: { schema: { type: string, contentEncoding: binary } } }
+        '404': { $ref: '#/components/responses/Error' }
+  /api/v1/drafts:
+    get:
+      summary: List drafts or outbox entries
+      parameters:
+        - { in: query, name: status, schema: { $ref: '#/components/schemas/DraftStatus' } }
+      responses:
+        '200':
+          description: Drafts
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/Draft' } }
+    post:
+      summary: Create a local draft
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/DraftInput' } } }
+      responses:
+        '201':
+          description: Draft created
+          content: { application/json: { schema: { $ref: '#/components/schemas/Draft' } } }
+  /api/v1/drafts/{id}:
+    get:
+      summary: Get a draft and its attachments
+      parameters: [ { $ref: '#/components/parameters/ID' } ]
+      responses:
+        '200':
+          description: Draft detail
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  draft: { $ref: '#/components/schemas/Draft' }
+                  attachments: { type: array, items: { $ref: '#/components/schemas/DraftAttachment' } }
+    patch:
+      summary: Update a draft using optimistic locking
+      parameters:
+        - { $ref: '#/components/parameters/ID' }
+        - { in: header, name: If-Match, required: true, schema: { type: string }, description: Current revision, optionally quoted }
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/DraftInput' } } }
+      responses:
+        '200':
+          description: Updated draft
+          headers: { ETag: { schema: { type: string } } }
+          content: { application/json: { schema: { $ref: '#/components/schemas/Draft' } } }
+        '409': { $ref: '#/components/responses/Error' }
+        '428': { $ref: '#/components/responses/Error' }
+    delete:
+      summary: Delete a draft
+      parameters: [ { $ref: '#/components/parameters/ID' } ]
+      responses: { '204': { description: Draft deleted } }
+  /api/v1/drafts/{id}/attachments:
+    post:
+      summary: Add an attachment to a draft
+      parameters: [ { $ref: '#/components/parameters/ID' } ]
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties: { file: { type: string, format: binary } }
+      responses:
+        '201':
+          description: Attachment created
+          content: { application/json: { schema: { $ref: '#/components/schemas/DraftAttachment' } } }
+  /api/v1/drafts/{id}/attachments/{attachment_id}:
+    delete:
+      summary: Remove a draft attachment
+      parameters:
+        - { $ref: '#/components/parameters/ID' }
+        - { in: path, name: attachment_id, required: true, schema: { type: integer, format: int64 } }
+      responses: { '204': { description: Attachment removed } }
+  /api/v1/drafts/{id}/send:
+    post:
+      summary: Queue a draft for delivery
+      parameters: [ { $ref: '#/components/parameters/ID' } ]
+      responses: { '202': { $ref: '#/components/responses/Queued' } }
+  /api/v1/drafts/{id}/retry:
+    post:
+      summary: Explicitly retry a failed or unknown delivery
+      parameters: [ { $ref: '#/components/parameters/ID' } ]
+      responses: { '202': { $ref: '#/components/responses/Queued' } }
+  /api/v1/ws:
+    get:
+      summary: Upgrade to the realtime WebSocket stream
+      responses:
+        '101': { description: WebSocket upgrade }
+  /healthz:
+    get:
+      security: []
+      summary: Process liveness
+      responses:
+        '200': { description: Process is alive }
+  /readyz:
+    get:
+      security: []
+      summary: Database readiness
+      responses:
+        '200': { description: Ready to serve }
+        '503': { description: Database is not ready }
+
+components:
+  securitySchemes:
+    apiKey: { type: apiKey, in: header, name: X-API-Key }
+    sessionCookie: { type: apiKey, in: cookie, name: nexusmail_session }
+  parameters:
+    ID: { in: path, name: id, required: true, schema: { type: integer, format: int64, minimum: 1 } }
+    Provider: { in: path, name: provider, required: true, schema: { type: string, enum: [gmail, outlook] } }
+  responses:
+    Error:
+      description: Error response
+      content: { application/json: { schema: { $ref: '#/components/schemas/ErrorEnvelope' } } }
+    MessageDetail:
+      description: Message body may still be queued when status is 202
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              message: { $ref: '#/components/schemas/Message' }
+              attachments: { type: array, items: { $ref: '#/components/schemas/Attachment' } }
+    Queued:
+      description: Accepted for asynchronous delivery
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              id: { type: integer, format: int64 }
+              status: { type: string, const: queued }
+  schemas:
+    AccountInput:
+      type: object
+      required: [provider]
+      properties:
+        provider: { type: string, enum: [qq, '163', gmail, outlook] }
+        email: { type: string, format: email }
+        display_name: { type: string }
+        username: { type: string }
+        auth:
+          type: object
+          properties:
+            type: { type: string, enum: [password, oauth2] }
+            password: { type: string }
+    Account:
+      type: object
+      required: [id, email, provider, status]
+      properties:
+        id: { type: integer, format: int64 }
+        email: { type: string, format: email }
+        display_name: { type: string }
+        provider: { type: string, enum: [qq, '163', gmail, outlook] }
+        auth_type: { type: string, enum: [password, oauth2] }
+        username: { type: string }
+        status: { type: string, enum: [disconnected, connecting, syncing, connected, backoff, auth_error, error] }
+        last_error: { type: [string, 'null'] }
+        last_connected_at: { type: [integer, 'null'], format: int64 }
+        created_at: { type: integer, format: int64 }
+        updated_at: { type: integer, format: int64 }
+    Mailbox:
+      type: object
+      properties:
+        id: { type: integer, format: int64 }
+        account_id: { type: integer, format: int64 }
+        remote_name: { type: string }
+        display_name: { type: string }
+        role: { type: string, enum: [inbox, sent, drafts, archive, trash, junk, all, custom] }
+        sync_mode: { type: string, enum: [realtime, periodic, lazy] }
+        uid_validity: { type: integer }
+        last_uid: { type: integer }
+        last_sync_at: { type: [integer, 'null'], format: int64 }
+    Message:
+      type: object
+      properties:
+        id: { type: integer, format: int64 }
+        account_id: { type: integer, format: int64 }
+        direction: { type: string, enum: [incoming, outgoing] }
+        rfc_message_id: { type: [string, 'null'] }
+        subject: { type: string }
+        sender: { type: string }
+        recipients: { type: string }
+        from: { type: string, description: JSON address array }
+        to: { type: string, description: JSON address array }
+        cc: { type: string, description: JSON address array }
+        bcc: { type: string, description: JSON address array }
+        snippet: { type: string }
+        body_text: { type: string }
+        body_html: { type: string, description: Server-sanitized HTML }
+        body_state: { type: string, enum: [metadata, queued, fetching, ready, error] }
+        size_bytes: { type: integer, format: int64 }
+        received_at: { type: integer, format: int64 }
+        is_read: { type: boolean }
+        is_starred: { type: boolean }
+        has_attachments: { type: boolean }
+    Attachment:
+      type: object
+      properties:
+        id: { type: integer, format: int64 }
+        message_id: { type: integer, format: int64 }
+        part_id: { type: string }
+        filename: { type: string }
+        content_type: { type: string }
+        size_bytes: { type: integer, format: int64 }
+        fetch_state: { type: string, enum: [metadata, fetching, ready, error] }
+    DraftStatus:
+      type: string
+      enum: [draft, queued, sending, retry_wait, failed, unknown, sent]
+    DraftInput:
+      type: object
+      required: [account_id]
+      properties:
+        account_id: { type: integer, format: int64 }
+        source_message_id: { type: [integer, 'null'], format: int64 }
+        to: { type: array, items: { type: string, format: email } }
+        cc: { type: array, items: { type: string, format: email } }
+        bcc: { type: array, items: { type: string, format: email } }
+        subject: { type: string }
+        body_text: { type: string }
+    Draft:
+      type: object
+      properties:
+        id: { type: integer, format: int64 }
+        account_id: { type: integer, format: int64 }
+        rfc_message_id: { type: string }
+        revision: { type: integer, format: int64 }
+        to: { type: string, description: JSON address array }
+        cc: { type: string, description: JSON address array }
+        bcc: { type: string, description: JSON address array }
+        subject: { type: string }
+        body_text: { type: string }
+        status: { $ref: '#/components/schemas/DraftStatus' }
+        remote_sync_state: { type: string, enum: [dirty, syncing, synced, error, conflict] }
+        attempt_count: { type: integer }
+        last_error: { type: [string, 'null'] }
+        created_at: { type: integer, format: int64 }
+        updated_at: { type: integer, format: int64 }
+    DraftAttachment:
+      type: object
+      properties:
+        id: { type: integer, format: int64 }
+        draft_id: { type: integer, format: int64 }
+        filename: { type: string }
+        content_type: { type: string }
+        size_bytes: { type: integer, format: int64 }
+        position: { type: integer }
+    Event:
+      type: object
+      required: [type, sequence, occurred_at, data]
+      properties:
+        type: { type: string, enum: [NEW_EMAIL, MESSAGE_UPDATED, ACCOUNT_STATUS, SYNC_PROGRESS, DRAFT_UPDATED, OUTBOX_UPDATED] }
+        sequence: { type: integer, format: int64 }
+        occurred_at: { type: integer, format: int64 }
+        data: { type: object, additionalProperties: true }
+    ErrorEnvelope:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message, request_id]
+          properties:
+            code: { type: string }
+            message: { type: string }
+            request_id: { type: string }
+            details: {}

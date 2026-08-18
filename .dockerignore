@@ -1,0 +1,15 @@
+.git
+.github
+.DS_Store
+.env
+.env.*
+!.env.example
+bin
+data
+coverage
+web/node_modules
+web/dist
+internal/transport/http/static/dist
+*.db
+*.db-shm
+*.db-wal

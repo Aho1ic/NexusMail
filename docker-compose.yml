@@ -1,0 +1,36 @@
+services:
+  nexusmail:
+    build:
+      context: .
+    image: nexusmail:local
+    restart: unless-stopped
+    init: true
+    ports:
+      - "8080:8080"
+    environment:
+      NEXUSMAIL_LISTEN_ADDR: ":8080"
+      NEXUSMAIL_DATA_DIR: /data
+      NEXUSMAIL_DATABASE_PATH: /data/mail.db
+      NEXUSMAIL_PUBLIC_URL: ${NEXUSMAIL_PUBLIC_URL:-http://localhost:8080}
+      NEXUSMAIL_API_KEY: ${NEXUSMAIL_API_KEY:?set NEXUSMAIL_API_KEY in .env}
+      NEXUSMAIL_MASTER_KEY: ${NEXUSMAIL_MASTER_KEY:?set NEXUSMAIL_MASTER_KEY in .env}
+      NEXUSMAIL_GOOGLE_CLIENT_ID: ${NEXUSMAIL_GOOGLE_CLIENT_ID:-}
+      NEXUSMAIL_GOOGLE_CLIENT_SECRET: ${NEXUSMAIL_GOOGLE_CLIENT_SECRET:-}
+      NEXUSMAIL_MICROSOFT_CLIENT_ID: ${NEXUSMAIL_MICROSOFT_CLIENT_ID:-}
+      NEXUSMAIL_MICROSOFT_CLIENT_SECRET: ${NEXUSMAIL_MICROSOFT_CLIENT_SECRET:-}
+      NEXUSMAIL_BLOB_CACHE_BYTES: ${NEXUSMAIL_BLOB_CACHE_BYTES:-2147483648}
+      NEXUSMAIL_MAX_OUTBOUND_BYTES: ${NEXUSMAIL_MAX_OUTBOUND_BYTES:-20971520}
+      NEXUSMAIL_LOG_LEVEL: ${NEXUSMAIL_LOG_LEVEL:-info}
+      TZ: ${TZ:-Asia/Shanghai}
+    volumes:
+      - nexusmail-data:/data
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/readyz"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+    stop_grace_period: 20s
+
+volumes:
+  nexusmail-data:
