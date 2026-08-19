@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math/rand/v2"
 	"mime"
 	"net"
@@ -610,7 +611,10 @@ func (s *Supervisor) closeCommand(rt *runtime, client *imapclient.Client) {
 }
 func (s *Supervisor) setError(ctx context.Context, id int64, status string, err error) {
 	value := err.Error()
-	_ = s.repo.UpdateAccountStatus(ctx, id, status, &value)
+	if updateErr := s.repo.UpdateAccountStatus(ctx, id, status, &value); updateErr != nil {
+		slog.Error("mail account status update failed", "account_id", id, "status", status, "error", updateErr)
+	}
+	slog.Error("mail account sync failed", "account_id", id, "status", status, "error", value)
 	s.events.Publish(ports.Event{Type: "ACCOUNT_STATUS", Data: map[string]any{"account_id": id, "status": status, "error": value}})
 }
 func waitBackoff(ctx context.Context, delay time.Duration) bool {

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -85,6 +86,9 @@ func (m *Manager) Exchange(ctx context.Context, provider, state, code string) (e
 	if token.RefreshToken == "" {
 		return "", "", "", errors.New("provider did not return a refresh token; revoke consent and try again")
 	}
+	if err := verifyMailScope(provider, token); err != nil {
+		return "", "", "", err
+	}
 	email, err = fetchEmail(ctx, oauthConfig.Client(ctx, token), provider)
 	if err != nil {
 		return "", "", "", err
@@ -112,6 +116,9 @@ func (m *Manager) AccessToken(ctx context.Context, account domain.Account, refre
 	token, err := oauthConfig.TokenSource(ctx, &oauth2.Token{RefreshToken: refreshToken}).Token()
 	if err != nil {
 		return "", fmt.Errorf("refresh OAuth token: %w", err)
+	}
+	if err := verifyMailScope(account.Provider, token); err != nil {
+		return "", err
 	}
 	entry.Token = token
 	return token.AccessToken, nil
@@ -141,6 +148,46 @@ func (m *Manager) providerConfig(provider string) (*oauth2.Config, error) {
 	default:
 		return nil, errors.New("provider does not support OAuth")
 	}
+}
+
+// mailScopes lists the scope each provider must grant for IMAP and SMTP access.
+var mailScopes = map[string]string{
+	"gmail":   "https://mail.google.com/",
+	"outlook": "https://outlook.office.com/IMAP.AccessAsUser.All",
+}
+
+// verifyMailScope rejects tokens that carry no mailbox access. Providers silently drop
+// restricted scopes that the OAuth client is not cleared for and still return a usable
+// token, which would otherwise surface much later as an opaque IMAP credential failure.
+func verifyMailScope(provider string, token *oauth2.Token) error {
+	required, ok := mailScopes[provider]
+	if !ok {
+		return nil
+	}
+	granted, _ := token.Extra("scope").(string)
+	if strings.TrimSpace(granted) == "" {
+		return nil
+	}
+	if scopeGranted(granted, required) {
+		return nil
+	}
+	return fmt.Errorf("%s granted [%s] but not the required %s scope; enable the provider mail API and add that scope to the OAuth consent screen, then authorize again", provider, strings.Join(strings.Fields(granted), " "), required)
+}
+
+func scopeGranted(granted, required string) bool {
+	required = strings.ToLower(required)
+	short := required
+	if trimmed := strings.TrimSuffix(required, "/"); trimmed != "" {
+		if index := strings.LastIndex(trimmed, "/"); index >= 0 {
+			short = trimmed[index+1:]
+		}
+	}
+	for _, value := range strings.Fields(strings.ToLower(granted)) {
+		if value == required || value == short {
+			return true
+		}
+	}
+	return false
 }
 
 func fetchEmail(ctx context.Context, client *http.Client, provider string) (string, error) {
