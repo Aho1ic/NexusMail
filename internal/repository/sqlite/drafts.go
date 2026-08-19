@@ -70,6 +70,13 @@ func (s *Store) ReconcileRemoteDraft(ctx context.Context, remote *domain.Draft) 
 	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var local domain.Draft
 		err := tx.Where("account_id = ? AND rfc_message_id = ?", remote.AccountID, remote.RFCMessageID).First(&local).Error
+		if errors.Is(err, gorm.ErrRecordNotFound) && remote.RemoteMailboxID != nil && remote.RemoteUID != nil {
+			// Some providers drop or rewrite Message-Id on APPEND, so a draft we
+			// uploaded comes back under a different RFC id and looks new. The
+			// remote UID still identifies the row and carries a unique index, so
+			// match on it before inserting a duplicate that cannot be stored.
+			err = tx.Where("remote_mailbox_id = ? AND remote_uid = ?", *remote.RemoteMailboxID, *remote.RemoteUID).First(&local).Error
+		}
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			if err := tx.Create(remote).Error; err != nil {
 				return err
@@ -100,6 +107,9 @@ func (s *Store) ReconcileRemoteDraft(ctx context.Context, remote *domain.Draft) 
 			copy.RFCMessageID = fmt.Sprintf("<conflict-%d-%d@nexusmail.local>", local.ID, time.Now().UnixNano())
 			copy.RemoteSyncState = "conflict"
 			copy.Subject = "[冲突副本] " + copy.Subject
+			// The remote UID maps to exactly one row and the dirty local draft keeps
+			// it, so the copy is stored as a local-only snapshot instead.
+			copy.RemoteMailboxID, copy.RemoteUIDValidity, copy.RemoteUID = nil, nil, nil
 			if err := tx.Create(&copy).Error; err != nil {
 				return err
 			}

@@ -541,7 +541,17 @@ func (s *Supervisor) syncMailbox(ctx context.Context, client *imapclient.Client,
 				}
 				changed, draftID, err := s.storeRemoteDraft(ctx, mailbox, fetched, raw)
 				if err != nil {
-					return err
+					if ctx.Err() != nil {
+						return err
+					}
+					// Failing the whole mailbox here would abort before the cursor
+					// advances, so one unstorable draft would stall every sync for
+					// the account, including the inbox. Skip just this message.
+					slog.Error("remote draft import failed", "account_id", mailbox.AccountID, "mailbox_id", mailbox.ID, "uid", fetched.UID, "error", err)
+					if uint32(fetched.UID) > lastUID {
+						lastUID = uint32(fetched.UID)
+					}
+					continue
 				}
 				if changed {
 					s.events.Publish(ports.Event{Type: "DRAFT_UPDATED", Data: map[string]any{"draft_id": draftID, "account_id": mailbox.AccountID, "remote": true}})

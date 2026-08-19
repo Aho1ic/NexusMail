@@ -168,6 +168,85 @@ func TestRemoteDraftReconciliation(t *testing.T) {
 
 func ptr32(value uint32) *uint32 { return &value }
 
+// TestRemoteDraftRewrittenMessageID covers providers that drop or rewrite
+// Message-Id on APPEND: the draft we uploaded comes back under a synthetic RFC
+// id, and matching on that alone used to insert a second row holding the same
+// remote UID, which the unique index rejected and which failed every later sync
+// of the account.
+func TestRemoteDraftRewrittenMessageID(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+	account, mailbox := seedAccountMailbox(t, store)
+	now := time.Now().UnixMilli()
+	uid, validity := uint32(9), mailbox.UIDValidity
+	local := domain.Draft{
+		AccountID: account.ID, RFCMessageID: "<6b2608c5@nexusmail.local>", Revision: 1,
+		ToJSON: "[]", CCJSON: "[]", BCCJSON: "[]", Subject: "uploaded", BodyText: "body",
+		Status: "draft", RemoteSyncState: "synced", RemoteMailboxID: &mailbox.ID,
+		RemoteUIDValidity: &validity, RemoteUID: &uid, RemoteUpdatedAt: &now,
+		CreatedAt: now, UpdatedAt: now,
+	}
+	if err := store.CreateDraft(ctx, &local); err != nil {
+		t.Fatal(err)
+	}
+
+	remote := local
+	remote.ID, remote.RFCMessageID = 0, "<remote-1-4-42-9@nexusmail.local>"
+	matched, changed, err := store.ReconcileRemoteDraft(ctx, &remote)
+	if err != nil {
+		t.Fatalf("reconcile rewritten message id: %v", err)
+	}
+	if matched.ID != local.ID || changed {
+		t.Fatalf("want existing draft %d unchanged, got id=%d changed=%v", local.ID, matched.ID, changed)
+	}
+	drafts, err := store.ListDrafts(ctx, "")
+	if err != nil || len(drafts) != 1 {
+		t.Fatalf("want a single draft row, got %d err=%v", len(drafts), err)
+	}
+}
+
+// TestRemoteDraftConflictCopyReleasesRemoteUID pins that a conflict copy does
+// not claim the remote UID still held by the dirty local draft, since the
+// unique index maps that UID to exactly one row.
+func TestRemoteDraftConflictCopyReleasesRemoteUID(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+	account, mailbox := seedAccountMailbox(t, store)
+	now := time.Now().UnixMilli()
+	uid, validity := uint32(9), mailbox.UIDValidity
+	local := domain.Draft{
+		AccountID: account.ID, RFCMessageID: "<shared@example.com>", Revision: 1,
+		ToJSON: "[]", CCJSON: "[]", BCCJSON: "[]", Subject: "local edit", BodyText: "local body",
+		Status: "draft", RemoteSyncState: "dirty", RemoteMailboxID: &mailbox.ID,
+		RemoteUIDValidity: &validity, RemoteUID: &uid, RemoteUpdatedAt: &now,
+		CreatedAt: now, UpdatedAt: now,
+	}
+	if err := store.CreateDraft(ctx, &local); err != nil {
+		t.Fatal(err)
+	}
+
+	// Same UID, a new UIDVALIDITY, and a timestamp inside the clock-skew window.
+	remote := local
+	remote.ID, remote.Subject = 0, "remote edit"
+	remote.RemoteUIDValidity = ptr32(validity + 1)
+	copyTime := now + 1_000
+	remote.RemoteUpdatedAt, remote.UpdatedAt = &copyTime, copyTime
+	conflict, changed, err := store.ReconcileRemoteDraft(ctx, &remote)
+	if err != nil {
+		t.Fatalf("reconcile conflict copy: %v", err)
+	}
+	if !changed || conflict.ConflictOfID == nil || *conflict.ConflictOfID != local.ID {
+		t.Fatalf("want conflict copy of draft %d, got %#v changed=%v", local.ID, conflict, changed)
+	}
+	if conflict.RemoteUID != nil || conflict.RemoteMailboxID != nil || conflict.RemoteUIDValidity != nil {
+		t.Fatalf("conflict copy must not claim the remote UID, got %#v", conflict)
+	}
+	kept, _, err := store.GetDraft(ctx, local.ID)
+	if err != nil || kept.RemoteUID == nil || *kept.RemoteUID != uid {
+		t.Fatalf("local draft must keep the remote UID, got %#v err=%v", kept, err)
+	}
+}
+
 func openTestStore(t *testing.T) *Store {
 	t.Helper()
 	store, err := Open(filepath.Join(t.TempDir(), "mail.db"))
