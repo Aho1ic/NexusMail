@@ -12,10 +12,11 @@ COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
 COPY --from=web-builder /src/web/dist ./internal/transport/http/static/dist
+ARG VERSION=dev
 RUN CGO_ENABLED=1 GOOS=linux go build \
     -tags sqlite_fts5 \
     -trimpath \
-    -ldflags="-s -w -linkmode external -extldflags '-static'" \
+    -ldflags="-s -w -linkmode external -extldflags '-static' -X nexusmail/internal/version.Value=${VERSION}" \
     -o /out/nexusmail ./cmd/server
 
 FROM alpine:3.23
@@ -25,6 +26,9 @@ RUN apk add --no-cache ca-certificates tzdata \
     && mkdir -p /data \
     && chown nexusmail:nexusmail /data
 COPY --from=go-builder /out/nexusmail /usr/local/bin/nexusmail
+ARG VERSION=dev
+LABEL org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.title="NexusMail"
 USER nexusmail:nexusmail
 VOLUME ["/data"]
 EXPOSE 8080
