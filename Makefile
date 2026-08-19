@@ -1,13 +1,15 @@
 .PHONY: dev build test test-race web-install web-build web-test test-e2e docker-build clean
 
 GO_TAGS := sqlite_fts5
+VERSION ?= $(shell cat VERSION)
+LDFLAGS := -X nexusmail/internal/version.Value=$(VERSION)
 
 dev:
 	go run -tags $(GO_TAGS) ./cmd/server
 
 build: web-build
 	mkdir -p bin
-	go build -tags $(GO_TAGS) -trimpath -o bin/nexusmail ./cmd/server
+	go build -tags $(GO_TAGS) -trimpath -ldflags "$(LDFLAGS)" -o bin/nexusmail ./cmd/server
 
 test:
 	go test -tags $(GO_TAGS) ./...
@@ -31,7 +33,7 @@ test-e2e:
 	cd web && npm run test:e2e
 
 docker-build:
-	docker build -t nexusmail:local .
+	docker build --build-arg VERSION=$(VERSION) -t nexusmail:local .
 
 clean:
 	rm -rf bin web/dist coverage

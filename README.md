@@ -24,6 +24,19 @@ docker compose up --build
 
 生产环境必须把 `NEXUSMAIL_PUBLIC_URL` 改为最终 HTTPS 地址。所有 secret 均支持同名 `_FILE` 变量，例如 `NEXUSMAIL_MASTER_KEY_FILE=/run/secrets/master_key`。
 
+## 版本与镜像发布
+
+版本号由根目录的 `VERSION` 文件统一管理，当前为 `0.1.0`。`make build` 和 `make docker-build` 会读取该文件，通过 `-ldflags` 注入 `internal/version.Value`，服务启动时以 `nexusmail starting` 日志输出版本。
+
+推送到 `main` 且改动 `VERSION` 时，`.github/workflows/publish-image.yml` 构建并推送镜像：
+
+- Docker Hub：`docker.io/<DOCKERHUB_USERNAME>/nexusmail`
+- GHCR：`ghcr.io/chenqi92/nexusmail`
+
+每次发布推送 `<version>`、`v<version>` 和 `latest` 三个标签。发布前需在仓库 Actions secret 中配置 `DOCKERHUB_USERNAME` 和 `DOCKERHUB_TOKEN`；GHCR 使用工作流内置的 `GITHUB_TOKEN`。工作流也支持在 Actions 页面手动 `workflow_dispatch` 触发。
+
+发布新版本：修改 `VERSION` 内容（例如 `0.2.0`）并提交到 `main`。`VERSION` 不符合 `MAJOR.MINOR.PATCH` 格式时工作流会直接失败。
+
 ## 本地开发
 
 ```bash
