@@ -6,12 +6,12 @@ services:
     restart: unless-stopped
     init: true
     ports:
-      - "8080:8080"
+      - "13737:8080"
     environment:
       NEXUSMAIL_LISTEN_ADDR: ":8080"
       NEXUSMAIL_DATA_DIR: /data
       NEXUSMAIL_DATABASE_PATH: /data/mail.db
-      NEXUSMAIL_PUBLIC_URL: ${NEXUSMAIL_PUBLIC_URL:-http://localhost:8080}
+      NEXUSMAIL_PUBLIC_URL: ${NEXUSMAIL_PUBLIC_URL:-http://localhost:13737}
       NEXUSMAIL_API_KEY: ${NEXUSMAIL_API_KEY:?set NEXUSMAIL_API_KEY in .env}
       NEXUSMAIL_MASTER_KEY: ${NEXUSMAIL_MASTER_KEY:?set NEXUSMAIL_MASTER_KEY in .env}
       NEXUSMAIL_GOOGLE_CLIENT_ID: ${NEXUSMAIL_GOOGLE_CLIENT_ID:-}

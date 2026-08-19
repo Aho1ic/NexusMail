@@ -17,10 +17,10 @@ openssl rand -base64 32
 docker compose up --build
 ```
 
-打开 `http://localhost:8080`，输入 API Key 换取 HttpOnly 浏览器会话。QQ/163 账户应填写服务商生成的客户端授权码；Gmail/Outlook 还需在 `.env` 配置 OAuth Client，并把回调地址设为：
+打开 `http://localhost:13737`，输入 API Key 换取 HttpOnly 浏览器会话。QQ/163 账户应填写服务商生成的客户端授权码；Gmail/Outlook 还需在 `.env` 配置 OAuth Client，并把回调地址设为：
 
-- `http://localhost:8080/api/v1/oauth/gmail/callback`
-- `http://localhost:8080/api/v1/oauth/outlook/callback`
+- `http://localhost:13737/api/v1/oauth/gmail/callback`
+- `http://localhost:13737/api/v1/oauth/outlook/callback`
 
 生产环境必须把 `NEXUSMAIL_PUBLIC_URL` 改为最终 HTTPS 地址。所有 secret 均支持同名 `_FILE` 变量，例如 `NEXUSMAIL_MASTER_KEY_FILE=/run/secrets/master_key`。
 
