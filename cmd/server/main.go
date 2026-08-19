@@ -25,6 +25,7 @@ import (
 	sessionservice "nexusmail/internal/service/session"
 	"nexusmail/internal/storage"
 	httptransport "nexusmail/internal/transport/http"
+	"nexusmail/internal/version"
 )
 
 func main() {
@@ -45,6 +46,7 @@ func run() error {
 	}
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: level}))
 	slog.SetDefault(logger)
+	slog.Info("nexusmail starting", "version", version.Value)
 
 	rootCtx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
