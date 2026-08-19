@@ -54,6 +54,11 @@ func (h *Hub) Publish(event ports.Event) {
 	}
 }
 
+// keepaliveInterval bounds how long a silently dead connection can look
+// healthy. Without it a client can wait indefinitely for events that are being
+// written into a broken socket.
+const keepaliveInterval = 20 * time.Second
+
 func (h *Hub) Serve(ctx context.Context, conn *websocket.Conn) {
 	readCtx := conn.CloseRead(ctx)
 	c := &client{conn: conn, send: make(chan []byte, 64), done: make(chan struct{})}
@@ -66,6 +71,8 @@ func (h *Hub) Serve(ctx context.Context, conn *websocket.Conn) {
 		h.mu.Unlock()
 		c.stop()
 	}()
+	keepalive := time.NewTicker(keepaliveInterval)
+	defer keepalive.Stop()
 	for {
 		select {
 		case <-ctx.Done():
@@ -74,6 +81,13 @@ func (h *Hub) Serve(ctx context.Context, conn *websocket.Conn) {
 			return
 		case <-c.done:
 			return
+		case <-keepalive.C:
+			pingCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+			err := conn.Ping(pingCtx)
+			cancel()
+			if err != nil {
+				return
+			}
 		case payload := <-c.send:
 			writeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 			err := conn.Write(writeCtx, websocket.MessageText, payload)

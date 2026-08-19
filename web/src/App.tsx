@@ -73,8 +73,9 @@ function MailboxApp({ onLogout }: { onLogout: () => void }) {
     try { setMailboxes((await api.mailboxes(accountID)).items) } catch (err) { setError(messageOf(err)) }
   }, [])
 
-  const loadMessages = useCallback(async (append = false, nextCursor?: string) => {
-    setLoading(true); setError('')
+  const loadMessages = useCallback(async (append = false, nextCursor?: string, quiet = false) => {
+    if (!quiet) setLoading(true)
+    setError('')
     const params = new URLSearchParams({ limit: '40' })
     if (selectedAccount) params.set('account_id', String(selectedAccount))
     if (selectedMailbox) params.set('mailbox_id', String(selectedMailbox)); else params.set('folder', 'inbox')
@@ -93,7 +94,10 @@ function MailboxApp({ onLogout }: { onLogout: () => void }) {
   useEffect(() => { loadMessages() }, [loadMessages])
 
   const refresh = useCallback(() => { loadAccounts(); loadMailboxes(selectedAccount); loadMessages() }, [loadAccounts, loadMailboxes, loadMessages, selectedAccount])
-  useRealtime(refresh)
+  // Realtime arrivals refresh without the spinner so incoming mail does not
+  // make the list flicker.
+  const refreshQuietly = useCallback(() => { loadAccounts(); loadMessages(false, undefined, true) }, [loadAccounts, loadMessages])
+  useRealtime(refreshQuietly)
 
   async function openMessage(message: Message) {
     setSelected(message); setPane('detail'); setDetails(null)
@@ -302,17 +306,35 @@ function prepareMessageHTML(input: string, attachments: Attachment[], messageID:
   return document.body.innerHTML
 }
 
+const realtimeEvents = ['NEW_EMAIL', 'MESSAGE_UPDATED', 'ACCOUNT_STATUS', 'OUTBOX_UPDATED']
+
+// Notification is absent in insecure contexts and some browsers; a throw here
+// would kill the socket handler and stall realtime updates.
+function notify() {
+  try { if ('Notification' in window && Notification.permission === 'granted') new Notification('NexusMail 收到新邮件') }
+  catch { /* notifications are best-effort */ }
+}
+
 function useRealtime(onChange: () => void) {
+  // Events are not persisted server-side, so the socket must outlive filter
+  // changes. Holding the callback in a ref keeps one connection for the
+  // session instead of reconnecting whenever the mailbox or query changes.
+  const handler = useRef(onChange)
+  useEffect(() => { handler.current = onChange }, [onChange])
   useEffect(() => {
-    let socket: WebSocket | undefined; let timer = 0; let stopped = false; let delay = 1000
+    let socket: WebSocket | undefined; let timer = 0; let coalesce = 0; let stopped = false; let delay = 250
+    // A backlog of body fetches emits a burst of events; coalesce them into one refresh.
+    const schedule = () => { window.clearTimeout(coalesce); coalesce = window.setTimeout(() => handler.current(), 80) }
     const connect = () => {
       const scheme = location.protocol === 'https:' ? 'wss' : 'ws'; socket = new WebSocket(`${scheme}://${location.host}/api/v1/ws`)
-      socket.onopen = () => { delay = 1000 }
-      socket.onmessage = event => { const payload = JSON.parse(event.data) as EventEnvelope; if (['NEW_EMAIL', 'MESSAGE_UPDATED', 'ACCOUNT_STATUS', 'OUTBOX_UPDATED'].includes(payload.type)) { onChange(); if (payload.type === 'NEW_EMAIL' && Notification.permission === 'granted') new Notification('NexusMail 收到新邮件') } }
-      socket.onclose = () => { if (!stopped) { timer = window.setTimeout(connect, delay); delay = Math.min(delay * 2, 30000) } }
+      // Any event missed while reconnecting is unrecoverable, so resync on open.
+      socket.onopen = () => { delay = 250; schedule() }
+      socket.onmessage = event => { const payload = JSON.parse(event.data) as EventEnvelope; if (realtimeEvents.includes(payload.type)) { schedule(); if (payload.type === 'NEW_EMAIL') notify() } }
+      socket.onclose = () => { if (!stopped) { timer = window.setTimeout(connect, delay); delay = Math.min(delay * 2, 10000) } }
     }
-    connect(); return () => { stopped = true; clearTimeout(timer); socket?.close() }
-  }, [onChange])
+    connect()
+    return () => { stopped = true; clearTimeout(timer); clearTimeout(coalesce); socket?.close() }
+  }, [])
 }
 
 function useKeyboard(messages: Message[], selected: Message | null, open: (message: Message) => void, compose: () => void, archive: () => void) {

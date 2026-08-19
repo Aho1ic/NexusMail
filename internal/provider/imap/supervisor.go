@@ -40,8 +40,41 @@ type runtime struct {
 	account domain.Account
 	cancel  context.CancelFunc
 	syncReq chan int64
-	mu      sync.Mutex
-	client  atomic.Pointer[imapclient.Client]
+	cmdMu   sync.Mutex
+	// urgent counts foreground waiters for cmdMu. Background body prefetch
+	// yields while it is non-zero so a new-mail sync never queues behind a
+	// backlog of body fetches.
+	urgent atomic.Int32
+	client atomic.Pointer[imapclient.Client]
+}
+
+// lock claims the command connection for sync or user-facing work.
+func (rt *runtime) lock() {
+	rt.urgent.Add(1)
+	rt.cmdMu.Lock()
+	rt.urgent.Add(-1)
+}
+
+func (rt *runtime) unlock() { rt.cmdMu.Unlock() }
+
+// lockBackground claims the command connection for opportunistic prefetch and
+// steps aside whenever foreground work is waiting.
+func (rt *runtime) lockBackground(ctx context.Context) bool {
+	for ctx.Err() == nil {
+		if rt.urgent.Load() == 0 {
+			rt.cmdMu.Lock()
+			if rt.urgent.Load() == 0 {
+				return true
+			}
+			rt.cmdMu.Unlock()
+		}
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(25 * time.Millisecond):
+		}
+	}
+	return false
 }
 
 type Supervisor struct {
@@ -57,9 +90,21 @@ type Supervisor struct {
 	bodySlots    chan struct{}
 	bodySeen     sync.Map
 	workerCancel context.CancelFunc
+	// dial overrides transport establishment in tests; nil uses TLS to the account host.
+	dial func(context.Context, domain.Account) (net.Conn, error)
+	// dropIdleNotifications simulates providers that advertise IDLE but never
+	// deliver EXISTS, so tests can exercise the polling safety net.
+	dropIdleNotifications bool
 }
 
 const maxInlineDraftImportBytes = 1 << 20
+
+// realtimePollInterval is a safety net for IMAP servers that advertise IDLE
+// but delay or drop mailbox change notifications. IDLE still handles the
+// normal path; this bounds the worst-case inbox discovery latency.
+const realtimePollInterval = 5 * time.Second
+
+const periodicSyncInterval = 5 * time.Minute
 
 func NewSupervisor(repo ports.Repository, blobs ports.BlobStore, accounts *accountservice.Service, tokens TokenProvider, events ports.Publisher) *Supervisor {
 	return &Supervisor{
@@ -136,9 +181,9 @@ func (s *Supervisor) commandLoop(ctx context.Context, rt *runtime) {
 		rt.client.Store(client)
 		backoff = time.Second
 		_ = s.repo.UpdateAccountStatus(ctx, rt.account.ID, "syncing", nil)
-		rt.mu.Lock()
+		rt.lock()
 		syncErr := s.syncAll(ctx, rt, client)
-		rt.mu.Unlock()
+		rt.unlock()
 		if syncErr != nil {
 			s.setError(ctx, rt.account.ID, "backoff", syncErr)
 			s.closeCommand(rt, client)
@@ -146,14 +191,28 @@ func (s *Supervisor) commandLoop(ctx context.Context, rt *runtime) {
 		}
 		s.enqueueBodyCandidates(ctx, rt.account.ID)
 		_ = s.repo.UpdateAccountStatus(ctx, rt.account.ID, "connected", nil)
-		ticker := time.NewTicker(5 * time.Minute)
+		ticker := time.NewTicker(periodicSyncInterval)
+		// The command connection owns sync and is always alive, so the safety
+		// net lives here rather than inside the IDLE state.
+		probe := time.NewTicker(realtimePollInterval)
 		connected := true
 		for connected {
 			select {
 			case <-ctx.Done():
 				connected = false
+			case <-probe.C:
+				rt.lock()
+				probeErr := s.probeInbox(ctx, rt, client)
+				rt.unlock()
+				if probeErr == nil {
+					s.enqueueBodyCandidates(ctx, rt.account.ID)
+				} else {
+					// A missing or misclassified inbox must not tear down the
+					// connection; client.Closed() covers real transport loss.
+					slog.Debug("mail inbox probe failed", "account_id", rt.account.ID, "error", probeErr)
+				}
 			case mailboxID := <-rt.syncReq:
-				rt.mu.Lock()
+				rt.lock()
 				var err error
 				if mailboxID == 0 {
 					err = s.syncRole(ctx, client, rt.account.ID, "inbox")
@@ -165,7 +224,7 @@ func (s *Supervisor) commandLoop(ctx context.Context, rt *runtime) {
 						err = s.syncMailbox(ctx, client, mailbox)
 					}
 				}
-				rt.mu.Unlock()
+				rt.unlock()
 				if err == nil {
 					s.enqueueBodyCandidates(ctx, rt.account.ID)
 				}
@@ -173,9 +232,9 @@ func (s *Supervisor) commandLoop(ctx context.Context, rt *runtime) {
 					connected = false
 				}
 			case <-ticker.C:
-				rt.mu.Lock()
+				rt.lock()
 				err := s.syncAll(ctx, rt, client)
-				rt.mu.Unlock()
+				rt.unlock()
 				if err == nil {
 					s.enqueueBodyCandidates(ctx, rt.account.ID)
 				}
@@ -187,6 +246,7 @@ func (s *Supervisor) commandLoop(ctx context.Context, rt *runtime) {
 			}
 		}
 		ticker.Stop()
+		probe.Stop()
 		s.closeCommand(rt, client)
 	}
 }
@@ -196,7 +256,7 @@ func (s *Supervisor) idleLoop(ctx context.Context, rt *runtime) {
 	for ctx.Err() == nil {
 		updates := make(chan struct{}, 1)
 		client, err := s.connect(ctx, rt.account, &imapclient.UnilateralDataHandler{Mailbox: func(data *imapclient.UnilateralDataMailbox) {
-			if data.NumMessages != nil {
+			if data.NumMessages != nil && !s.dropIdleNotifications {
 				select {
 				case updates <- struct{}{}:
 				default:
@@ -213,9 +273,13 @@ func (s *Supervisor) idleLoop(ctx context.Context, rt *runtime) {
 		backoff = time.Second
 		inbox, err := s.repo.GetMailboxByRole(ctx, rt.account.ID, "inbox")
 		if err != nil {
+			// The command loop has not recorded mailboxes yet. This is a local
+			// read, so retry quickly instead of idling for seconds.
 			_ = client.Close()
-			if !waitBackoff(ctx, 10*time.Second) {
+			select {
+			case <-ctx.Done():
 				return
+			case <-time.After(500 * time.Millisecond):
 			}
 			continue
 		}
@@ -225,14 +289,8 @@ func (s *Supervisor) idleLoop(ctx context.Context, rt *runtime) {
 		}
 		if !client.Caps().Has(goimap.CapIdle) {
 			_ = client.Close()
-			ticker := time.NewTicker(30 * time.Second)
-			select {
-			case <-ctx.Done():
-				ticker.Stop()
+			if !s.pollWithoutIdle(ctx, rt) {
 				return
-			case <-ticker.C:
-				s.requestSync(rt)
-				ticker.Stop()
 			}
 			continue
 		}
@@ -268,6 +326,46 @@ func (s *Supervisor) idleLoop(ctx context.Context, rt *runtime) {
 	}
 }
 
+// probeInbox cheaply checks whether the inbox moved before paying for a sync.
+// STATUS needs one round trip and leaves the selected mailbox untouched, so the
+// safety net can run often without loading the provider. The caller must hold
+// the command lock.
+func (s *Supervisor) probeInbox(ctx context.Context, rt *runtime, client *imapclient.Client) error {
+	mailbox, err := s.repo.GetMailboxByRole(ctx, rt.account.ID, "inbox")
+	if err != nil {
+		return err
+	}
+	status, err := client.Status(mailbox.RemoteName, &goimap.StatusOptions{UIDNext: true, UIDValidity: true}).Wait()
+	if err != nil {
+		return err
+	}
+	unchanged := mailbox.UIDNext != nil && status.UIDNext != 0 &&
+		uint32(status.UIDNext) == *mailbox.UIDNext && status.UIDValidity == mailbox.UIDValidity
+	if unchanged {
+		return nil
+	}
+	return s.syncMailbox(ctx, client, mailbox)
+}
+
+// pollWithoutIdle drives sync signals for servers lacking IDLE. It returns
+// false when the context is done, and true to re-probe capabilities.
+func (s *Supervisor) pollWithoutIdle(ctx context.Context, rt *runtime) bool {
+	ticker := time.NewTicker(realtimePollInterval)
+	defer ticker.Stop()
+	recheck := time.NewTimer(periodicSyncInterval)
+	defer recheck.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return false
+		case <-ticker.C:
+			s.requestSync(rt)
+		case <-recheck.C:
+			return true
+		}
+	}
+}
+
 func (s *Supervisor) connect(ctx context.Context, account domain.Account, handler *imapclient.UnilateralDataHandler) (*imapclient.Client, error) {
 	credential, err := s.accounts.Credential(account)
 	if err != nil {
@@ -280,9 +378,16 @@ func (s *Supervisor) connect(ctx context.Context, account domain.Account, handle
 	}
 	address := net.JoinHostPort(account.IMAPHost, strconv.Itoa(account.IMAPPort))
 	var client *imapclient.Client
-	if account.IMAPTLSMode == "starttls" {
+	switch {
+	case s.dial != nil:
+		conn, dialErr := s.dial(ctx, account)
+		if dialErr != nil {
+			return nil, dialErr
+		}
+		client = imapclient.New(conn, options)
+	case account.IMAPTLSMode == "starttls":
 		client, err = imapclient.DialStartTLS(address, options)
-	} else {
+	default:
 		client, err = imapclient.DialTLS(address, options)
 	}
 	if err != nil {
@@ -342,8 +447,42 @@ func (s *Supervisor) syncAll(ctx context.Context, rt *runtime, client *imapclien
 		if err := s.syncMailbox(ctx, client, mailbox); err != nil {
 			return fmt.Errorf("sync %s: %w", mailbox.RemoteName, err)
 		}
+		// A full sync can span minutes on large accounts. Serve queued inbox
+		// signals between mailboxes so new mail is not stuck behind it.
+		if err := s.drainPending(ctx, rt, client); err != nil {
+			return err
+		}
 	}
 	return nil
+}
+
+// drainPending services queued sync requests. The caller must hold the command
+// lock; each syncMailbox re-selects its own mailbox, so this is only safe
+// between mailboxes, never inside one.
+func (s *Supervisor) drainPending(ctx context.Context, rt *runtime, client *imapclient.Client) error {
+	for {
+		select {
+		case mailboxID := <-rt.syncReq:
+			if mailboxID == 0 {
+				if err := s.syncRole(ctx, client, rt.account.ID, "inbox"); err != nil {
+					return err
+				}
+				continue
+			}
+			mailbox, err := s.repo.GetMailbox(ctx, mailboxID)
+			if err != nil {
+				return err
+			}
+			if mailbox.AccountID != rt.account.ID {
+				continue
+			}
+			if err := s.syncMailbox(ctx, client, mailbox); err != nil {
+				return err
+			}
+		default:
+			return nil
+		}
+	}
 }
 
 func (s *Supervisor) syncRole(ctx context.Context, client *imapclient.Client, accountID int64, role string) error {
@@ -628,7 +767,13 @@ func waitBackoff(ctx context.Context, delay time.Duration) bool {
 	}
 }
 
-func (s *Supervisor) FetchBody(ctx context.Context, messageID int64) (resultErr error) {
+// FetchBody retrieves a message body for a waiting caller and takes priority
+// over background prefetch.
+func (s *Supervisor) FetchBody(ctx context.Context, messageID int64) error {
+	return s.fetchBody(ctx, messageID, false)
+}
+
+func (s *Supervisor) fetchBody(ctx context.Context, messageID int64, background bool) (resultErr error) {
 	select {
 	case s.bodySlots <- struct{}{}:
 		defer func() { <-s.bodySlots }()
@@ -658,8 +803,14 @@ func (s *Supervisor) FetchBody(ctx context.Context, messageID int64) (resultErr 
 	if err != nil {
 		return err
 	}
-	rt.mu.Lock()
-	defer rt.mu.Unlock()
+	if background {
+		if !rt.lockBackground(ctx) {
+			return ctx.Err()
+		}
+	} else {
+		rt.lock()
+	}
+	defer rt.unlock()
 	client := rt.client.Load()
 	if client == nil {
 		return errors.New("account is offline")
@@ -721,9 +872,12 @@ func (s *Supervisor) bodyWorker(ctx context.Context) {
 			return
 		case id := <-s.bodyQueue:
 			fetchCtx, cancel := context.WithTimeout(ctx, 45*time.Second)
-			_ = s.FetchBody(fetchCtx, id)
+			err := s.fetchBody(fetchCtx, id, true)
 			cancel()
 			s.bodySeen.Delete(id)
+			if err == nil {
+				s.events.Publish(ports.Event{Type: "MESSAGE_UPDATED", Data: map[string]any{"message_id": id}})
+			}
 			select {
 			case <-ctx.Done():
 				return
@@ -754,8 +908,8 @@ func (s *Supervisor) FetchAttachment(ctx context.Context, messageID, attachmentI
 	if err != nil {
 		return domain.BlobObject{}, attachment, err
 	}
-	rt.mu.Lock()
-	defer rt.mu.Unlock()
+	rt.lock()
+	defer rt.unlock()
 	client := rt.client.Load()
 	if client == nil {
 		return domain.BlobObject{}, attachment, errors.New("account is offline")
@@ -792,8 +946,8 @@ func (s *Supervisor) SetFlags(ctx context.Context, messageID int64, isRead, isSt
 	if err != nil {
 		return err
 	}
-	rt.mu.Lock()
-	defer rt.mu.Unlock()
+	rt.lock()
+	defer rt.unlock()
 	client := rt.client.Load()
 	if client == nil {
 		return errors.New("account is offline")
@@ -833,8 +987,8 @@ func (s *Supervisor) Archive(ctx context.Context, messageID int64) error {
 	if err != nil {
 		return err
 	}
-	rt.mu.Lock()
-	defer rt.mu.Unlock()
+	rt.lock()
+	defer rt.unlock()
 	client := rt.client.Load()
 	if client == nil {
 		return errors.New("account is offline")
@@ -962,8 +1116,8 @@ func (s *Supervisor) SyncDraft(ctx context.Context, draftID int64) error {
 	if err != nil {
 		return err
 	}
-	rt.mu.Lock()
-	defer rt.mu.Unlock()
+	rt.lock()
+	defer rt.unlock()
 	client := rt.client.Load()
 	if client == nil {
 		return errors.New("account is offline")
@@ -1008,8 +1162,8 @@ func (s *Supervisor) DeleteRemoteDraft(ctx context.Context, draftID int64) error
 	if err != nil {
 		return err
 	}
-	rt.mu.Lock()
-	defer rt.mu.Unlock()
+	rt.lock()
+	defer rt.unlock()
 	client := rt.client.Load()
 	if client == nil {
 		return errors.New("account is offline")
@@ -1041,8 +1195,8 @@ func (s *Supervisor) AppendSent(ctx context.Context, accountID int64, payload []
 	if err != nil {
 		return err
 	}
-	rt.mu.Lock()
-	defer rt.mu.Unlock()
+	rt.lock()
+	defer rt.unlock()
 	client := rt.client.Load()
 	if client == nil {
 		return errors.New("account is offline")
