@@ -1,0 +1,51 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="100%" height="100%">
+  <defs>
+    <!-- 浅色背景：高雅纯白微渐变 -->
+    <linearGradient id="bgLight" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#FFFFFF" />
+      <stop offset="100%" stop-color="#F8FAFC" />
+    </linearGradient>
+
+    <!-- 品牌主色渐变：极速宝蓝 -> 科技深靛蓝 (确保浅色底上有高对比度) -->
+    <linearGradient id="brandGradient" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#1D4ED8" />
+      <stop offset="50%" stop-color="#4338CA" />
+      <stop offset="100%" stop-color="#6D28D9" />
+    </linearGradient>
+
+    <!-- 细微悬浮弥散投影 -->
+    <filter id="crispShadow" x="-10%" y="-10%" width="120%" height="120%">
+      <feDropShadow dx="0" dy="2" stdDeviation="2" flood-color="#0F172A" flood-opacity="0.08" />
+    </filter>
+  </defs>
+
+  <!-- 浅色圆角底座（带 1.5px 极细精工边框） -->
+  <rect x="6" y="6" width="116" height="116" rx="30" fill="url(#bgLight)" stroke="#E2E8F0" stroke-width="1.5" />
+
+  <!-- 核心图元：一体化 @-M 连续流线 -->
+  <g filter="url(#crispShadow)">
+    <path 
+      d="
+        M 42 74 
+        L 42 48 
+        L 58 64 
+        L 74 48 
+        L 74 74 
+        C 74 82, 83 87, 91 81 
+        C 98 73, 101 55, 97 40 
+        C 91 23, 77 18, 58 18 
+        C 36 18, 20 34, 20 62 
+        C 20 90, 38 106, 64 106 
+        C 84 106, 98 96, 104 84
+      " 
+      fill="none" 
+      stroke="url(#brandGradient)" 
+      stroke-width="7.5" 
+      stroke-linecap="round" 
+      stroke-linejoin="round" 
+    />
+    
+    <!-- 汇聚点：增强视觉平衡与终点呼应 -->
+    <circle cx="104" cy="84" r="4.5" fill="#6D28D9" />
+  </g>
+</svg>

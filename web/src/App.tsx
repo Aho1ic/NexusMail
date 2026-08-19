@@ -1,10 +1,11 @@
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
-  Archive, AtSign, Bell, ChevronDown, Circle, File, Inbox, LoaderCircle,
+  Archive, AtSign, Bell, ChevronDown, Circle, File, Image, Inbox, Keyboard, LoaderCircle,
   LogOut, Mail, Menu, Paperclip, Plus, RefreshCw, Search, Send, Settings, Star, X,
   SquarePen,
 } from 'lucide-react'
 import { APIError, api, isAuthenticated } from './lib/api'
+import { loadPreferences, notificationPermission, requestNotificationPermission, savePreferences, type Preferences } from './lib/preferences'
 import type { Account, Attachment, Draft, DraftInput, EventEnvelope, Mailbox, Message } from './types'
 
 type Pane = 'nav' | 'list' | 'detail'
@@ -60,6 +61,16 @@ function MailboxApp({ onLogout }: { onLogout: () => void }) {
   const [showComposer, setShowComposer] = useState(false)
   const [composerDraft, setComposerDraft] = useState<Draft | null>(null)
   const [showOutbox, setShowOutbox] = useState(false)
+  const [showSettings, setShowSettings] = useState(false)
+  const [preferences, setPreferences] = useState<Preferences>(loadPreferences)
+
+  // notify() runs from the socket handler outside React, so the live value is
+  // mirrored into a module ref instead of being read from state.
+  useEffect(() => { notificationsEnabled.current = preferences.desktopNotifications }, [preferences.desktopNotifications])
+
+  const updatePreferences = useCallback((patch: Partial<Preferences>) => {
+    setPreferences(current => { const next = { ...current, ...patch }; savePreferences(next); return next })
+  }, [])
 
   const compose = useCallback((draft: Draft | null = null) => { setComposerDraft(draft); setShowComposer(true) }, [])
 
@@ -117,7 +128,7 @@ function MailboxApp({ onLogout }: { onLogout: () => void }) {
     } catch (err) { setError(messageOf(err)) }
   }
 
-  useKeyboard(messages, selected, openMessage, () => compose(), () => mutateMessage({ archive: true }))
+  useKeyboard(preferences.keyboardShortcuts, messages, selected, openMessage, () => compose(), () => mutateMessage({ archive: true }))
 
   async function logout() { try { await api.logout() } finally { onLogout() } }
   const accountMap = useMemo(() => new Map(accounts.map(account => [account.id, account])), [accounts])
@@ -138,7 +149,7 @@ function MailboxApp({ onLogout }: { onLogout: () => void }) {
           </div>)}
           <button onClick={() => setShowAccounts(true)} className="mt-4 flex w-full items-center gap-3 rounded-xl px-3 py-3 text-sm text-white/50 hover:bg-white/5 hover:text-white"><Plus size={18} />连接邮箱</button>
         </nav>
-        <div className="flex items-center justify-between border-t border-white/10 p-5 text-white/50"><button className="hover:text-white"><Settings size={18} /></button><button onClick={logout} className="flex items-center gap-2 text-xs hover:text-white"><LogOut size={16} />退出</button></div>
+        <div className="flex items-center justify-between border-t border-white/10 p-5 text-white/50"><button onClick={() => setShowSettings(true)} className="flex items-center gap-2 text-xs hover:text-white" title="设置"><Settings size={18} />设置</button><button onClick={logout} className="flex items-center gap-2 text-xs hover:text-white"><LogOut size={16} />退出</button></div>
       </aside>
 
       <section className={`${pane === 'list' ? 'flex' : 'hidden'} md:flex w-full md:w-[390px] lg:w-[440px] shrink-0 flex-col border-r border-black/5 bg-[#fbfaf6]`}>
@@ -155,12 +166,13 @@ function MailboxApp({ onLogout }: { onLogout: () => void }) {
       </section>
 
       <main className={`${pane === 'detail' ? 'flex' : 'hidden'} md:flex min-w-0 flex-1 flex-col bg-white`}>
-        {selected ? <MessageDetail selected={selected} details={details} onBack={() => setPane('list')} onStar={() => mutateMessage({ is_starred: !selected.is_starred })} onArchive={() => mutateMessage({ archive: true })} onReply={() => compose()} /> : <Welcome count={messages.filter(item => !item.is_read).length} />}
+        {selected ? <MessageDetail selected={selected} details={details} autoLoadRemoteImages={preferences.autoLoadRemoteImages} onBack={() => setPane('list')} onStar={() => mutateMessage({ is_starred: !selected.is_starred })} onArchive={() => mutateMessage({ archive: true })} onReply={() => compose()} /> : <Welcome count={messages.filter(item => !item.is_read).length} />}
       </main>
     </div>
     {showAccounts && <AccountDialog onClose={() => setShowAccounts(false)} onCreated={() => { setShowAccounts(false); loadAccounts() }} />}
     {showOutbox && <OutboxDialog onClose={() => setShowOutbox(false)} onEdit={draft => { setShowOutbox(false); compose(draft) }} />}
     {showComposer && <Composer accounts={accounts} replyTo={composerDraft ? null : selected} initialDraft={composerDraft} onClose={() => setShowComposer(false)} onSent={() => { setShowComposer(false); refresh() }} />}
+    {showSettings && <SettingsDialog preferences={preferences} accounts={accounts} onChange={updatePreferences} onClose={() => setShowSettings(false)} onAddAccount={() => { setShowSettings(false); setShowAccounts(true) }} onLogout={logout} />}
   </div>
 }
 
@@ -174,11 +186,13 @@ function MessageRow({ message, account, active, onClick }: { message: Message; a
   </button>
 }
 
-function MessageDetail({ selected, details, onBack, onStar, onArchive, onReply }: { selected: Message; details: { message: Message; attachments: Attachment[] } | null; onBack: () => void; onStar: () => void; onArchive: () => void; onReply: () => void }) {
+function MessageDetail({ selected, details, autoLoadRemoteImages, onBack, onStar, onArchive, onReply }: { selected: Message; details: { message: Message; attachments: Attachment[] } | null; autoLoadRemoteImages: boolean; onBack: () => void; onStar: () => void; onArchive: () => void; onReply: () => void }) {
   const message = details?.message ?? selected
   const bodyHTML = message.body_html ?? ''
-  const [loadRemoteImages, setLoadRemoteImages] = useState(false)
-  useEffect(() => setLoadRemoteImages(false), [message.id])
+  const [loadRemoteImages, setLoadRemoteImages] = useState(autoLoadRemoteImages)
+  // Remote images are re-blocked per message unless the setting opts in, so
+  // trusting one sender never silently leaks the next sender a read receipt.
+  useEffect(() => setLoadRemoteImages(autoLoadRemoteImages), [message.id, autoLoadRemoteImages])
   const renderedHTML = useMemo(() => prepareMessageHTML(bodyHTML, details?.attachments ?? [], message.id, loadRemoteImages), [bodyHTML, details?.attachments, message.id, loadRemoteImages])
   const hasRemoteImages = bodyHTML.includes('data-nexusmail-remote-src')
   return <>
@@ -284,6 +298,71 @@ function AccountDialog({ onClose, onCreated }: { onClose: () => void; onCreated:
   return <div className="modal-backdrop"><form onSubmit={submit} className="w-[min(92vw,460px)] rounded-[1.7rem] bg-white p-7 shadow-2xl"><div className="flex items-center justify-between"><div><p className="text-[10px] font-bold uppercase tracking-[.2em] text-pine/40">Connect</p><h2 className="font-serif text-3xl">连接邮箱</h2></div><button type="button" onClick={onClose} className="icon-button"><X size={19} /></button></div><div className="mt-7 grid grid-cols-4 gap-2">{['qq', '163', 'gmail', 'outlook'].map(item => <button type="button" key={item} onClick={() => setProvider(item)} className={`rounded-xl border px-2 py-3 text-xs font-bold uppercase ${provider === item ? 'border-pine bg-sage text-pine' : 'border-black/5 text-black/35'}`}>{item}</button>)}</div><label className="field-label">显示名称</label><input className="input" value={name} onChange={e => setName(e.target.value)} placeholder="工作邮箱" />{!['gmail', 'outlook'].includes(provider) && <><label className="field-label">邮箱地址</label><input className="input" type="email" required value={email} onChange={e => setEmail(e.target.value)} /><label className="field-label">授权码</label><input className="input" type="password" required value={password} onChange={e => setPassword(e.target.value)} /><p className="mt-2 text-xs text-black/40">请使用邮箱服务商生成的客户端授权码，而非网页登录密码。</p></>}{['gmail', 'outlook'].includes(provider) && <div className="mt-6 rounded-xl bg-sage/50 p-4 text-sm leading-6 text-pine">继续后将跳转到服务商授权页面。部署者必须已配置对应 OAuth Client ID 与 Secret。</div>}{error && <p className="mt-3 text-sm text-red-600">{error}</p>}<button disabled={busy} className="button-primary mt-7 w-full">{busy ? <LoaderCircle className="animate-spin" size={17} /> : '继续'}</button></form></div>
 }
 
+function SettingsDialog({ preferences, accounts, onChange, onClose, onAddAccount, onLogout }: { preferences: Preferences; accounts: Account[]; onChange: (patch: Partial<Preferences>) => void; onClose: () => void; onAddAccount: () => void; onLogout: () => void }) {
+  const [permission, setPermission] = useState(notificationPermission)
+  const [asking, setAsking] = useState(false)
+  useEffect(() => { const handler = (event: KeyboardEvent) => { if (event.key === 'Escape') onClose() }; addEventListener('keydown', handler); return () => removeEventListener('keydown', handler) }, [onClose])
+  async function askPermission() { setAsking(true); try { setPermission(await requestNotificationPermission()) } finally { setAsking(false) } }
+  return <div className="modal-backdrop">
+    <div role="dialog" aria-modal="true" aria-label="设置" className="flex max-h-[min(88vh,780px)] w-[min(94vw,540px)] flex-col overflow-hidden rounded-[1.7rem] bg-white shadow-2xl">
+      <header className="flex shrink-0 items-center justify-between border-b border-black/5 px-7 py-6"><div><p className="text-[10px] font-bold uppercase tracking-[.2em] text-pine/40">Preferences</p><h2 className="font-serif text-3xl">设置</h2></div><button onClick={onClose} className="icon-button" aria-label="关闭设置"><X size={19} /></button></header>
+      <div className="flex-1 overflow-y-auto px-7 py-2">
+        <SettingsSection icon={<Bell size={14} />} title="通知">
+          <SettingsToggle label="新邮件桌面通知" hint="收到新邮件时弹出系统通知，需要浏览器授权。" checked={preferences.desktopNotifications} onChange={value => onChange({ desktopNotifications: value })} />
+          {permission === 'default' && <div className="flex items-center justify-between gap-3 rounded-xl bg-sage/50 px-3.5 py-3 text-xs text-pine"><span>浏览器尚未授权通知。</span><button onClick={askPermission} disabled={asking} className="button-secondary shrink-0">{asking ? '请求中…' : '授权'}</button></div>}
+          {permission === 'denied' && <p className="rounded-xl bg-amber-50 px-3.5 py-3 text-xs leading-5 text-amber-800">浏览器已拒绝通知权限，需在地址栏的站点设置中重新允许后才会生效。</p>}
+          {permission === 'unsupported' && <p className="rounded-xl bg-black/[.03] px-3.5 py-3 text-xs leading-5 text-black/45">当前浏览器或非 HTTPS 环境不支持桌面通知。</p>}
+        </SettingsSection>
+
+        <SettingsSection icon={<Image size={14} />} title="阅读">
+          <SettingsToggle label="自动加载远程图片" hint="关闭时每封邮件的外部图片都需手动加载，可避免发件人通过图片追踪你的阅读行为。" checked={preferences.autoLoadRemoteImages} onChange={value => onChange({ autoLoadRemoteImages: value })} />
+        </SettingsSection>
+
+        <SettingsSection icon={<Keyboard size={14} />} title="快捷键">
+          <SettingsToggle label="启用单键快捷键" hint="关闭后 J / K / C / E 不再触发操作，可避免误触归档。" checked={preferences.keyboardShortcuts} onChange={value => onChange({ keyboardShortcuts: value })} />
+          <div className={`grid grid-cols-2 gap-2 text-xs ${preferences.keyboardShortcuts ? 'text-black/55' : 'text-black/25'}`}>
+            {[['J', '下一封'], ['K', '上一封'], ['C', '写邮件'], ['E', '归档当前邮件']].map(([key, label]) => <div key={key} className="flex items-center gap-2 rounded-xl bg-paper/70 px-3 py-2"><kbd>{key}</kbd>{label}</div>)}
+          </div>
+        </SettingsSection>
+
+        <SettingsSection icon={<AtSign size={14} />} title="账户">
+          {accounts.length === 0 && <p className="rounded-xl bg-black/[.03] px-3.5 py-3 text-xs text-black/45">还没有连接任何邮箱。</p>}
+          {accounts.map(account => <div key={account.id} className="rounded-xl border border-black/5 bg-paper/60 p-3.5">
+            <div className="flex items-center gap-2.5">
+              <span className={`h-2 w-2 shrink-0 rounded-full ${account.status === 'connected' ? 'bg-emerald-500' : account.status === 'backoff' ? 'bg-amber-500' : 'bg-black/20'}`} />
+              <span className="min-w-0 flex-1"><span className="block truncate text-sm font-semibold">{account.display_name || account.email}</span><span className="block truncate text-[11px] text-black/40">{account.email}</span></span>
+              <span className="shrink-0 rounded-full bg-black/[.05] px-2 py-0.5 text-[9px] font-bold uppercase tracking-wide text-black/45">{account.provider}</span>
+            </div>
+            <p className="mt-2 text-[11px] text-black/35">{accountStatusLabel(account.status)}{account.last_connected_at ? ` · 最近连接 ${formatFullDate(account.last_connected_at)}` : ''}</p>
+            {account.last_error && <p className="mt-2 break-words rounded-lg bg-red-50 px-2.5 py-2 text-[11px] leading-4 text-red-700" role="alert">{account.last_error}</p>}
+          </div>)}
+          <button onClick={onAddAccount} className="button-secondary w-full justify-center"><Plus size={15} />连接邮箱</button>
+        </SettingsSection>
+      </div>
+      <footer className="flex shrink-0 items-center justify-between gap-3 border-t border-black/5 px-7 py-5"><button onClick={onLogout} className="flex items-center gap-2 text-xs font-semibold text-red-600 hover:text-red-700"><LogOut size={15} />退出登录</button><button onClick={onClose} className="button-primary">完成</button></footer>
+    </div>
+  </div>
+}
+
+function SettingsSection({ icon, title, children }: { icon: React.ReactNode; title: string; children: React.ReactNode }) {
+  return <section className="border-b border-black/5 py-5 last:border-b-0">
+    <h3 className="flex items-center gap-2 text-[10px] font-bold uppercase tracking-[.18em] text-pine/50">{icon}{title}</h3>
+    <div className="mt-3 grid gap-2.5">{children}</div>
+  </section>
+}
+
+function SettingsToggle({ label, hint, checked, onChange }: { label: string; hint: string; checked: boolean; onChange: (value: boolean) => void }) {
+  return <div className="flex items-start justify-between gap-4">
+    <span className="min-w-0"><span className="block text-sm font-semibold">{label}</span><span className="mt-1 block text-xs leading-5 text-black/40">{hint}</span></span>
+    <button type="button" role="switch" aria-checked={checked} aria-label={label} onClick={() => onChange(!checked)} className={`relative mt-0.5 h-6 w-11 shrink-0 rounded-full transition ${checked ? 'bg-pine' : 'bg-black/15'}`}><span className={`absolute top-0.5 h-5 w-5 rounded-full bg-white shadow transition-all ${checked ? 'left-[1.375rem]' : 'left-0.5'}`} /></button>
+  </div>
+}
+
+function accountStatusLabel(status: string) {
+  const label: Record<string, string> = { connected: '已连接', connecting: '正在连接', syncing: '正在同步', backoff: '连接异常，正在重试', disconnected: '未连接' }
+  return label[status] || status
+}
+
 function NavItem({ active, icon, label, sublabel, count, onClick }: { active: boolean; icon: React.ReactNode; label: string; sublabel?: string; count?: number; onClick: () => void }) { return <button onClick={onClick} className={`mt-1 flex w-full items-center gap-3 rounded-xl px-3 py-3 text-left transition ${active ? 'bg-white/12 text-white' : 'text-white/65 hover:bg-white/5 hover:text-white'}`}><span className="grid w-5 place-items-center">{icon}</span><span className="min-w-0 flex-1"><span className="block truncate text-sm font-semibold">{label}</span>{sublabel && <span className="block truncate text-[9px] text-white/35">{sublabel}</span>}</span>{Boolean(count) && <span className="rounded-full bg-coral px-2 py-0.5 text-[9px] font-bold text-white">{count}</span>}</button> }
 function FolderIcon({ role }: { role: string }) { if (role === 'inbox') return <Inbox size={13} />; if (role === 'sent') return <Send size={13} />; if (role === 'archive') return <Archive size={13} />; return <Mail size={13} /> }
 function Brand({ light = false }: { light?: boolean }) { return <div className="flex items-center gap-3"><span className={`grid h-9 w-9 place-items-center rounded-xl ${light ? 'bg-white text-pine' : 'bg-pine text-white'}`}><AtSign size={19} strokeWidth={2.4} /></span><span className="font-serif text-xl font-semibold tracking-tight">NexusMail</span></div> }
@@ -309,9 +388,14 @@ function prepareMessageHTML(input: string, attachments: Attachment[], messageID:
 
 const realtimeEvents = ['NEW_EMAIL', 'MESSAGE_UPDATED', 'ACCOUNT_STATUS', 'OUTBOX_UPDATED']
 
+// The socket handler calls notify() from outside the React tree, so the desktop
+// notification preference is mirrored here rather than read from state.
+const notificationsEnabled = { current: loadPreferences().desktopNotifications }
+
 // Notification is absent in insecure contexts and some browsers; a throw here
 // would kill the socket handler and stall realtime updates.
 function notify() {
+  if (!notificationsEnabled.current) return
   try { if ('Notification' in window && Notification.permission === 'granted') new Notification('NexusMail 收到新邮件') }
   catch { /* notifications are best-effort */ }
 }
@@ -338,8 +422,8 @@ function useRealtime(onChange: () => void) {
   }, [])
 }
 
-function useKeyboard(messages: Message[], selected: Message | null, open: (message: Message) => void, compose: () => void, archive: () => void) {
-  useEffect(() => { const handler = (event: KeyboardEvent) => { if (['INPUT', 'TEXTAREA', 'SELECT'].includes((event.target as HTMLElement).tagName)) return; const index = selected ? messages.findIndex(item => item.id === selected.id) : -1; if (event.key === 'j' && messages[index + 1]) open(messages[index + 1]); if (event.key === 'k' && messages[Math.max(0, index - 1)]) open(messages[Math.max(0, index - 1)]); if (event.key === 'c') compose(); if (event.key === 'e' && selected) archive() }; addEventListener('keydown', handler); return () => removeEventListener('keydown', handler) }, [messages, selected, open, compose, archive])
+function useKeyboard(enabled: boolean, messages: Message[], selected: Message | null, open: (message: Message) => void, compose: () => void, archive: () => void) {
+  useEffect(() => { if (!enabled) return; const handler = (event: KeyboardEvent) => { if (['INPUT', 'TEXTAREA', 'SELECT'].includes((event.target as HTMLElement).tagName)) return; const index = selected ? messages.findIndex(item => item.id === selected.id) : -1; if (event.key === 'j' && messages[index + 1]) open(messages[index + 1]); if (event.key === 'k' && messages[Math.max(0, index - 1)]) open(messages[Math.max(0, index - 1)]); if (event.key === 'c') compose(); if (event.key === 'e' && selected) archive() }; addEventListener('keydown', handler); return () => removeEventListener('keydown', handler) }, [enabled, messages, selected, open, compose, archive])
 }
 
 function splitEmails(value: string) { return value.split(/[,;\n]/).map(item => item.trim()).filter(Boolean) }
