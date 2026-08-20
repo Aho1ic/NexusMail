@@ -63,7 +63,11 @@ type Repository interface {
 	ResetMailbox(context.Context, int64, uint32) error
 	CreateOrUpdateMessage(context.Context, *domain.Message, int64, uint32, []string, time.Time) (bool, error)
 	ReconcileMailboxFlags(context.Context, int64, []RemoteFlagState) (int, error)
-	DeleteMissingMailboxMessages(context.Context, int64, []uint32) (int, error)
+	// ListMailboxUIDs returns the UIDs stored locally for one mailbox, ascending.
+	// Reconciliation is driven from this list so its cost scales with what the app
+	// actually holds rather than with the size of the remote mailbox.
+	ListMailboxUIDs(context.Context, int64) ([]uint32, error)
+	DeleteMailboxUIDs(context.Context, int64, []uint32) (int, error)
 	MessageLocation(context.Context, int64) (MessageLocation, error)
 	MessageLocations(context.Context, []int64) ([]MessageLocation, error)
 	MoveMessageLocation(context.Context, int64, int64, int64, *uint32) error

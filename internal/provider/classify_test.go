@@ -24,7 +24,15 @@ func TestClassifyMailboxByName(t *testing.T) {
 		{"垃圾邮件", "junk", "lazy"},
 		{"Junk E-mail", "junk", "lazy"},
 		{"Archive", "archive", "periodic"},
-		{"All Mail", "archive", "periodic"},
+		// "All Mail" and its localised form are every message in the account, not an
+		// archive folder: on Gmail they hold a second copy of the inbox and of
+		// everything ever sent. Syncing that on the periodic tier doubled the first
+		// import and re-walked the whole account every five minutes on the connection
+		// new mail needs, so they sync on demand like trash and junk.
+		{"All Mail", "archive", "lazy"},
+		{"[Gmail]/All Mail", "archive", "lazy"},
+		{"所有邮件", "archive", "lazy"},
+		{"归档", "archive", "periodic"},
 		{"Notes", "custom", "lazy"},
 		{"Newsletters", "custom", "lazy"},
 		// Substring matching used to answer these: "Presentations" contains "sent",
@@ -55,5 +63,14 @@ func TestClassifyMailboxAttributesWin(t *testing.T) {
 	}
 	if role, syncMode = ClassifyMailbox("随便取的名字", []string{"\\Sent"}); role != "sent" || syncMode != "periodic" {
 		t.Fatalf("sent attribute ignored: got %q/%q", role, syncMode)
+	}
+	// \All and \Archive both mean "archive" as a role but not as a workload: \All is
+	// the whole account, so it must not join the periodic tier that shares the
+	// command connection with new-mail sync.
+	if role, syncMode = ClassifyMailbox("[Gmail]/All Mail", []string{"\\All"}); role != "archive" || syncMode != "lazy" {
+		t.Fatalf(`\All is not lazy: got %q/%q`, role, syncMode)
+	}
+	if role, syncMode = ClassifyMailbox("Archive", []string{"\\Archive"}); role != "archive" || syncMode != "periodic" {
+		t.Fatalf(`\Archive changed tier: got %q/%q`, role, syncMode)
 	}
 }

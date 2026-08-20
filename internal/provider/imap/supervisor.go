@@ -100,6 +100,9 @@ type Supervisor struct {
 	lastReconcile sync.Map
 	// dial overrides transport establishment in tests; nil uses TLS to the account host.
 	dial func(context.Context, domain.Account) (net.Conn, error)
+	// commandStall overrides commandStallWindow so a test can drive the recovery
+	// path without waiting out the production window.
+	commandStall time.Duration
 	// dropIdleNotifications simulates providers that advertise IDLE but never
 	// deliver EXISTS, so tests can exercise the polling safety net.
 	dropIdleNotifications bool
@@ -120,12 +123,49 @@ const bulkFlagChunk = 500
 
 // reconcileInterval bounds how often a mailbox is checked for changes the
 // append-only path cannot see: flags set in another client and messages deleted
-// or expunged elsewhere. It costs one UID FETCH of flags over the whole mailbox,
-// so it runs on the periodic sync rather than on the 5s probe.
+// or expunged elsewhere. It costs one UID FETCH of flags over the locally stored
+// UIDs, so it runs on the periodic sync rather than on the 5s probe.
 const reconcileInterval = 5 * time.Minute
+
+// backgroundReconcileInterval is the same for mailboxes the user is not watching.
+// It has to exceed periodicSyncInterval to be worth anything: at equal intervals
+// reconciliation is due on every tick, so every mailbox is selected and walked
+// every time and the cheap STATUS check can never skip one. Mail read or deleted
+// in another client still converges here, just not on the inbox's schedule.
+const backgroundReconcileInterval = 30 * time.Minute
+
+// reconcileIntervalFor returns the reconciliation cadence for a mailbox. The gate
+// in reconcileMailbox and the skip in mailboxQuiet must agree on it, or a mailbox
+// would be skipped as quiet and then never reconciled.
+func reconcileIntervalFor(role string) time.Duration {
+	if role == "inbox" {
+		return reconcileInterval
+	}
+	return backgroundReconcileInterval
+}
 
 // reconcileFlagChunk caps the UIDs per flag FETCH during reconciliation.
 const reconcileFlagChunk = 2000
+
+// slowPhaseThreshold is how long a stretch of command-connection work may take
+// before it is logged. Everything on that connection is serialised, so anything
+// slow here is new-mail latency for the whole account, and the log line is what
+// turns "mail is late" into a specific phase and mailbox.
+const slowPhaseThreshold = 3 * time.Second
+
+// observe times a stretch of command-connection work and logs it when it runs
+// long enough to be felt.
+func observe(phase string, accountID int64, attrs ...any) func() {
+	start := time.Now()
+	return func() {
+		elapsed := time.Since(start)
+		if elapsed < slowPhaseThreshold {
+			return
+		}
+		slog.Warn("imap phase held the command connection",
+			append([]any{"phase", phase, "account_id", accountID, "elapsed", elapsed}, attrs...)...)
+	}
+}
 
 // maxBodyAttempts bounds how often the prefetch retries one message. The
 // candidate query returns everything that is not 'ready', which includes 'error',
@@ -210,7 +250,7 @@ func (s *Supervisor) commandLoop(ctx context.Context, rt *runtime) {
 	backoff := time.Second
 	for ctx.Err() == nil {
 		_ = s.repo.UpdateAccountStatus(ctx, rt.account.ID, "connecting", nil)
-		client, err := s.connect(ctx, rt.account, nil)
+		client, err := s.connect(ctx, rt.account, nil, s.commandStallOrDefault())
 		if err != nil {
 			// Credentials the server already refused will be refused again, so the
 			// account is parked in auth_error with a long delay instead of being
@@ -321,7 +361,7 @@ func (s *Supervisor) idleLoop(ctx context.Context, rt *runtime) {
 				default:
 				}
 			}
-		}})
+		}}, idleStallWindow)
 		if err != nil {
 			if !waitBackoff(ctx, backoff) {
 				return
@@ -425,7 +465,70 @@ func (s *Supervisor) pollWithoutIdle(ctx context.Context, rt *runtime) bool {
 	}
 }
 
-func (s *Supervisor) connect(ctx context.Context, account domain.Account, handler *imapclient.UnilateralDataHandler) (*imapclient.Client, error) {
+// stallGuard fails a connection that stops delivering data while the client is
+// waiting on it.
+//
+// go-imap arms a read deadline only once a response has started arriving and
+// clears it again afterwards, and cmd.Wait() has no timeout of its own. A
+// provider that accepts a command and then goes quiet — throttled, or a socket a
+// NAT dropped without ever sending a RST — therefore blocks the caller forever.
+// On the command connection that caller holds cmdMu and is the command loop
+// itself, so the account froze completely: the loop never returned to its select,
+// so neither the 5s probe nor client.Closed() could recover it, and mail stopped
+// appearing until the process was restarted. Bounding silence rather than total
+// duration is what keeps a legitimately long sync working: that keeps delivering
+// data, a dead connection does not.
+type stallGuard struct {
+	net.Conn
+	// window is nanoseconds of tolerated silence, swapped once the connection is
+	// established: setup is always quick, while an established connection may be
+	// deliberately quiet for a long time.
+	window atomic.Int64
+}
+
+func newStallGuard(conn net.Conn, window time.Duration) *stallGuard {
+	guard := &stallGuard{Conn: conn}
+	guard.window.Store(int64(window))
+	return guard
+}
+
+func (c *stallGuard) Read(payload []byte) (int, error) {
+	// Re-armed per read, so any byte of progress buys another full window. Set
+	// after go-imap's own deadline calls, so this is the one that applies.
+	_ = c.Conn.SetReadDeadline(time.Now().Add(time.Duration(c.window.Load())))
+	return c.Conn.Read(payload)
+}
+
+func (c *stallGuard) Write(payload []byte) (int, error) {
+	_ = c.Conn.SetWriteDeadline(time.Now().Add(time.Duration(c.window.Load())))
+	return c.Conn.Write(payload)
+}
+
+// setupStallWindow bounds silence during the TLS handshake, the greeting and
+// authentication. Those are never slow on a healthy connection, so they do not
+// need the long window an established IDLE connection does — and giving them that
+// window would let a half-open socket hold the account in "connecting" for as long
+// as the window lasts.
+const setupStallWindow = 30 * time.Second
+
+// commandStallWindow bounds silence on the command connection. Every command it
+// runs is either a user action or a sync, so a stall here is visible latency and
+// reconnecting is always better than waiting.
+const commandStallWindow = 90 * time.Second
+
+// idleStallWindow bounds silence on the IDLE connection, which is legitimately
+// quiet between arrivals. It only has to outlast the refresh cycle; a dead IDLE
+// connection costs nothing beyond falling back to the 5s probe.
+const idleStallWindow = 30 * time.Minute
+
+func (s *Supervisor) commandStallOrDefault() time.Duration {
+	if s.commandStall > 0 {
+		return s.commandStall
+	}
+	return commandStallWindow
+}
+
+func (s *Supervisor) connect(ctx context.Context, account domain.Account, handler *imapclient.UnilateralDataHandler, stall time.Duration) (*imapclient.Client, error) {
 	credential, err := s.accounts.Credential(account)
 	if err != nil {
 		return nil, err
@@ -436,6 +539,10 @@ func (s *Supervisor) connect(ctx context.Context, account domain.Account, handle
 		WordDecoder: &mime.WordDecoder{CharsetReader: messagecharset.Reader},
 	}
 	address := net.JoinHostPort(account.IMAPHost, strconv.Itoa(account.IMAPPort))
+	// Bounded tightly for setup and widened to the caller's window once the
+	// connection is authenticated and handed back.
+	setup := min(stall, setupStallWindow)
+	var guard *stallGuard
 	var client *imapclient.Client
 	switch {
 	case s.dial != nil:
@@ -443,11 +550,29 @@ func (s *Supervisor) connect(ctx context.Context, account domain.Account, handle
 		if dialErr != nil {
 			return nil, dialErr
 		}
-		client = imapclient.New(conn, options)
+		guard = newStallGuard(conn, setup)
+		client = imapclient.New(guard, options)
 	case account.IMAPTLSMode == "starttls":
-		client, err = imapclient.DialStartTLS(address, options)
+		// The guard wraps the raw socket and STARTTLS layers on top of it, so the
+		// deadline still governs every byte the TLS layer reads.
+		conn, dialErr := options.Dialer.DialContext(ctx, "tcp", address)
+		if dialErr != nil {
+			return nil, dialErr
+		}
+		guard = newStallGuard(conn, setup)
+		client, err = imapclient.NewStartTLS(guard, options)
 	default:
-		client, err = imapclient.DialTLS(address, options)
+		conn, dialErr := options.Dialer.DialContext(ctx, "tcp", address)
+		if dialErr != nil {
+			return nil, dialErr
+		}
+		guard = newStallGuard(conn, setup)
+		secure := tls.Client(guard, options.TLSConfig)
+		if handshakeErr := secure.HandshakeContext(ctx); handshakeErr != nil {
+			_ = conn.Close()
+			return nil, handshakeErr
+		}
+		client = imapclient.New(secure, options)
 	}
 	if err != nil {
 		return nil, err
@@ -470,10 +595,12 @@ func (s *Supervisor) connect(ctx context.Context, account domain.Account, handle
 		_ = client.Close()
 		return nil, err
 	}
+	guard.window.Store(int64(stall))
 	return client, nil
 }
 
 func (s *Supervisor) syncAll(ctx context.Context, rt *runtime, client *imapclient.Client) error {
+	defer observe("sync_all", rt.account.ID)()
 	items, err := client.List("", "*", nil).Collect()
 	if err != nil {
 		return err
@@ -503,6 +630,14 @@ func (s *Supervisor) syncAll(ctx context.Context, rt *runtime, client *imapclien
 		if mailbox.SyncMode == "lazy" {
 			continue
 		}
+		// Sent, drafts and archive change rarely, but syncing them cost a SELECT and
+		// a UID SEARCH each regardless, on the same connection new mail needs. STATUS
+		// answers "did anything move" in one command, so a quiet mailbox is skipped
+		// unless reconciliation is due — which is the only thing that can change
+		// without UIDNEXT changing.
+		if mailbox.Role != "inbox" && s.mailboxQuiet(client, mailbox) {
+			continue
+		}
 		if err := s.syncMailbox(ctx, client, mailbox); err != nil {
 			return fmt.Errorf("sync %s: %w", mailbox.RemoteName, err)
 		}
@@ -513,6 +648,26 @@ func (s *Supervisor) syncAll(ctx context.Context, rt *runtime, client *imapclien
 		}
 	}
 	return nil
+}
+
+// mailboxQuiet reports whether a mailbox can be skipped this pass: nothing new
+// arrived and its reconciliation is not yet due. A STATUS failure returns false so
+// the caller falls back to the full path rather than silently skipping a mailbox.
+func (s *Supervisor) mailboxQuiet(client *imapclient.Client, mailbox domain.Mailbox) bool {
+	if mailbox.UIDNext == nil || mailbox.UIDValidity == 0 {
+		return false
+	}
+	value, ok := s.lastReconcile.Load(mailbox.ID)
+	last, valid := value.(time.Time)
+	if !ok || !valid || time.Since(last) >= reconcileIntervalFor(mailbox.Role) {
+		return false
+	}
+	status, err := client.Status(mailbox.RemoteName, &goimap.StatusOptions{UIDNext: true, UIDValidity: true}).Wait()
+	if err != nil {
+		slog.Debug("mailbox status probe failed", "mailbox_id", mailbox.ID, "error", err)
+		return false
+	}
+	return status.UIDNext != 0 && uint32(status.UIDNext) == *mailbox.UIDNext && status.UIDValidity == mailbox.UIDValidity
 }
 
 // drainPending services queued sync requests. The caller must hold the command
@@ -553,8 +708,12 @@ func (s *Supervisor) syncRole(ctx context.Context, client *imapclient.Client, ac
 }
 
 func (s *Supervisor) syncMailbox(ctx context.Context, client *imapclient.Client, mailbox domain.Mailbox) error {
-	// CONDSTORE is requested so SELECT reports HIGHESTMODSEQ, which lets the
-	// reconciliation pass ask only for flags that changed since the last sync.
+	defer observe("sync_mailbox", mailbox.AccountID, "mailbox", mailbox.RemoteName, "role", mailbox.Role)()
+	// CONDSTORE is requested so SELECT reports HIGHESTMODSEQ and the cursor can
+	// record it. Nothing reads it back yet — reconciliation cannot narrow on it
+	// without losing the ability to tell an expunge from an unchanged flag, see
+	// reconcileFlags — but it is the anchor any future QRESYNC path needs, and it is
+	// only useful if it was being recorded all along.
 	condStore := client.Caps().Has(goimap.CapCondStore)
 	selected, err := client.Select(mailbox.RemoteName, &goimap.SelectOptions{ReadOnly: true, CondStore: condStore}).Wait()
 	if err != nil {
@@ -664,9 +823,16 @@ func (s *Supervisor) syncMailbox(ctx context.Context, client *imapclient.Client,
 // and messages deleted or expunged elsewhere.
 //
 // The mailbox must already be selected by the caller, which also holds the
-// command lock. Two commands are issued: a flag FETCH — narrowed with
-// CHANGEDSINCE when the server supports CONDSTORE — and a UID SEARCH ALL used to
-// find the UIDs that are gone.
+// command lock, so everything this does is charged to new-mail latency. It is
+// driven from the UIDs stored locally: one chunked UID FETCH of flags over that
+// list answers both questions at once, because a UID the provider no longer has
+// is simply absent from the response.
+//
+// The earlier shape asked the provider instead — UID SEARCH ALL plus a flag FETCH
+// over everything it returned — which made the cost scale with the remote mailbox
+// rather than with what the app holds. On a Gmail "All Mail" or a long-lived QQ
+// inbox that is a six-figure UID list and a multi-megabyte flag response pulled
+// under the foreground lock every five minutes, and new mail waited behind it.
 func (s *Supervisor) reconcileMailbox(ctx context.Context, client *imapclient.Client, mailbox domain.Mailbox, selected *goimap.SelectData) error {
 	if mailbox.Role == "drafts" {
 		// Drafts have their own reconciliation with conflict handling in
@@ -674,7 +840,7 @@ func (s *Supervisor) reconcileMailbox(ctx context.Context, client *imapclient.Cl
 		return nil
 	}
 	if value, ok := s.lastReconcile.Load(mailbox.ID); ok {
-		if last, valid := value.(time.Time); valid && time.Since(last) < reconcileInterval {
+		if last, valid := value.(time.Time); valid && time.Since(last) < reconcileIntervalFor(mailbox.Role) {
 			return nil
 		}
 	}
@@ -683,22 +849,41 @@ func (s *Supervisor) reconcileMailbox(ctx context.Context, client *imapclient.Cl
 	if mailbox.UIDValidity != 0 && mailbox.UIDValidity != selected.UIDValidity {
 		return nil
 	}
-	present, err := client.UIDSearch(&goimap.SearchCriteria{}, nil).Wait()
+	stored, err := s.repo.ListMailboxUIDs(ctx, mailbox.ID)
 	if err != nil {
-		return fmt.Errorf("search present uids: %w", err)
+		return fmt.Errorf("list local uids: %w", err)
 	}
-	uids := present.AllUIDs()
-	local := make([]uint32, 0, len(uids))
-	for _, uid := range uids {
-		local = append(local, uint32(uid))
+	return s.reconcileMailboxWithUIDs(ctx, client, mailbox, selected, stored)
+}
+
+// reconcileMailboxWithUIDs is reconcileMailbox over an explicit snapshot of the
+// local UIDs. Splitting it out keeps the snapshot visible as an input, because
+// which UIDs were asked about is exactly what decides which ones may be deleted.
+func (s *Supervisor) reconcileMailboxWithUIDs(ctx context.Context, client *imapclient.Client, mailbox domain.Mailbox, selected *goimap.SelectData, stored []uint32) error {
+	if len(stored) == 0 {
+		s.lastReconcile.Store(mailbox.ID, time.Now())
+		return nil
 	}
-	removed, err := s.repo.DeleteMissingMailboxMessages(ctx, mailbox.ID, local)
-	if err != nil {
-		return fmt.Errorf("drop expunged: %w", err)
-	}
-	changed, err := s.reconcileFlags(ctx, client, mailbox, selected, uids)
+	defer observe("reconcile", mailbox.AccountID, "mailbox", mailbox.RemoteName, "local_uids", len(stored))()
+	present, changed, err := s.reconcileFlags(ctx, client, mailbox, stored)
 	if err != nil {
 		return err
+	}
+	// Only UIDs that were asked about and did not come back are gone. Anything that
+	// arrived after the snapshot above is simply not part of this pass.
+	seen := make(map[uint32]struct{}, len(present))
+	for _, uid := range present {
+		seen[uid] = struct{}{}
+	}
+	stale := make([]uint32, 0, len(stored)-len(present))
+	for _, uid := range stored {
+		if _, ok := seen[uid]; !ok {
+			stale = append(stale, uid)
+		}
+	}
+	removed, err := s.repo.DeleteMailboxUIDs(ctx, mailbox.ID, stale)
+	if err != nil {
+		return fmt.Errorf("drop expunged: %w", err)
 	}
 	s.lastReconcile.Store(mailbox.ID, time.Now())
 	if removed == 0 && changed == 0 {
@@ -712,23 +897,29 @@ func (s *Supervisor) reconcileMailbox(ctx context.Context, client *imapclient.Cl
 	return nil
 }
 
-// reconcileFlags fetches the provider's flags and writes back the ones that
-// differ. With CONDSTORE the FETCH is narrowed to what changed since the stored
-// modseq, which on a steady mailbox returns nothing at all.
-func (s *Supervisor) reconcileFlags(ctx context.Context, client *imapclient.Client, mailbox domain.Mailbox, selected *goimap.SelectData, uids []goimap.UID) (int, error) {
-	if len(uids) == 0 {
-		return 0, nil
-	}
-	options := &goimap.FetchOptions{UID: true, Flags: true}
-	if client.Caps().Has(goimap.CapCondStore) && mailbox.HighestModSeq != nil && *mailbox.HighestModSeq > 0 && selected.HighestModSeq > 0 {
-		options.ChangedSince = *mailbox.HighestModSeq
-	}
+// reconcileFlags fetches the provider's flags for the UIDs held locally and
+// writes back the ones that differ. It returns the UIDs the provider still has,
+// which is what the caller uses to find the expunged ones.
+//
+// CHANGEDSINCE is deliberately not used. It would shrink the response, but a UID
+// omitted because its flags did not change is indistinguishable from one that was
+// expunged, and treating the first as the second deletes mail that still exists.
+// The request is already bounded by the local row count, so the full answer is
+// affordable.
+func (s *Supervisor) reconcileFlags(ctx context.Context, client *imapclient.Client, mailbox domain.Mailbox, stored []uint32) ([]uint32, int, error) {
+	present := make([]uint32, 0, len(stored))
 	total := 0
-	for start := 0; start < len(uids); start += reconcileFlagChunk {
-		end := min(start+reconcileFlagChunk, len(uids))
-		fetched, err := client.Fetch(goimap.UIDSetNum(uids[start:end]...), options).Collect()
+	options := &goimap.FetchOptions{UID: true, Flags: true}
+	for start := 0; start < len(stored); start += reconcileFlagChunk {
+		end := min(start+reconcileFlagChunk, len(stored))
+		chunk := stored[start:end]
+		set := make([]goimap.UID, len(chunk))
+		for index, uid := range chunk {
+			set[index] = goimap.UID(uid)
+		}
+		fetched, err := client.Fetch(goimap.UIDSetNum(set...), options).Collect()
 		if err != nil {
-			return total, fmt.Errorf("fetch flags: %w", err)
+			return nil, total, fmt.Errorf("fetch flags: %w", err)
 		}
 		states := make([]ports.RemoteFlagState, 0, len(fetched))
 		for _, item := range fetched {
@@ -736,6 +927,7 @@ func (s *Supervisor) reconcileFlags(ctx context.Context, client *imapclient.Clie
 			for index, flag := range item.Flags {
 				values[index] = string(flag)
 			}
+			present = append(present, uint32(item.UID))
 			states = append(states, ports.RemoteFlagState{
 				UID:       uint32(item.UID),
 				IsRead:    hasFlag(item.Flags, goimap.FlagSeen),
@@ -745,11 +937,11 @@ func (s *Supervisor) reconcileFlags(ctx context.Context, client *imapclient.Clie
 		}
 		changed, err := s.repo.ReconcileMailboxFlags(ctx, mailbox.ID, states)
 		if err != nil {
-			return total, fmt.Errorf("apply flags: %w", err)
+			return nil, total, fmt.Errorf("apply flags: %w", err)
 		}
 		total += changed
 	}
-	return total, nil
+	return present, total, nil
 }
 
 // isAuthFailure reports whether the provider rejected the credentials rather than

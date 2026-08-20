@@ -147,6 +147,16 @@ func (s *Store) UpdateAccountStatus(ctx context.Context, id int64, status string
 	return s.db.WithContext(ctx).Model(&domain.Account{}).Where("id = ?", id).Updates(values).Error
 }
 
+// UpsertMailbox records what LIST reported about a mailbox: its name, delimiter,
+// role and sync tier.
+//
+// It deliberately does not touch uid_next or highest_modseq. Those are the sync
+// cursor and only UpdateMailboxCursor knows them; the caller here builds its
+// struct from a LIST response, where both are always nil. Including them in the
+// conflict clause meant every full sync wiped the cursor it had just written,
+// which silently disabled both the cheap STATUS short-circuit that decides whether
+// a mailbox needs syncing at all and any CONDSTORE narrowing that depends on a
+// stored modseq.
 func (s *Store) UpsertMailbox(ctx context.Context, mailbox *domain.Mailbox) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
@@ -155,8 +165,7 @@ func (s *Store) UpsertMailbox(ctx context.Context, mailbox *domain.Mailbox) erro
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(account_id, remote_name) DO UPDATE SET
         display_name=excluded.display_name, delimiter=excluded.delimiter, role=excluded.role,
-        sync_mode=excluded.sync_mode, uid_next=excluded.uid_next, highest_modseq=excluded.highest_modseq,
-        updated_at=excluded.updated_at`, mailbox.AccountID, mailbox.RemoteName, mailbox.DisplayName,
+        sync_mode=excluded.sync_mode, updated_at=excluded.updated_at`, mailbox.AccountID, mailbox.RemoteName, mailbox.DisplayName,
 		mailbox.Delimiter, mailbox.Role, mailbox.SyncMode, mailbox.UIDValidity, mailbox.UIDNext,
 		mailbox.HighestModSeq, mailbox.LastUID, mailbox.LastSyncAt, mailbox.CreatedAt, mailbox.UpdatedAt).Error
 }

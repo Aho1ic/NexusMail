@@ -33,16 +33,19 @@ type Account struct {
 func (Account) TableName() string { return "accounts" }
 
 type Mailbox struct {
-	ID            int64   `json:"id"`
-	AccountID     int64   `json:"account_id"`
-	RemoteName    string  `json:"remote_name"`
-	DisplayName   string  `json:"display_name"`
-	Delimiter     *string `json:"delimiter,omitempty"`
-	Role          string  `json:"role"`
-	SyncMode      string  `json:"sync_mode"`
-	UIDValidity   uint32  `json:"uid_validity"`
-	UIDNext       *uint32 `json:"uid_next,omitempty"`
-	HighestModSeq *uint64 `json:"highest_modseq,omitempty"`
+	ID          int64   `json:"id"`
+	AccountID   int64   `json:"account_id"`
+	RemoteName  string  `json:"remote_name"`
+	DisplayName string  `json:"display_name"`
+	Delimiter   *string `json:"delimiter,omitempty"`
+	Role        string  `json:"role"`
+	SyncMode    string  `json:"sync_mode"`
+	UIDValidity uint32  `json:"uid_validity"`
+	UIDNext     *uint32 `json:"uid_next,omitempty"`
+	// The column is highest_modseq, but GORM's naming strategy derives
+	// highest_mod_seq from the field name, so without this tag the value was written
+	// through raw column names and then never read back: every load returned nil.
+	HighestModSeq *uint64 `json:"highest_modseq,omitempty" gorm:"column:highest_modseq"`
 	LastUID       uint32  `json:"last_uid"`
 	LastSyncAt    *int64  `json:"last_sync_at,omitempty"`
 	CreatedAt     int64   `json:"created_at"`

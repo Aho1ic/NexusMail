@@ -109,16 +109,16 @@ func TestReconcileMailboxFlagsEmptyIsNoop(t *testing.T) {
 	}
 }
 
-// TestDeleteMissingMailboxMessages covers expunge propagation. Mail deleted in
-// another client used to stay in the feed permanently, and opening it produced a
-// body fetch that could never succeed.
-func TestDeleteMissingMailboxMessages(t *testing.T) {
+// TestDeleteMailboxUIDs covers expunge propagation. Mail deleted in another
+// client used to stay in the feed permanently, and opening it produced a body
+// fetch that could never succeed.
+func TestDeleteMailboxUIDs(t *testing.T) {
 	store := openTestStore(t)
 	ctx := context.Background()
 	_, mailbox := seedAccountMailbox(t, store)
 	ids := seedMessages(t, store, mailbox.ID, 3)
 
-	removed, err := store.DeleteMissingMailboxMessages(ctx, mailbox.ID, []uint32{1, 3})
+	removed, err := store.DeleteMailboxUIDs(ctx, mailbox.ID, []uint32{2})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -141,21 +141,25 @@ func TestDeleteMissingMailboxMessages(t *testing.T) {
 		t.Fatal("expunged message row survived")
 	}
 
-	// Idempotent: a second pass over the same present set must not remove more.
-	if removed, err = store.DeleteMissingMailboxMessages(ctx, mailbox.ID, []uint32{1, 3}); err != nil || removed != 0 {
+	// Idempotent: replaying the same stale set must not remove more.
+	if removed, err = store.DeleteMailboxUIDs(ctx, mailbox.ID, []uint32{2}); err != nil || removed != 0 {
 		t.Fatalf("second pass removed=%d err=%v", removed, err)
+	}
+
+	// A UID that was never stored is not an error and changes nothing.
+	if removed, err = store.DeleteMailboxUIDs(ctx, mailbox.ID, []uint32{99}); err != nil || removed != 0 {
+		t.Fatalf("unknown uid removed=%d err=%v", removed, err)
 	}
 }
 
-func TestDeleteMissingMailboxMessagesEmptiesMailbox(t *testing.T) {
+func TestDeleteMailboxUIDsEmptiesMailbox(t *testing.T) {
 	store := openTestStore(t)
 	ctx := context.Background()
 	_, mailbox := seedAccountMailbox(t, store)
 	seedMessages(t, store, mailbox.ID, 2)
 
-	// An empty present list is a real state, not a missing argument: the folder was
-	// emptied on the server.
-	removed, err := store.DeleteMissingMailboxMessages(ctx, mailbox.ID, nil)
+	// Every UID gone is a real state: the folder was emptied on the server.
+	removed, err := store.DeleteMailboxUIDs(ctx, mailbox.ID, []uint32{1, 2})
 	if err != nil || removed != 2 {
 		t.Fatalf("removed=%d err=%v", removed, err)
 	}
@@ -168,10 +172,10 @@ func TestDeleteMissingMailboxMessagesEmptiesMailbox(t *testing.T) {
 	}
 }
 
-// TestDeleteMissingMailboxMessagesKeepsMessagesInOtherMailboxes protects the
-// second half of the delete: a message filed in two mailboxes (Gmail labels) is
-// only unreachable once the last mapping is gone.
-func TestDeleteMissingMailboxMessagesKeepsMessagesInOtherMailboxes(t *testing.T) {
+// TestDeleteMailboxUIDsKeepsMessagesInOtherMailboxes protects the second half of
+// the delete: a message filed in two mailboxes (Gmail labels) is only
+// unreachable once the last mapping is gone.
+func TestDeleteMailboxUIDsKeepsMessagesInOtherMailboxes(t *testing.T) {
 	store := openTestStore(t)
 	ctx := context.Background()
 	account, inbox := seedAccountMailbox(t, store)
@@ -196,13 +200,13 @@ func TestDeleteMissingMailboxMessagesKeepsMessagesInOtherMailboxes(t *testing.T)
 		t.Fatal(err)
 	}
 
-	if _, err := store.DeleteMissingMailboxMessages(ctx, inbox.ID, nil); err != nil {
+	if _, err := store.DeleteMailboxUIDs(ctx, inbox.ID, []uint32{1}); err != nil {
 		t.Fatal(err)
 	}
 	if _, _, err := store.GetMessage(ctx, ids[0]); err != nil {
 		t.Fatalf("message still filed in archive was deleted: %v", err)
 	}
-	if _, err := store.DeleteMissingMailboxMessages(ctx, stored.ID, nil); err != nil {
+	if _, err := store.DeleteMailboxUIDs(ctx, stored.ID, []uint32{7}); err != nil {
 		t.Fatal(err)
 	}
 	if _, _, err := store.GetMessage(ctx, ids[0]); err == nil {

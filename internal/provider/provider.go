@@ -67,7 +67,10 @@ var roleRules = []roleRule{
 	{role: "junk", syncMode: "lazy", words: []string{"junk", "spam"}, contains: []string{"垃圾"}},
 	{role: "sent", syncMode: "periodic", words: []string{"sent"}, contains: []string{"已发送", "发件箱"}},
 	{role: "drafts", syncMode: "periodic", words: []string{"draft", "drafts"}, contains: []string{"草稿"}},
-	{role: "archive", syncMode: "periodic", words: []string{"archive", "archives"}, contains: []string{"归档", "所有邮件"}},
+	// "所有邮件" is the localised every-message view, so it is lazy for the same
+	// reason "All Mail" is, while a real archive folder stays on the periodic tick.
+	{role: "archive", syncMode: "lazy", contains: []string{"所有邮件"}},
+	{role: "archive", syncMode: "periodic", words: []string{"archive", "archives"}, contains: []string{"归档"}},
 }
 
 func ClassifyMailbox(name string, attributes []string) (role, syncMode string) {
@@ -79,8 +82,16 @@ func ClassifyMailbox(name string, attributes []string) (role, syncMode string) {
 			return "sent", "periodic"
 		case `\drafts`:
 			return "drafts", "periodic"
-		case `\archive`, `\all`:
+		case `\archive`:
 			return "archive", "periodic"
+		case `\all`:
+			// \All is not an archive folder, it is every message in the account —
+			// Gmail's "All Mail" holds a second copy of the inbox, the sent folder and
+			// everything ever archived. Syncing it on the periodic tick doubled the
+			// first import and then re-walked the whole account history every five
+			// minutes on the one command connection, which is what pushed new-mail
+			// latency into the minutes. It syncs on demand like trash and junk.
+			return "archive", "lazy"
 		case `\trash`:
 			return "trash", "lazy"
 		case `\junk`:
@@ -91,10 +102,11 @@ func ClassifyMailbox(name string, attributes []string) (role, syncMode string) {
 	if normalized == "inbox" {
 		return "inbox", "realtime"
 	}
-	// "All Mail" is Gmail's archive and is two words, so it is checked before the
-	// single-word rules rather than being expressed as one of them.
+	// "All Mail" is Gmail's every-message view and is two words, so it is checked
+	// before the single-word rules rather than being expressed as one of them. It is
+	// lazy for the same reason \All is.
 	if hasPhrase(normalized, "all mail") {
-		return "archive", "periodic"
+		return "archive", "lazy"
 	}
 	words := mailboxWords(normalized)
 	for _, rule := range roleRules {

@@ -112,41 +112,42 @@ func (s *Store) ReconcileMailboxFlags(ctx context.Context, mailboxID int64, stat
 	return changed, err
 }
 
-// DeleteMissingMailboxMessages drops the local mapping for every UID the mailbox
-// no longer holds, then removes messages that are left in no mailbox at all.
+// ListMailboxUIDs returns the UIDs this mailbox holds locally, ascending.
+func (s *Store) ListMailboxUIDs(ctx context.Context, mailboxID int64) ([]uint32, error) {
+	var uids []uint32
+	err := s.db.WithContext(ctx).Raw("SELECT uid FROM mailbox_messages WHERE mailbox_id = ? ORDER BY uid", mailboxID).Scan(&uids).Error
+	return uids, err
+}
+
+// DeleteMailboxUIDs drops the local mapping for UIDs the provider no longer
+// holds, then removes messages that are left in no mailbox at all.
 //
 // Without this, mail deleted or expunged in another client stayed in the feed
-// forever, and opening it produced a body fetch that could never succeed. Passing
-// an empty present list clears the mailbox, which is what an emptied folder means.
-func (s *Store) DeleteMissingMailboxMessages(ctx context.Context, mailboxID int64, present []uint32) (int, error) {
+// forever, and opening it produced a body fetch that could never succeed.
+//
+// The caller passes the UIDs it established are gone rather than the ones that
+// remain: deriving the stale set here from "everything not in this list" would
+// delete any row inserted after the caller took its snapshot, which for the inbox
+// means deleting mail that had just arrived.
+func (s *Store) DeleteMailboxUIDs(ctx context.Context, mailboxID int64, stale []uint32) (int, error) {
+	if len(stale) == 0 {
+		return 0, nil
+	}
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	removed := 0
 	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		var stale []uint32
-		if err := tx.Raw("SELECT uid FROM mailbox_messages WHERE mailbox_id = ?", mailboxID).Scan(&stale).Error; err != nil {
-			return err
-		}
-		keep := make(map[uint32]struct{}, len(present))
-		for _, uid := range present {
-			keep[uid] = struct{}{}
-		}
-		drop := make([]uint32, 0, len(stale))
-		for _, uid := range stale {
-			if _, ok := keep[uid]; !ok {
-				drop = append(drop, uid)
+		for start := 0; start < len(stale); start += sqliteParameterChunk {
+			end := min(start+sqliteParameterChunk, len(stale))
+			result := tx.Exec("DELETE FROM mailbox_messages WHERE mailbox_id = ? AND uid IN ?", mailboxID, stale[start:end])
+			if result.Error != nil {
+				return result.Error
 			}
+			removed += int(result.RowsAffected)
 		}
-		if len(drop) == 0 {
+		if removed == 0 {
 			return nil
 		}
-		for start := 0; start < len(drop); start += sqliteParameterChunk {
-			end := min(start+sqliteParameterChunk, len(drop))
-			if err := tx.Exec("DELETE FROM mailbox_messages WHERE mailbox_id = ? AND uid IN ?", mailboxID, drop[start:end]).Error; err != nil {
-				return err
-			}
-		}
-		removed = len(drop)
 		// An incoming message that is in no mailbox is unreachable: it cannot be
 		// opened, its body cannot be fetched, and it would sit in the feed as a
 		// permanent error. Outgoing mail has no mailbox mapping by design.
