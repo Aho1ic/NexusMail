@@ -32,6 +32,9 @@ describe('mark the current view read', () => {
   let inbox = [message(1, 'First mail', false), message(2, 'Second mail', false)]
   let markRead: { updated: number; capped?: boolean; partial?: boolean }
   let calls: string[]
+  // null means "let the fake derive it from the page", which is what a view smaller
+  // than one page looks like.
+  let unreadTotal: number | null
 
   beforeEach(() => {
     sessionStorage.clear()
@@ -40,6 +43,7 @@ describe('mark the current view read', () => {
     inbox = [message(1, 'First mail', false), message(2, 'Second mail', false)]
     markRead = { updated: 2 }
     calls = []
+    unreadTotal = null
     vi.stubGlobal('WebSocket', FakeSocket as unknown as typeof WebSocket)
     sessionStorage.setItem('nexusmail.csrf', 'csrf-value')
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -52,7 +56,15 @@ describe('mark the current view read', () => {
         inbox = inbox.map(item => ({ ...item, is_read: true }))
         return json(markRead)
       }
-      if (url.startsWith('/api/v1/messages')) return json({ items: inbox })
+      const detail = url.match(/^\/api\/v1\/messages\/(\d+)$/)
+      if (detail) {
+        const item = inbox.find(entry => entry.id === Number(detail[1]))
+        return json({ message: item, attachments: [] })
+      }
+      if (url.startsWith('/api/v1/messages')) {
+        const total = unreadTotal ?? inbox.filter(item => !item.is_read).length
+        return json({ items: inbox, unread_total: total })
+      }
       return json({})
     }))
   })
@@ -91,7 +103,7 @@ describe('mark the current view read', () => {
 
   it('reloads the feed so the unread badges cannot go stale', async () => {
     await mount()
-    // The sidebar count comes from the loaded page, not from the response.
+    // The sidebar count comes from the server total that ships with the feed.
     expect(screen.getByText('2')).toBeInTheDocument()
 
     fireEvent.click(screen.getByRole('button', { name: '全部已读' }))
@@ -135,5 +147,42 @@ describe('mark the current view read', () => {
 
     expect(screen.getByRole('button', { name: '全部已读' })).toBeDisabled()
     expect(calls.some(call => call.includes('mark-read'))).toBe(false)
+  })
+
+  it('counts the whole view, not the loaded page', async () => {
+    // One page holds 40 rows while the view holds far more unread mail. Counting the
+    // loaded rows reported 2 here, and reported 0 for any view whose unread mail sat
+    // entirely past the first page, which left the button disabled with work to do.
+    unreadTotal = 137
+    await mount()
+
+    expect(screen.getByText('137')).toBeInTheDocument()
+    const button = screen.getByRole('button', { name: '全部已读' })
+    expect(button).toBeEnabled()
+    expect(button).toHaveAttribute('title', '将当前视图的 137 封未读邮件标记为已读')
+  })
+
+  it('offers the pass when every unread message is past the first page', async () => {
+    // Every loaded row is read, yet the view still holds unread mail further down.
+    inbox = [message(1, 'First mail', true), message(2, 'Second mail', true)]
+    unreadTotal = 12
+    await mount()
+
+    expect(screen.getByRole('button', { name: '全部已读' })).toBeEnabled()
+    expect(screen.getByText('12')).toBeInTheDocument()
+  })
+
+  it('draws the badge down when a message is opened', async () => {
+    unreadTotal = 9
+    await mount()
+    expect(screen.getByText('9')).toBeInTheDocument()
+
+    // The badge tracks the server total, so opening a message has to adjust it locally
+    // as well; otherwise the count only moves on the next feed load.
+    unreadTotal = 8
+    fireEvent.click(screen.getByRole('button', { name: /First mail/ }))
+
+    await waitFor(() => expect(screen.getByText('8')).toBeInTheDocument())
+    await waitFor(() => expect(calls).toContain('PATCH /api/v1/messages/1'))
   })
 })

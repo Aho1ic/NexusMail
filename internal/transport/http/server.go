@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"log/slog"
 	"mime"
 	"net/http"
 	"net/url"
@@ -38,21 +39,22 @@ type Hub interface {
 }
 
 type Server struct {
-	cfg      config.Config
-	repo     ports.Repository
-	blobs    ports.BlobStore
-	accounts *accountservice.Service
-	messages *messageservice.Service
-	drafts   *draftservice.Service
-	sessions *sessionservice.Service
-	oauth    *oauth.Manager
-	sync     *imapprovider.Supervisor
-	sender   *sendservice.Worker
-	hub      Hub
-	appCtx   context.Context
-	router   *gin.Engine
-	rateMu   sync.Mutex
-	rate     map[string][]time.Time
+	cfg       config.Config
+	repo      ports.Repository
+	blobs     ports.BlobStore
+	accounts  *accountservice.Service
+	messages  *messageservice.Service
+	drafts    *draftservice.Service
+	sessions  *sessionservice.Service
+	oauth     *oauth.Manager
+	sync      *imapprovider.Supervisor
+	sender    *sendservice.Worker
+	hub       Hub
+	appCtx    context.Context
+	router    *gin.Engine
+	rateMu    sync.Mutex
+	rate      map[string][]time.Time
+	rateSwept time.Time
 }
 
 func New(cfg config.Config, repo ports.Repository, blobs ports.BlobStore, accounts *accountservice.Service, messages *messageservice.Service, drafts *draftservice.Service, sessions *sessionservice.Service, oauthManager *oauth.Manager, syncer *imapprovider.Supervisor, sender *sendservice.Worker, hub Hub, appCtx context.Context) *Server {
@@ -66,6 +68,15 @@ func (s *Server) Handler() http.Handler { return s.router }
 func (s *Server) routes() *gin.Engine {
 	gin.SetMode(gin.ReleaseMode)
 	router := gin.New()
+	// Gin trusts every proxy by default, which makes ClientIP() report whatever
+	// X-Forwarded-For says. The login throttle is keyed on that address, so an
+	// attacker could get a fresh bucket per request just by varying the header —
+	// and grow the bucket map without bound while doing it. Only addresses the
+	// deployment actually declares are trusted.
+	if err := router.SetTrustedProxies(s.cfg.TrustedProxies); err != nil {
+		slog.Warn("invalid NEXUSMAIL_TRUSTED_PROXIES, falling back to no trusted proxies", "error", err)
+		_ = router.SetTrustedProxies(nil)
+	}
 	router.Use(gin.Recovery(), requestID(), securityHeaders())
 	router.GET("/healthz", func(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"status": "ok"}) })
 	router.GET("/readyz", s.ready)
@@ -101,6 +112,16 @@ func (s *Server) authenticate() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		if apiKey := c.GetHeader("X-API-Key"); apiKey != "" {
 			if !s.sessions.CheckAPIKey(apiKey) {
+				// Only wrong keys are counted, so a working integration is never
+				// throttled however busy it gets, while guessing runs into the same
+				// ceiling the login endpoint has. Keyed on the address rather than on
+				// the key itself: keying on the guess would hand out a fresh budget per
+				// attempt and put candidate secrets in the map.
+				if !s.allowAttempt("apikey:"+c.ClientIP(), apiKeyRateLimit) {
+					fail(c, 429, "rate_limited", "too many failed API key attempts", nil)
+					c.Abort()
+					return
+				}
 				fail(c, http.StatusUnauthorized, "unauthorized", "invalid API key", nil)
 				c.Abort()
 				return
@@ -578,27 +599,59 @@ func sameOrigin(request *http.Request, publicURL string) bool {
 	return err == nil && subtle.ConstantTimeCompare([]byte(strings.ToLower(actual.Host)), []byte(strings.ToLower(expected.Host))) == 1 && actual.Scheme == expected.Scheme
 }
 
+const (
+	rateWindow      = time.Minute
+	loginRateLimit  = 5
+	apiKeyRateLimit = 20
+	rateSweepEvery  = 5 * time.Minute
+)
+
 func (s *Server) rateLimitLogin() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		now := time.Now()
-		key := c.ClientIP()
-		s.rateMu.Lock()
-		recent := s.rate[key][:0]
-		for _, item := range s.rate[key] {
-			if now.Sub(item) < time.Minute {
-				recent = append(recent, item)
-			}
-		}
-		if len(recent) >= 5 {
-			s.rate[key] = recent
-			s.rateMu.Unlock()
+		if !s.allowAttempt("login:"+c.ClientIP(), loginRateLimit) {
 			fail(c, 429, "rate_limited", "too many login attempts", nil)
 			c.Abort()
 			return
 		}
-		s.rate[key] = append(recent, now)
-		s.rateMu.Unlock()
 		c.Next()
+	}
+}
+
+// allowAttempt records one attempt against a sliding window and reports whether
+// it fits under the limit. A bucket that empties is deleted rather than left
+// behind: keys are caller controlled, so keeping spent buckets lets the map grow
+// with every distinct address that ever probed the endpoint.
+func (s *Server) allowAttempt(key string, limit int) bool {
+	now := time.Now()
+	s.rateMu.Lock()
+	defer s.rateMu.Unlock()
+	s.sweepRate(now)
+	recent := s.rate[key][:0]
+	for _, item := range s.rate[key] {
+		if now.Sub(item) < rateWindow {
+			recent = append(recent, item)
+		}
+	}
+	if len(recent) >= limit {
+		s.rate[key] = recent
+		return false
+	}
+	s.rate[key] = append(recent, now)
+	return true
+}
+
+// sweepRate drops buckets nothing has touched for a window. Without it a key that
+// is never retried keeps its slice forever, since expiry is only ever evaluated
+// on the path that looks that key up again. Callers must hold rateMu.
+func (s *Server) sweepRate(now time.Time) {
+	if now.Sub(s.rateSwept) < rateSweepEvery {
+		return
+	}
+	s.rateSwept = now
+	for key, stamps := range s.rate {
+		if len(stamps) == 0 || now.Sub(stamps[len(stamps)-1]) >= rateWindow {
+			delete(s.rate, key)
+		}
 	}
 }
 func idParam(c *gin.Context, name string) (int64, bool) {

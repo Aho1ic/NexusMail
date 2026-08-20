@@ -35,6 +35,10 @@ type Config struct {
 	SessionMaxTTL    time.Duration
 	ShutdownTimeout  time.Duration
 	LogLevel         string
+	// TrustedProxies lists the hops allowed to set X-Forwarded-For. Empty means
+	// the peer address is the client address, which is what a direct bind wants:
+	// otherwise the login throttle can be sidestepped by forging the header.
+	TrustedProxies []string
 }
 
 func Load() (Config, error) {
@@ -51,6 +55,7 @@ func Load() (Config, error) {
 		SessionMaxTTL:    7 * 24 * time.Hour,
 		ShutdownTimeout:  15 * time.Second,
 		LogLevel:         env("NEXUSMAIL_LOG_LEVEL", "info"),
+		TrustedProxies:   splitList(os.Getenv("NEXUSMAIL_TRUSTED_PROXIES")),
 		Google: OAuthProvider{
 			ClientID:     secretEnv("NEXUSMAIL_GOOGLE_CLIENT_ID"),
 			ClientSecret: secretEnv("NEXUSMAIL_GOOGLE_CLIENT_SECRET"),
@@ -80,6 +85,18 @@ func Load() (Config, error) {
 		return Config{}, errors.New("cache and outbound size limits must be positive")
 	}
 	return cfg, nil
+}
+
+// splitList reads a comma separated setting, dropping blanks so a trailing comma
+// or a value of " " cannot turn into an entry that matches nothing.
+func splitList(raw string) []string {
+	var out []string
+	for _, part := range strings.Split(raw, ",") {
+		if trimmed := strings.TrimSpace(part); trimmed != "" {
+			out = append(out, trimmed)
+		}
+	}
+	return out
 }
 
 func env(key, fallback string) string {

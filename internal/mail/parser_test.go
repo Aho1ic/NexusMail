@@ -63,3 +63,53 @@ func TestComposeDoesNotExposeBCCHeader(t *testing.T) {
 		t.Fatal("BCC leaked into MIME headers")
 	}
 }
+
+// TestSanitizeHTMLNarrowsDataURIs covers the scheme allowlist. Inline images arrive
+// as data URIs so the scheme cannot simply be dropped, but allowing it outright also
+// allowed data:text/html on a link — script execution the rest of the policy does
+// not cover.
+func TestSanitizeHTMLNarrowsDataURIs(t *testing.T) {
+	const pngPixel = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAAAAAA6fptVAAAACklEQVQI12NgAAAAAgAB4iG8MwAAAABJRU5ErkJggg=="
+
+	inline := sanitizeHTML(`<p><img src="` + pngPixel + `"></p>`)
+	if !strings.Contains(inline, "data:image/png;base64,") {
+		t.Fatalf("inline image was stripped: %s", inline)
+	}
+
+	for _, payload := range []string{
+		`<a href="data:text/html;base64,PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg==">click</a>`,
+		`<a href="data:text/html,<script>alert(1)</script>">click</a>`,
+		`<img src="data:text/html;base64,PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg==">`,
+		`<img src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciPjxzY3JpcHQ+YWxlcnQoMSk8L3NjcmlwdD48L3N2Zz4=">`,
+		`<a href="javascript:alert(1)">click</a>`,
+	} {
+		got := sanitizeHTML(payload)
+		if strings.Contains(got, "data:text/html") || strings.Contains(got, "svg+xml") || strings.Contains(got, "javascript:") {
+			t.Errorf("sanitizeHTML(%q) kept an unsafe URL: %s", payload, got)
+		}
+	}
+}
+
+// TestSanitizeHTMLKeepsCIDReferences protects the other half: a stripped cid: URL
+// turns every embedded image in normal mail into a broken one.
+func TestSanitizeHTMLKeepsCIDReferences(t *testing.T) {
+	got := sanitizeHTML(`<p><img src="cid:logo@example.com"></p>`)
+	if !strings.Contains(got, "cid:logo@example.com") {
+		t.Fatalf("cid reference was stripped: %s", got)
+	}
+}
+
+// TestSanitizeHTMLDefersRemoteImages records the privacy behaviour: the URL is kept
+// for an explicit opt-in, but the initial render must not fetch it, because that
+// fetch reports the reader's address and open time to the sender.
+func TestSanitizeHTMLDefersRemoteImages(t *testing.T) {
+	got := sanitizeHTML(`<p><img src="https://tracker.example/open.gif?id=42"></p>`)
+	// The check is on the src attribute specifically: the URL stays in the output under
+	// the deferred attribute name, so searching for the host alone proves nothing.
+	if strings.Contains(got, `<img src=`) {
+		t.Fatalf("remote image is still loaded on render: %s", got)
+	}
+	if !strings.Contains(got, "data-nexusmail-remote-src") {
+		t.Fatalf("remote URL was discarded instead of deferred: %s", got)
+	}
+}

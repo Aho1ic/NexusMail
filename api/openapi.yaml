@@ -112,9 +112,16 @@ paths:
             application/json:
               schema:
                 type: object
+                required: [items, unread_total]
                 properties:
-                  items: { type: array, items: { $ref: '#/components/schemas/Message' } }
+                  items: { type: array, items: { $ref: '#/components/schemas/MessageSummary' } }
                   next_cursor: { type: string }
+                  unread_total:
+                    type: integer
+                    description: >-
+                      Unread incoming messages in the whole view, not just on this
+                      page. Independent of cursor and limit, so it is the count to
+                      show in a badge; items alone cannot produce it.
   /api/v1/messages/mark-read:
     post:
       summary: Mark every unread message in the current view as read
@@ -360,8 +367,12 @@ components:
         uid_validity: { type: integer }
         last_uid: { type: integer }
         last_sync_at: { type: [integer, 'null'], format: int64 }
-    Message:
+    MessageSummary:
       type: object
+      description: >-
+        Feed projection. body_text and body_html are always absent here: a page of
+        50 full bodies is megabytes of payload the list never renders. Read a single
+        message to get them.
       properties:
         id: { type: integer, format: int64 }
         account_id: { type: integer, format: int64 }
@@ -375,14 +386,19 @@ components:
         cc: { type: string, description: JSON address array }
         bcc: { type: string, description: JSON address array }
         snippet: { type: string }
-        body_text: { type: string }
-        body_html: { type: string, description: Server-sanitized HTML }
         body_state: { type: string, enum: [metadata, queued, fetching, ready, error] }
         size_bytes: { type: integer, format: int64 }
         received_at: { type: integer, format: int64 }
         is_read: { type: boolean }
         is_starred: { type: boolean }
         has_attachments: { type: boolean }
+    Message:
+      allOf:
+        - $ref: '#/components/schemas/MessageSummary'
+        - type: object
+          properties:
+            body_text: { type: string }
+            body_html: { type: string, description: Server-sanitized HTML }
     Attachment:
       type: object
       properties:

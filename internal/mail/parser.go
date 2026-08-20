@@ -2,11 +2,14 @@ package mail
 
 import (
 	"bytes"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
 	"mime"
 	"net/mail"
+	"net/url"
+	"regexp"
 	"strings"
 	"unicode/utf8"
 
@@ -113,10 +116,33 @@ func Parse(reader io.Reader) (Parsed, error) {
 func sanitizeHTML(input string) string {
 	policy := bluemonday.UGCPolicy()
 	policy.AllowAttrs("class").OnElements("pre", "code")
-	policy.AllowURLSchemes("cid", "data")
+	policy.AllowURLSchemes("cid")
+	// Inline attachments arrive as data URIs, so the scheme cannot simply be dropped,
+	// but allowing it outright also allows data:text/html on a link — script execution
+	// the rest of the policy does not cover. bluemonday's own AllowDataURIImages is
+	// not used because its allowlist includes svg+xml, and SVG carries script.
+	policy.RequireParseableURLs(true)
+	policy.AllowURLSchemeWithCustomPolicy("data", allowInlineRasterImage)
 	policy.RequireNoFollowOnLinks(true)
 	policy.RequireNoReferrerOnLinks(true)
 	return blockRemoteImages(policy.Sanitize(input))
+}
+
+// inlineRasterImage matches the data URI payloads an embedded image legitimately
+// uses. Raster only and base64 only: SVG is a document format that can carry script,
+// and a non-base64 payload is a text body wearing an image label.
+var inlineRasterImage = regexp.MustCompile(`^image/(gif|jpeg|png|webp);base64,`)
+
+func allowInlineRasterImage(target *url.URL) bool {
+	if target.RawQuery != "" || target.Fragment != "" {
+		return false
+	}
+	prefix := inlineRasterImage.FindString(target.Opaque)
+	if prefix == "" {
+		return false
+	}
+	_, err := base64.StdEncoding.DecodeString(target.Opaque[len(prefix):])
+	return err == nil
 }
 
 // blockRemoteImages keeps the sanitized URL available for an explicit UI opt-in

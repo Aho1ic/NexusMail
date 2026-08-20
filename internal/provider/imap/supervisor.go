@@ -90,6 +90,14 @@ type Supervisor struct {
 	bodySlots    chan struct{}
 	bodySeen     sync.Map
 	workerCancel context.CancelFunc
+	// bodyAttempts counts failed prefetch attempts per message so a body that can
+	// never be fetched stops being retried. It is memory-only: a restart is a fine
+	// time to try again, and persisting it would need a migration the runner
+	// cannot apply.
+	bodyAttempts sync.Map
+	// lastReconcile tracks when each mailbox last had its flags and deletions
+	// checked against the provider.
+	lastReconcile sync.Map
 	// dial overrides transport establishment in tests; nil uses TLS to the account host.
 	dial func(context.Context, domain.Account) (net.Conn, error)
 	// dropIdleNotifications simulates providers that advertise IDLE but never
@@ -109,6 +117,27 @@ const periodicSyncInterval = 5 * time.Minute
 // bulkFlagChunk caps the UIDs per STORE so a large mark-read stays inside the
 // command line limits servers enforce and yields the connection between chunks.
 const bulkFlagChunk = 500
+
+// reconcileInterval bounds how often a mailbox is checked for changes the
+// append-only path cannot see: flags set in another client and messages deleted
+// or expunged elsewhere. It costs one UID FETCH of flags over the whole mailbox,
+// so it runs on the periodic sync rather than on the 5s probe.
+const reconcileInterval = 5 * time.Minute
+
+// reconcileFlagChunk caps the UIDs per flag FETCH during reconciliation.
+const reconcileFlagChunk = 2000
+
+// maxBodyAttempts bounds how often the prefetch retries one message. The
+// candidate query returns everything that is not 'ready', which includes 'error',
+// so without a cap a body that can never be fetched — the message was deleted
+// remotely, or the provider refuses the part — was retried every 5 seconds for
+// the life of the process, taking the command connection each time.
+const maxBodyAttempts = 3
+
+// authBackoff is the retry delay after the provider rejected the credentials.
+// Reconnecting every second with a password the server already refused is how
+// accounts get locked out, and no amount of retrying will fix it.
+const authBackoff = 15 * time.Minute
 
 // otpFreshness bounds how old a message may be for its verification code to ride
 // on a realtime event. A first sync imports 30 days of mail and the body prefetch
@@ -183,24 +212,42 @@ func (s *Supervisor) commandLoop(ctx context.Context, rt *runtime) {
 		_ = s.repo.UpdateAccountStatus(ctx, rt.account.ID, "connecting", nil)
 		client, err := s.connect(ctx, rt.account, nil)
 		if err != nil {
-			s.setError(ctx, rt.account.ID, "backoff", err)
+			// Credentials the server already refused will be refused again, so the
+			// account is parked in auth_error with a long delay instead of being
+			// hammered on the connection ladder.
+			status, delay := "backoff", backoff
+			if isAuthFailure(err) {
+				status, delay = "auth_error", authBackoff
+			}
+			s.setError(ctx, rt.account.ID, status, err)
+			if !waitBackoff(ctx, delay) {
+				return
+			}
+			if status == "backoff" {
+				backoff = min(backoff*2, 5*time.Minute)
+			}
+			continue
+		}
+		rt.client.Store(client)
+		_ = s.repo.UpdateAccountStatus(ctx, rt.account.ID, "syncing", nil)
+		rt.lock()
+		syncErr := s.syncAll(ctx, rt, client)
+		rt.unlock()
+		if syncErr != nil {
+			// A sync that keeps failing used to reconnect with no delay at all,
+			// because the ladder was reset on connect and only the connect path
+			// waited. That is a tight reconnect loop against the provider.
+			s.setError(ctx, rt.account.ID, "backoff", syncErr)
+			s.closeCommand(rt, client)
 			if !waitBackoff(ctx, backoff) {
 				return
 			}
 			backoff = min(backoff*2, 5*time.Minute)
 			continue
 		}
-		rt.client.Store(client)
+		// The ladder is reset only once a sync has actually succeeded: reaching the
+		// greeting proves nothing about whether the account can be read.
 		backoff = time.Second
-		_ = s.repo.UpdateAccountStatus(ctx, rt.account.ID, "syncing", nil)
-		rt.lock()
-		syncErr := s.syncAll(ctx, rt, client)
-		rt.unlock()
-		if syncErr != nil {
-			s.setError(ctx, rt.account.ID, "backoff", syncErr)
-			s.closeCommand(rt, client)
-			continue
-		}
 		s.enqueueBodyCandidates(ctx, rt.account.ID)
 		_ = s.repo.UpdateAccountStatus(ctx, rt.account.ID, "connected", nil)
 		ticker := time.NewTicker(periodicSyncInterval)
@@ -506,7 +553,10 @@ func (s *Supervisor) syncRole(ctx context.Context, client *imapclient.Client, ac
 }
 
 func (s *Supervisor) syncMailbox(ctx context.Context, client *imapclient.Client, mailbox domain.Mailbox) error {
-	selected, err := client.Select(mailbox.RemoteName, &goimap.SelectOptions{ReadOnly: true}).Wait()
+	// CONDSTORE is requested so SELECT reports HIGHESTMODSEQ, which lets the
+	// reconciliation pass ask only for flags that changed since the last sync.
+	condStore := client.Caps().Has(goimap.CapCondStore)
+	selected, err := client.Select(mailbox.RemoteName, &goimap.SelectOptions{ReadOnly: true, CondStore: condStore}).Wait()
 	if err != nil {
 		return err
 	}
@@ -596,9 +646,136 @@ func (s *Supervisor) syncMailbox(ctx context.Context, client *imapclient.Client,
 			}
 		}
 	}
+	// Appending new UIDs is only half of sync: flags set elsewhere and messages
+	// deleted elsewhere are invisible to the pass above.
+	if err := s.reconcileMailbox(ctx, client, mailbox, selected); err != nil {
+		// Reconciliation is a repair pass, not the ingest path. Failing the mailbox
+		// here would also discard the new mail just stored and stop the cursor from
+		// advancing, so the error is recorded and the sync still commits.
+		slog.Warn("mailbox reconcile failed", "account_id", mailbox.AccountID, "mailbox_id", mailbox.ID, "error", err)
+	}
 	uidNext := uint32(selected.UIDNext)
 	highest := selected.HighestModSeq
 	return s.repo.UpdateMailboxCursor(ctx, mailbox.ID, selected.UIDValidity, lastUID, &uidNext, &highest)
+}
+
+// reconcileMailbox brings local rows back in line with the provider for changes
+// the append-only pass cannot observe: \Seen and \Flagged set in another client,
+// and messages deleted or expunged elsewhere.
+//
+// The mailbox must already be selected by the caller, which also holds the
+// command lock. Two commands are issued: a flag FETCH — narrowed with
+// CHANGEDSINCE when the server supports CONDSTORE — and a UID SEARCH ALL used to
+// find the UIDs that are gone.
+func (s *Supervisor) reconcileMailbox(ctx context.Context, client *imapclient.Client, mailbox domain.Mailbox, selected *goimap.SelectData) error {
+	if mailbox.Role == "drafts" {
+		// Drafts have their own reconciliation with conflict handling in
+		// ReconcileRemoteDraft; flags and expunges there mean something else.
+		return nil
+	}
+	if value, ok := s.lastReconcile.Load(mailbox.ID); ok {
+		if last, valid := value.(time.Time); valid && time.Since(last) < reconcileInterval {
+			return nil
+		}
+	}
+	// UIDVALIDITY changed means ResetMailbox already cleared the mapping, so there
+	// is nothing local left to reconcile against.
+	if mailbox.UIDValidity != 0 && mailbox.UIDValidity != selected.UIDValidity {
+		return nil
+	}
+	present, err := client.UIDSearch(&goimap.SearchCriteria{}, nil).Wait()
+	if err != nil {
+		return fmt.Errorf("search present uids: %w", err)
+	}
+	uids := present.AllUIDs()
+	local := make([]uint32, 0, len(uids))
+	for _, uid := range uids {
+		local = append(local, uint32(uid))
+	}
+	removed, err := s.repo.DeleteMissingMailboxMessages(ctx, mailbox.ID, local)
+	if err != nil {
+		return fmt.Errorf("drop expunged: %w", err)
+	}
+	changed, err := s.reconcileFlags(ctx, client, mailbox, selected, uids)
+	if err != nil {
+		return err
+	}
+	s.lastReconcile.Store(mailbox.ID, time.Now())
+	if removed == 0 && changed == 0 {
+		return nil
+	}
+	// One aggregate event: a per-message burst would overrun the realtime hub's
+	// buffer and disconnect the very client waiting for the correction.
+	s.events.Publish(ports.Event{Type: "MESSAGE_UPDATED", Data: map[string]any{
+		"bulk": true, "reconciled": changed, "removed": removed, "mailbox_id": mailbox.ID,
+	}})
+	return nil
+}
+
+// reconcileFlags fetches the provider's flags and writes back the ones that
+// differ. With CONDSTORE the FETCH is narrowed to what changed since the stored
+// modseq, which on a steady mailbox returns nothing at all.
+func (s *Supervisor) reconcileFlags(ctx context.Context, client *imapclient.Client, mailbox domain.Mailbox, selected *goimap.SelectData, uids []goimap.UID) (int, error) {
+	if len(uids) == 0 {
+		return 0, nil
+	}
+	options := &goimap.FetchOptions{UID: true, Flags: true}
+	if client.Caps().Has(goimap.CapCondStore) && mailbox.HighestModSeq != nil && *mailbox.HighestModSeq > 0 && selected.HighestModSeq > 0 {
+		options.ChangedSince = *mailbox.HighestModSeq
+	}
+	total := 0
+	for start := 0; start < len(uids); start += reconcileFlagChunk {
+		end := min(start+reconcileFlagChunk, len(uids))
+		fetched, err := client.Fetch(goimap.UIDSetNum(uids[start:end]...), options).Collect()
+		if err != nil {
+			return total, fmt.Errorf("fetch flags: %w", err)
+		}
+		states := make([]ports.RemoteFlagState, 0, len(fetched))
+		for _, item := range fetched {
+			values := make([]string, len(item.Flags))
+			for index, flag := range item.Flags {
+				values[index] = string(flag)
+			}
+			states = append(states, ports.RemoteFlagState{
+				UID:       uint32(item.UID),
+				IsRead:    hasFlag(item.Flags, goimap.FlagSeen),
+				IsStarred: hasFlag(item.Flags, goimap.FlagFlagged),
+				Flags:     values,
+			})
+		}
+		changed, err := s.repo.ReconcileMailboxFlags(ctx, mailbox.ID, states)
+		if err != nil {
+			return total, fmt.Errorf("apply flags: %w", err)
+		}
+		total += changed
+	}
+	return total, nil
+}
+
+// isAuthFailure reports whether the provider rejected the credentials rather than
+// failing for a reason retrying could fix.
+func isAuthFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	var status *goimap.Error
+	if errors.As(err, &status) {
+		switch status.Code {
+		case goimap.ResponseCodeAuthenticationFailed, goimap.ResponseCodeAuthorizationFailed, goimap.ResponseCodeExpired, goimap.ResponseCodePrivacyRequired:
+			return true
+		}
+	}
+	text := strings.ToLower(err.Error())
+	for _, marker := range []string{
+		"authenticationfailed", "authorizationfailed", "invalid credentials",
+		"invalid password", "login denied", "authentication failed", "auth failed",
+		"password error", "refresh oauth token",
+	} {
+		if strings.Contains(text, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Supervisor) storeRemoteDraft(ctx context.Context, mailbox domain.Mailbox, fetched *imapclient.FetchMessageBuffer, raw []byte) (bool, int64, error) {
@@ -905,6 +1082,14 @@ func (s *Supervisor) enqueueBodyCandidates(ctx context.Context, accountID int64)
 		return
 	}
 	for _, id := range ids {
+		// The candidate query cannot exclude 'error' without a schema change, so
+		// the cap is enforced here: a body that has already failed maxBodyAttempts
+		// times is not retried again for the life of the process.
+		if value, ok := s.bodyAttempts.Load(id); ok {
+			if attempts, valid := value.(int); valid && attempts >= maxBodyAttempts {
+				continue
+			}
+		}
 		if _, loaded := s.bodySeen.LoadOrStore(id, struct{}{}); loaded {
 			continue
 		}
@@ -936,6 +1121,7 @@ func (s *Supervisor) bodyWorker(ctx context.Context) {
 			otp, err := s.fetchBody(fetchCtx, id, true)
 			cancel()
 			s.bodySeen.Delete(id)
+			s.recordBodyAttempt(id, err)
 			if err == nil {
 				// Published after fetchBody released the command lock. The code is
 				// carried on the event so the browser can raise a copyable
@@ -954,6 +1140,27 @@ func (s *Supervisor) bodyWorker(ctx context.Context) {
 			}
 		}
 	}
+}
+
+// recordBodyAttempt maintains the per-message failure count the prefetch cap
+// reads. A success clears the entry so a message that recovers is not held
+// against its earlier failures. Cancellation is not a failure of the message: the
+// process is shutting down or the caller went away.
+func (s *Supervisor) recordBodyAttempt(id int64, err error) {
+	if err == nil {
+		s.bodyAttempts.Delete(id)
+		return
+	}
+	if errors.Is(err, context.Canceled) {
+		return
+	}
+	attempts := 0
+	if value, ok := s.bodyAttempts.Load(id); ok {
+		if current, valid := value.(int); valid {
+			attempts = current
+		}
+	}
+	s.bodyAttempts.Store(id, attempts+1)
 }
 
 func (s *Supervisor) FetchAttachment(ctx context.Context, messageID, attachmentID int64) (domain.BlobObject, domain.Attachment, error) {

@@ -13,6 +13,10 @@ export type Message = {
   received_at: number; sent_at?: number; is_read: boolean; is_starred: boolean;
   has_attachments: boolean;
 }
+// unread_total counts the whole view, not the loaded page, so the badge and the
+// mark-all-read button stay honest when the view holds more unread mail than one
+// page carries.
+export type MessagePage = { items: Message[]; next_cursor?: string; unread_total: number }
 export type Attachment = { id: number; message_id: number; filename: string; content_type: string; content_id?: string; size_bytes: number; fetch_state: string }
 // capped means more unread mail remained than one call may touch; partial means
 // some accounts failed while the reported messages were still applied.

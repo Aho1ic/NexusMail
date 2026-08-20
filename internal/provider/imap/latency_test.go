@@ -22,6 +22,7 @@ import (
 	"nexusmail/internal/storage"
 
 	goimap "github.com/emersion/go-imap/v2"
+	"github.com/emersion/go-imap/v2/imapclient"
 	"github.com/emersion/go-imap/v2/imapserver"
 	"github.com/emersion/go-imap/v2/imapserver/imapmemserver"
 )
@@ -89,6 +90,7 @@ type harness struct {
 	events     *recorder
 	repo       *sqlite.Store
 	account    domain.Account
+	accounts   *accountservice.Service
 }
 
 func (h *harness) deliver(t *testing.T, subject string) {
@@ -153,7 +155,7 @@ func newHarness(t *testing.T) *harness {
 		}
 		return countingConn{conn}, nil
 	}
-	return &harness{supervisor: supervisor, user: user, events: events, repo: repo, account: account}
+	return &harness{supervisor: supervisor, user: user, events: events, repo: repo, account: account, accounts: accounts}
 }
 
 // TestNewMailLatency measures the delay between a message landing on the IMAP
@@ -288,4 +290,20 @@ func waitConnected(t *testing.T, h *harness) {
 		time.Sleep(50 * time.Millisecond)
 	}
 	t.Fatal("account never reached connected status")
+}
+
+// connect opens a second client against the same server, standing in for another
+// mail client the user has open on the same account.
+func (h *harness) connect(t *testing.T, ctx context.Context) *imapclient.Client {
+	t.Helper()
+	conn, err := h.supervisor.dial(ctx, h.account)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := imapclient.New(conn, nil)
+	if err := client.Login(h.account.Username, "test-password").Wait(); err != nil {
+		_ = client.Close()
+		t.Fatal(err)
+	}
+	return client
 }

@@ -203,6 +203,19 @@ func (s *Store) CachedBlobs(ctx context.Context) ([]domain.BlobObject, error) {
 	return blobs, err
 }
 
+// CachedBlobBytes totals the cache tier without materialising it. Eviction runs
+// after every cached write, and loading every row just to add up sizes turned a
+// body prefetch over a large backlog into a full scan per message.
+func (s *Store) CachedBlobBytes(ctx context.Context) (int64, error) {
+	var total *int64
+	err := s.db.WithContext(ctx).Model(&domain.BlobObject{}).Where("durability = 'cache'").
+		Select("sum(size_bytes)").Scan(&total).Error
+	if err != nil || total == nil {
+		return 0, err
+	}
+	return *total, nil
+}
+
 func (s *Store) AddDraftAttachment(ctx context.Context, attachment *domain.DraftAttachment) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()

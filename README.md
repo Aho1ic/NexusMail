@@ -24,6 +24,8 @@ docker compose up --build
 
 生产环境必须把 `NEXUSMAIL_PUBLIC_URL` 改为最终 HTTPS 地址。所有 secret 均支持同名 `_FILE` 变量，例如 `NEXUSMAIL_MASTER_KEY_FILE=/run/secrets/master_key`。
 
+若在应用前面部署了反向代理（Nginx、Traefik 等），需要把代理地址填入 `NEXUSMAIL_TRUSTED_PROXIES`（逗号分隔的 IP 或 CIDR），否则登录限流会把所有请求都算到代理这一个地址上。反之，直接暴露端口时必须留空：登录限流按客户端地址计数，无条件信任 `X-Forwarded-For` 等于让调用方每次请求都换一个新配额。
+
 ## 版本与镜像发布
 
 版本号由根目录的 `VERSION` 文件统一管理，当前为 `0.1.0`。`make build` 和 `make docker-build` 会读取该文件，通过 `-ldflags` 注入 `internal/version.Value`，服务启动时以 `nexusmail starting` 日志输出版本。

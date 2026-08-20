@@ -88,14 +88,22 @@ func (s *Store) Remove(ctx context.Context, blob domain.BlobObject) error {
 	return s.repo.DeleteBlob(ctx, blob.ID)
 }
 
+// Evict trims the cache tier to maxBytes, least recently used first.
+//
+// The total is read with an aggregate first and the rows are only materialised
+// when the budget is actually exceeded: this runs after every cached write, so
+// the common case must not scan the whole tier.
 func (s *Store) Evict(ctx context.Context) error {
-	blobs, err := s.repo.CachedBlobs(ctx)
+	total, err := s.repo.CachedBlobBytes(ctx)
 	if err != nil {
 		return err
 	}
-	var total int64
-	for _, blob := range blobs {
-		total += blob.SizeBytes
+	if total <= s.maxBytes {
+		return nil
+	}
+	blobs, err := s.repo.CachedBlobs(ctx)
+	if err != nil {
+		return err
 	}
 	for _, blob := range blobs {
 		if total <= s.maxBytes {

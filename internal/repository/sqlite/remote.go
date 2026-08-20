@@ -2,6 +2,7 @@ package sqlite
 
 import (
 	"context"
+	"encoding/json"
 	"time"
 
 	"nexusmail/internal/domain"
@@ -46,6 +47,113 @@ func (s *Store) ResetMailbox(ctx context.Context, id int64, uidValidity uint32) 
 			"uid_validity": uidValidity, "last_uid": 0, "last_sync_at": nil, "updated_at": time.Now().UnixMilli(),
 		}).Error
 	})
+}
+
+// ReconcileMailboxFlags applies the provider's view of \Seen and \Flagged to the
+// local rows of one mailbox and returns how many messages actually changed.
+//
+// Sync only ever appended new UIDs, so a message read or starred in another
+// client stayed wrong here forever. Only rows that differ are written, both to
+// keep the FTS triggers idle and so the caller can stay silent when nothing moved.
+func (s *Store) ReconcileMailboxFlags(ctx context.Context, mailboxID int64, states []ports.RemoteFlagState) (int, error) {
+	if len(states) == 0 {
+		return 0, nil
+	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	changed := 0
+	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		now := time.Now().UnixMilli()
+		for start := 0; start < len(states); start += sqliteParameterChunk {
+			end := min(start+sqliteParameterChunk, len(states))
+			chunk := states[start:end]
+			uids := make([]uint32, len(chunk))
+			for index, state := range chunk {
+				uids[index] = state.UID
+			}
+			type row struct {
+				MessageID int64  `gorm:"column:message_id"`
+				UID       uint32 `gorm:"column:uid"`
+				IsRead    bool   `gorm:"column:is_read"`
+				IsStarred bool   `gorm:"column:is_starred"`
+			}
+			var rows []row
+			if err := tx.Raw(`SELECT mm.message_id, mm.uid, m.is_read, m.is_starred
+                FROM mailbox_messages mm JOIN messages m ON m.id = mm.message_id
+                WHERE mm.mailbox_id = ? AND mm.uid IN ?`, mailboxID, uids).Scan(&rows).Error; err != nil {
+				return err
+			}
+			local := make(map[uint32]row, len(rows))
+			for _, item := range rows {
+				local[item.UID] = item
+			}
+			for _, state := range chunk {
+				current, ok := local[state.UID]
+				if !ok {
+					continue
+				}
+				flagsJSON, _ := json.Marshal(state.Flags)
+				if err := tx.Exec("UPDATE mailbox_messages SET flags_json = ? WHERE mailbox_id = ? AND uid = ?", string(flagsJSON), mailboxID, state.UID).Error; err != nil {
+					return err
+				}
+				if current.IsRead == state.IsRead && current.IsStarred == state.IsStarred {
+					continue
+				}
+				if err := tx.Model(&domain.Message{}).Where("id = ?", current.MessageID).Updates(map[string]any{
+					"is_read": state.IsRead, "is_starred": state.IsStarred, "updated_at": now,
+				}).Error; err != nil {
+					return err
+				}
+				changed++
+			}
+		}
+		return nil
+	})
+	return changed, err
+}
+
+// DeleteMissingMailboxMessages drops the local mapping for every UID the mailbox
+// no longer holds, then removes messages that are left in no mailbox at all.
+//
+// Without this, mail deleted or expunged in another client stayed in the feed
+// forever, and opening it produced a body fetch that could never succeed. Passing
+// an empty present list clears the mailbox, which is what an emptied folder means.
+func (s *Store) DeleteMissingMailboxMessages(ctx context.Context, mailboxID int64, present []uint32) (int, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	removed := 0
+	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var stale []uint32
+		if err := tx.Raw("SELECT uid FROM mailbox_messages WHERE mailbox_id = ?", mailboxID).Scan(&stale).Error; err != nil {
+			return err
+		}
+		keep := make(map[uint32]struct{}, len(present))
+		for _, uid := range present {
+			keep[uid] = struct{}{}
+		}
+		drop := make([]uint32, 0, len(stale))
+		for _, uid := range stale {
+			if _, ok := keep[uid]; !ok {
+				drop = append(drop, uid)
+			}
+		}
+		if len(drop) == 0 {
+			return nil
+		}
+		for start := 0; start < len(drop); start += sqliteParameterChunk {
+			end := min(start+sqliteParameterChunk, len(drop))
+			if err := tx.Exec("DELETE FROM mailbox_messages WHERE mailbox_id = ? AND uid IN ?", mailboxID, drop[start:end]).Error; err != nil {
+				return err
+			}
+		}
+		removed = len(drop)
+		// An incoming message that is in no mailbox is unreachable: it cannot be
+		// opened, its body cannot be fetched, and it would sit in the feed as a
+		// permanent error. Outgoing mail has no mailbox mapping by design.
+		return tx.Exec(`DELETE FROM messages WHERE direction = 'incoming'
+            AND id NOT IN (SELECT message_id FROM mailbox_messages)`).Error
+	})
+	return removed, err
 }
 
 func (s *Store) MessageLocation(ctx context.Context, messageID int64) (ports.MessageLocation, error) {

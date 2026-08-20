@@ -3,6 +3,7 @@ package provider
 import (
 	"errors"
 	"strings"
+	"unicode"
 
 	"nexusmail/internal/domain"
 )
@@ -46,6 +47,29 @@ func Get(name string) (Preset, error) {
 	return preset, nil
 }
 
+// roleRule maps a mailbox name to a role. ASCII keywords are matched as whole
+// words, never as substrings: "Presentations" contains "sent" and used to be
+// classified as the Sent folder, which let AppendSent write delivered mail into a
+// user's own folder. CJK keywords have no word boundaries, so they stay
+// substring matches — the terms are specific enough not to collide.
+type roleRule struct {
+	role     string
+	syncMode string
+	words    []string
+	contains []string
+}
+
+// The order is significant: the first rule that matches wins, so "Deleted
+// Messages" must be tested for trash before "messages" can mean anything else.
+var roleRules = []roleRule{
+	{role: "inbox", syncMode: "realtime", words: []string{"inbox"}, contains: []string{"收件箱"}},
+	{role: "trash", syncMode: "lazy", words: []string{"trash", "deleted", "bin"}, contains: []string{"已删除", "废件箱", "回收站"}},
+	{role: "junk", syncMode: "lazy", words: []string{"junk", "spam"}, contains: []string{"垃圾"}},
+	{role: "sent", syncMode: "periodic", words: []string{"sent"}, contains: []string{"已发送", "发件箱"}},
+	{role: "drafts", syncMode: "periodic", words: []string{"draft", "drafts"}, contains: []string{"草稿"}},
+	{role: "archive", syncMode: "periodic", words: []string{"archive", "archives"}, contains: []string{"归档", "所有邮件"}},
+}
+
 func ClassifyMailbox(name string, attributes []string) (role, syncMode string) {
 	for _, attribute := range attributes {
 		switch strings.ToLower(attribute) {
@@ -64,20 +88,57 @@ func ClassifyMailbox(name string, attributes []string) (role, syncMode string) {
 		}
 	}
 	normalized := strings.ToLower(strings.TrimSpace(name))
-	switch {
-	case normalized == "inbox" || normalized == "收件箱":
+	if normalized == "inbox" {
 		return "inbox", "realtime"
-	case strings.Contains(normalized, "sent") || strings.Contains(normalized, "已发送"):
-		return "sent", "periodic"
-	case strings.Contains(normalized, "draft") || strings.Contains(normalized, "草稿"):
-		return "drafts", "periodic"
-	case strings.Contains(normalized, "archive") || strings.Contains(normalized, "归档") || strings.Contains(normalized, "all mail"):
-		return "archive", "periodic"
-	case strings.Contains(normalized, "trash") || strings.Contains(normalized, "deleted") || strings.Contains(normalized, "已删除"):
-		return "trash", "lazy"
-	case strings.Contains(normalized, "junk") || strings.Contains(normalized, "spam") || strings.Contains(normalized, "垃圾"):
-		return "junk", "lazy"
-	default:
-		return "custom", "lazy"
 	}
+	// "All Mail" is Gmail's archive and is two words, so it is checked before the
+	// single-word rules rather than being expressed as one of them.
+	if hasPhrase(normalized, "all mail") {
+		return "archive", "periodic"
+	}
+	words := mailboxWords(normalized)
+	for _, rule := range roleRules {
+		for _, word := range rule.words {
+			if _, ok := words[word]; ok {
+				return rule.role, rule.syncMode
+			}
+		}
+		for _, fragment := range rule.contains {
+			if strings.Contains(normalized, fragment) {
+				return rule.role, rule.syncMode
+			}
+		}
+	}
+	return "custom", "lazy"
+}
+
+// mailboxWords splits a mailbox name on everything that is not a letter or
+// digit, so "Sent Items", "sent-items", "INBOX.Sent" and "Sent_Mail" all yield
+// the token "sent" while "Presentations" yields only itself.
+func mailboxWords(normalized string) map[string]struct{} {
+	fields := strings.FieldsFunc(normalized, func(r rune) bool {
+		return !unicode.IsLetter(r) && !unicode.IsDigit(r)
+	})
+	words := make(map[string]struct{}, len(fields))
+	for _, field := range fields {
+		words[field] = struct{}{}
+	}
+	return words
+}
+
+// hasPhrase matches a multi-word phrase on word boundaries.
+func hasPhrase(normalized, phrase string) bool {
+	index := strings.Index(normalized, phrase)
+	if index < 0 {
+		return false
+	}
+	if index > 0 && isWordByte(normalized[index-1]) {
+		return false
+	}
+	tail := index + len(phrase)
+	return tail >= len(normalized) || !isWordByte(normalized[tail])
+}
+
+func isWordByte(value byte) bool {
+	return (value >= '0' && value <= '9') || (value >= 'a' && value <= 'z') || (value >= 'A' && value <= 'Z')
 }

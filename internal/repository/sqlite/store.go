@@ -205,6 +205,18 @@ type cursorValue struct {
 	ID         int64 `json:"i"`
 }
 
+// feedColumns is the projection the message list returns. body_text and
+// body_html are deliberately absent: a page of 40 messages would otherwise carry
+// up to 40 full bodies, and the feed reloads on every realtime event — including
+// the burst a first-sync body prefetch produces. The detail endpoint serves the
+// body for the one message that is actually open.
+const feedColumns = `messages.id, messages.account_id, messages.direction, messages.rfc_message_id,
+	messages.provider_message_id, messages.in_reply_to, messages.references_json, messages.subject,
+	messages.sender, messages.recipients, messages.from_json, messages.to_json, messages.cc_json,
+	messages.bcc_json, messages.reply_to_json, messages.snippet, messages.body_state, messages.size_bytes,
+	messages.sent_at, messages.received_at, messages.is_read, messages.is_starred, messages.has_attachments,
+	messages.created_at, messages.updated_at`
+
 func (s *Store) ListMessages(ctx context.Context, filter ports.MessageFilter) (ports.MessagePage, error) {
 	limit := filter.Limit
 	if limit <= 0 {
@@ -213,7 +225,7 @@ func (s *Store) ListMessages(ctx context.Context, filter ports.MessageFilter) (p
 	if limit > 100 {
 		limit = 100
 	}
-	query := s.db.WithContext(ctx).Model(&domain.Message{}).Distinct("messages.*")
+	query := s.db.WithContext(ctx).Model(&domain.Message{}).Distinct(feedColumns)
 	query = applyMessageScope(query, filter)
 	if filter.IsRead != nil {
 		query = query.Where("messages.is_read = ?", *filter.IsRead)
@@ -238,7 +250,25 @@ func (s *Store) ListMessages(ctx context.Context, filter ports.MessageFilter) (p
 		page.Items = items[:limit]
 		page.NextCursor = encodeCursor(cursorValue{ReceivedAt: last.ReceivedAt, ID: last.ID})
 	}
+	total, err := s.unreadTotal(ctx, filter)
+	if err != nil {
+		return ports.MessagePage{}, err
+	}
+	page.UnreadTotal = total
 	return page, nil
+}
+
+// unreadTotal counts the unread mail the whole view holds, ignoring the cursor:
+// the count belongs to the view, not to the page being read.
+func (s *Store) unreadTotal(ctx context.Context, filter ports.MessageFilter) (int, error) {
+	query := applyMessageScope(s.db.WithContext(ctx).Model(&domain.Message{}), filter)
+	if filter.Query != "" {
+		query = applyMessageSearch(query, filter.Query)
+	}
+	var count int64
+	err := query.Where("messages.is_read = 0 AND messages.direction = 'incoming'").
+		Distinct("messages.id").Count(&count).Error
+	return int(count), err
 }
 
 // applyMessageSearch applies the FTS or LIKE predicate shared by the message feed

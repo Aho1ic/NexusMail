@@ -55,6 +55,7 @@ function MailboxApp({ onLogout }: { onLogout: () => void }) {
   const [query, setQuery] = useState('')
   const [debouncedQuery, setDebouncedQuery] = useState('')
   const [cursor, setCursor] = useState<string | undefined>()
+  const [unreadTotal, setUnreadTotal] = useState(0)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
   const [pane, setPane] = useState<Pane>('list')
@@ -122,6 +123,7 @@ function MailboxApp({ onLogout }: { onLogout: () => void }) {
       const page = await api.messages(params)
       setMessages(current => append ? [...current, ...page.items.filter(item => !current.some(existing => existing.id === item.id))] : page.items)
       setCursor(page.next_cursor)
+      setUnreadTotal(page.unread_total ?? 0)
     } catch (err) { setError(messageOf(err)) } finally { setLoading(false) }
   }, [viewParams])
 
@@ -175,6 +177,9 @@ function MailboxApp({ onLogout }: { onLogout: () => void }) {
     setSelected(message); setPane('detail'); setDetails(null)
     if (!message.is_read) {
       setMessages(items => items.map(item => item.id === message.id ? { ...item, is_read: true } : item))
+      // The badge tracks the server total, so opening a message has to draw it down
+      // here as well; otherwise the count only moves on the next feed load.
+      setUnreadTotal(total => Math.max(total - 1, 0))
       api.patchMessage(message.id, { is_read: true }).catch(() => undefined)
     }
     try { setDetails(await api.message(message.id)) } catch (err) { setError(messageOf(err)) }
@@ -193,7 +198,11 @@ function MailboxApp({ onLogout }: { onLogout: () => void }) {
 
   async function logout() { try { await api.logout() } finally { onLogout() } }
   const accountMap = useMemo(() => new Map(accounts.map(account => [account.id, account])), [accounts])
-  const unreadCount = useMemo(() => messages.filter(item => !item.is_read).length, [messages])
+  // The server counts the whole view; the loaded page only holds 40 rows, so
+  // counting locally reported "0 unread" on any view whose unread mail sits past
+  // the first page and left mark-all-read disabled with work still to do. The page
+  // count is the floor for the case where a local read has not been counted yet.
+  const unreadCount = useMemo(() => Math.max(unreadTotal, messages.filter(item => !item.is_read).length), [unreadTotal, messages])
 
   return <div className="h-screen bg-paper text-ink p-0 md:p-3 lg:p-5 overflow-hidden">
     <div className="mx-auto flex h-full max-w-[1680px] overflow-hidden bg-white md:rounded-[1.8rem] md:border md:border-black/5 md:shadow-panel">
@@ -216,7 +225,7 @@ function MailboxApp({ onLogout }: { onLogout: () => void }) {
 
       <section className={`${pane === 'list' ? 'flex' : 'hidden'} md:flex w-full md:w-[390px] lg:w-[440px] shrink-0 flex-col border-r border-black/5 bg-[#fbfaf6]`}>
         <header className="border-b border-black/5 px-5 pb-4 pt-5">
-          <div className="flex items-center justify-between"><button onClick={() => setPane('nav')} className="md:hidden"><Menu size={21} /></button><div><p className="text-[10px] font-bold uppercase tracking-[.2em] text-pine/40">Nexus stream</p><h1 className="font-serif text-2xl">{selectedMailbox ? mailboxes.find(box => box.id === selectedMailbox)?.display_name : selectedAccount ? accountMap.get(selectedAccount)?.display_name || accountMap.get(selectedAccount)?.email : 'All Inboxes'}</h1></div><div className="flex gap-1"><button onClick={markViewRead} disabled={markingRead || unreadCount === 0} className="icon-button disabled:opacity-35" title={unreadCount ? `将当前视图的 ${unreadCount}+ 封未读邮件标记为已读` : '当前视图没有未读邮件'} aria-label="全部已读">{markingRead ? <LoaderCircle size={17} className="animate-spin" /> : <CheckCheck size={17} />}</button><button onClick={refresh} className="icon-button" aria-label="刷新"><RefreshCw size={17} className={loading ? 'animate-spin' : ''} /></button></div></div>
+          <div className="flex items-center justify-between"><button onClick={() => setPane('nav')} className="md:hidden"><Menu size={21} /></button><div><p className="text-[10px] font-bold uppercase tracking-[.2em] text-pine/40">Nexus stream</p><h1 className="font-serif text-2xl">{selectedMailbox ? mailboxes.find(box => box.id === selectedMailbox)?.display_name : selectedAccount ? accountMap.get(selectedAccount)?.display_name || accountMap.get(selectedAccount)?.email : 'All Inboxes'}</h1></div><div className="flex gap-1"><button onClick={markViewRead} disabled={markingRead || unreadCount === 0} className="icon-button disabled:opacity-35" title={unreadCount ? `将当前视图的 ${unreadCount} 封未读邮件标记为已读` : '当前视图没有未读邮件'} aria-label="全部已读">{markingRead ? <LoaderCircle size={17} className="animate-spin" /> : <CheckCheck size={17} />}</button><button onClick={refresh} className="icon-button" aria-label="刷新"><RefreshCw size={17} className={loading ? 'animate-spin' : ''} /></button></div></div>
           <div className="relative mt-4"><Search className="absolute left-3 top-1/2 -translate-y-1/2 text-black/30" size={16} /><input value={query} onChange={event => setQuery(event.target.value)} className="w-full rounded-xl border border-black/5 bg-white py-2.5 pl-9 pr-8 text-sm outline-none ring-pine/20 focus:ring-2" placeholder="搜索主题、发件人或正文…" />{query && <button onClick={() => setQuery('')} className="absolute right-2.5 top-1/2 -translate-y-1/2 text-black/30"><X size={15} /></button>}</div>
         </header>
         <div className="flex-1 overflow-y-auto p-2" aria-label="邮件列表">
@@ -276,7 +285,7 @@ function MessageDetail({ selected, details, autoLoadRemoteImages, onBack, onStar
         {details && message.body_state !== 'ready' && message.body_state !== 'error' && <div className="my-10 rounded-2xl bg-sage/50 p-5 text-sm text-pine">正文正在从邮件服务商异步获取，稍后会自动刷新。</div>}
         {details && hasRemoteImages && !loadRemoteImages && <button onClick={() => setLoadRemoteImages(true)} className="mt-6 rounded-xl bg-amber-50 px-4 py-2 text-xs font-semibold text-amber-800">本邮件包含已阻止的远程图片，点击临时加载</button>}
         {details && message.body_html ? <iframe title="邮件正文" sandbox="" referrerPolicy="no-referrer" srcDoc={`<!doctype html><meta charset="utf-8"><meta name="referrer" content="no-referrer"><style>body{font:15px/1.75 system-ui;color:#24332d;overflow-wrap:anywhere}img{max-width:100%;height:auto}a{color:#256b50}pre{white-space:pre-wrap}</style>${renderedHTML}`} className="mt-8 min-h-[520px] w-full border-0" /> : details && <pre className="mt-8 whitespace-pre-wrap font-sans text-[15px] leading-7 text-black/75">{message.body_text || message.snippet}</pre>}
-        {!!details?.attachments.length && <div className="mt-10 border-t border-black/5 pt-5"><h2 className="text-xs font-bold uppercase tracking-wider text-black/40">附件</h2><div className="mt-3 grid gap-2 sm:grid-cols-2">{details.attachments.map(att => <a key={att.id} href={`/api/v1/messages/${message.id}/attachments/${att.id}`} className="flex items-center gap-3 rounded-xl border border-black/5 p-3 hover:bg-paper"><span className="grid h-9 w-9 place-items-center rounded-lg bg-sage"><File size={17} /></span><span className="min-w-0"><span className="block truncate text-xs font-semibold">{att.filename}</span><span className="text-[10px] text-black/35">{formatBytes(att.size_bytes)}</span></span></a>)}</div></div>}
+        {!!details?.attachments?.length && <div className="mt-10 border-t border-black/5 pt-5"><h2 className="text-xs font-bold uppercase tracking-wider text-black/40">附件</h2><div className="mt-3 grid gap-2 sm:grid-cols-2">{details.attachments.map(att => <a key={att.id} href={`/api/v1/messages/${message.id}/attachments/${att.id}`} className="flex items-center gap-3 rounded-xl border border-black/5 p-3 hover:bg-paper"><span className="grid h-9 w-9 place-items-center rounded-lg bg-sage"><File size={17} /></span><span className="min-w-0"><span className="block truncate text-xs font-semibold">{att.filename}</span><span className="text-[10px] text-black/35">{formatBytes(att.size_bytes)}</span></span></a>)}</div></div>}
       </div>
     </article>
   </>
