@@ -1,10 +1,11 @@
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
-  Archive, AtSign, Bell, ChevronDown, Circle, File, Image, Inbox, Keyboard, LoaderCircle,
+  Archive, AtSign, Bell, CheckCheck, ChevronDown, Circle, Copy, File, Image, Inbox, Keyboard, LoaderCircle,
   LogOut, Mail, Menu, Paperclip, Plus, RefreshCw, Search, Send, Settings, Star, X,
   SquarePen,
 } from 'lucide-react'
 import { APIError, api, isAuthenticated } from './lib/api'
+import { copyText, listenForCopyRequests, registerServiceWorker, showOTPNotification } from './lib/notifications'
 import { loadPreferences, notificationPermission, requestNotificationPermission, savePreferences, type Preferences } from './lib/preferences'
 import type { Account, Attachment, Draft, DraftInput, EventEnvelope, Mailbox, Message } from './types'
 
@@ -50,7 +51,7 @@ function MailboxApp({ onLogout }: { onLogout: () => void }) {
   const [selectedMailbox, setSelectedMailbox] = useState<number | null>(null)
   const [messages, setMessages] = useState<Message[]>([])
   const [selected, setSelected] = useState<Message | null>(null)
-  const [details, setDetails] = useState<{ message: Message; attachments: Attachment[] } | null>(null)
+  const [details, setDetails] = useState<{ message: Message; attachments: Attachment[]; otp_code?: string } | null>(null)
   const [query, setQuery] = useState('')
   const [debouncedQuery, setDebouncedQuery] = useState('')
   const [cursor, setCursor] = useState<string | undefined>()
@@ -63,16 +64,43 @@ function MailboxApp({ onLogout }: { onLogout: () => void }) {
   const [showOutbox, setShowOutbox] = useState(false)
   const [showSettings, setShowSettings] = useState(false)
   const [preferences, setPreferences] = useState<Preferences>(loadPreferences)
+  const [toast, setToast] = useState('')
+  const [markingRead, setMarkingRead] = useState(false)
 
   // notify() runs from the socket handler outside React, so the live value is
   // mirrored into a module ref instead of being read from state.
   useEffect(() => { notificationsEnabled.current = preferences.desktopNotifications }, [preferences.desktopNotifications])
+
+  // The toast is the only feedback for a copy that was triggered from the
+  // notification centre, where nothing else on screen changes.
+  const announce = useCallback((text: string) => {
+    setToast(text)
+    window.setTimeout(() => setToast(current => (current === text ? '' : current)), 2600)
+  }, [])
+
+  useEffect(() => {
+    void registerServiceWorker()
+    // The worker cannot reach the clipboard, so it forwards the code here after
+    // the notification button is pressed.
+    return listenForCopyRequests(({ code, copied }) => announce(copied ? `已复制验证码 ${code}` : `复制失败，验证码为 ${code}`))
+  }, [announce])
 
   const updatePreferences = useCallback((patch: Partial<Preferences>) => {
     setPreferences(current => { const next = { ...current, ...patch }; savePreferences(next); return next })
   }, [])
 
   const compose = useCallback((draft: Draft | null = null) => { setComposerDraft(draft); setShowComposer(true) }, [])
+
+  // One definition of "the current view", shared by the feed and by mark-all-read
+  // so the button can never act on a different set than the list shows — including
+  // the search term, which hides mail the button must not touch.
+  const viewParams = useCallback(() => {
+    const params = new URLSearchParams()
+    if (selectedAccount) params.set('account_id', String(selectedAccount))
+    if (selectedMailbox) params.set('mailbox_id', String(selectedMailbox)); else params.set('folder', 'inbox')
+    if (debouncedQuery) params.set('query', debouncedQuery)
+    return params
+  }, [selectedAccount, selectedMailbox, debouncedQuery])
 
   const loadAccounts = useCallback(async () => {
     try { const result = await api.accounts(); setAccounts(result.items) }
@@ -87,17 +115,15 @@ function MailboxApp({ onLogout }: { onLogout: () => void }) {
   const loadMessages = useCallback(async (append = false, nextCursor?: string, quiet = false) => {
     if (!quiet) setLoading(true)
     setError('')
-    const params = new URLSearchParams({ limit: '40' })
-    if (selectedAccount) params.set('account_id', String(selectedAccount))
-    if (selectedMailbox) params.set('mailbox_id', String(selectedMailbox)); else params.set('folder', 'inbox')
-    if (debouncedQuery) params.set('query', debouncedQuery)
+    const params = viewParams()
+    params.set('limit', '40')
     if (nextCursor) params.set('cursor', nextCursor)
     try {
       const page = await api.messages(params)
       setMessages(current => append ? [...current, ...page.items.filter(item => !current.some(existing => existing.id === item.id))] : page.items)
       setCursor(page.next_cursor)
     } catch (err) { setError(messageOf(err)) } finally { setLoading(false) }
-  }, [selectedAccount, selectedMailbox, debouncedQuery])
+  }, [viewParams])
 
   useEffect(() => { loadAccounts() }, [loadAccounts])
   useEffect(() => { loadMailboxes(selectedAccount); setSelectedMailbox(null) }, [selectedAccount, loadMailboxes])
@@ -108,7 +134,42 @@ function MailboxApp({ onLogout }: { onLogout: () => void }) {
   // Realtime arrivals refresh without the spinner so incoming mail does not
   // make the list flicker.
   const refreshQuietly = useCallback(() => { loadAccounts(); loadMessages(false, undefined, true) }, [loadAccounts, loadMessages])
-  useRealtime(refreshQuietly)
+
+  // Keyed by message and code, not by message alone: the arrival pass only sees
+  // the subject, so a later body pass may carry a better code that should still
+  // reach the user, while a repeat of the same code must not notify twice.
+  const notifiedCodes = useRef(new Set<string>())
+  const handleEvent = useCallback((payload: EventEnvelope) => {
+    const code = typeof payload.data?.otp_code === 'string' ? payload.data.otp_code : ''
+    // The code notification replaces the generic notice rather than adding to it,
+    // so switching only the code notification off has to fall back to the generic
+    // one instead of leaving the arrival silent.
+    if (code && preferences.desktopNotifications && preferences.verificationCodeNotifications) {
+      const messageID = typeof payload.data?.message_id === 'number' ? payload.data.message_id : 0
+      const key = `${messageID}:${code}`
+      if (notifiedCodes.current.has(key)) return
+      notifiedCodes.current.add(key)
+      const subject = typeof payload.data?.otp_subject === 'string' ? payload.data.otp_subject : ''
+      void showOTPNotification(code, subject, messageID)
+      return
+    }
+    if (payload.type === 'NEW_EMAIL') notify()
+  }, [preferences.desktopNotifications, preferences.verificationCodeNotifications])
+  useRealtime(refreshQuietly, handleEvent)
+
+  async function markViewRead() {
+    setMarkingRead(true)
+    try {
+      const result = await api.markAllRead(viewParams())
+      // A full refresh, not a local map: the unread badges are derived from the
+      // loaded page, so a partial update would leave stale counts behind.
+      refresh()
+      if (result.updated === 0) announce('当前视图没有未读邮件')
+      else if (result.partial) announce(`已标记 ${result.updated} 封，部分账户同步失败`)
+      else if (result.capped) announce(`已标记 ${result.updated} 封，仍有未读邮件，可再次点击`)
+      else announce(`已标记 ${result.updated} 封为已读`)
+    } catch (err) { setError(messageOf(err)) } finally { setMarkingRead(false) }
+  }
 
   async function openMessage(message: Message) {
     setSelected(message); setPane('detail'); setDetails(null)
@@ -132,6 +193,7 @@ function MailboxApp({ onLogout }: { onLogout: () => void }) {
 
   async function logout() { try { await api.logout() } finally { onLogout() } }
   const accountMap = useMemo(() => new Map(accounts.map(account => [account.id, account])), [accounts])
+  const unreadCount = useMemo(() => messages.filter(item => !item.is_read).length, [messages])
 
   return <div className="h-screen bg-paper text-ink p-0 md:p-3 lg:p-5 overflow-hidden">
     <div className="mx-auto flex h-full max-w-[1680px] overflow-hidden bg-white md:rounded-[1.8rem] md:border md:border-black/5 md:shadow-panel">
@@ -139,7 +201,7 @@ function MailboxApp({ onLogout }: { onLogout: () => void }) {
         <div className="p-6"><Brand light /></div>
         <button onClick={() => compose()} className="mx-5 mt-3 flex items-center justify-center gap-2 rounded-2xl bg-coral px-5 py-3.5 text-sm font-semibold shadow-lg shadow-black/10 transition hover:-translate-y-0.5"><SquarePen size={18} />写邮件</button>
         <nav className="mt-8 flex-1 overflow-y-auto px-3">
-          <NavItem active={!selectedAccount && !selectedMailbox} icon={<Inbox size={18} />} label="All Inboxes" count={messages.filter(m => !m.is_read).length} onClick={() => { setSelectedAccount(null); setSelectedMailbox(null); setPane('list') }} />
+          <NavItem active={!selectedAccount && !selectedMailbox} icon={<Inbox size={18} />} label="All Inboxes" count={unreadCount} onClick={() => { setSelectedAccount(null); setSelectedMailbox(null); setPane('list') }} />
           <NavItem active={false} icon={<Send size={18} />} label="草稿与发件箱" onClick={() => setShowOutbox(true)} />
           <div className="mt-7 px-3 text-[10px] font-bold uppercase tracking-[.22em] text-white/40">账户</div>
           {accounts.map(account => <div key={account.id}>
@@ -154,7 +216,7 @@ function MailboxApp({ onLogout }: { onLogout: () => void }) {
 
       <section className={`${pane === 'list' ? 'flex' : 'hidden'} md:flex w-full md:w-[390px] lg:w-[440px] shrink-0 flex-col border-r border-black/5 bg-[#fbfaf6]`}>
         <header className="border-b border-black/5 px-5 pb-4 pt-5">
-          <div className="flex items-center justify-between"><button onClick={() => setPane('nav')} className="md:hidden"><Menu size={21} /></button><div><p className="text-[10px] font-bold uppercase tracking-[.2em] text-pine/40">Nexus stream</p><h1 className="font-serif text-2xl">{selectedMailbox ? mailboxes.find(box => box.id === selectedMailbox)?.display_name : selectedAccount ? accountMap.get(selectedAccount)?.display_name || accountMap.get(selectedAccount)?.email : 'All Inboxes'}</h1></div><button onClick={refresh} className="icon-button"><RefreshCw size={17} className={loading ? 'animate-spin' : ''} /></button></div>
+          <div className="flex items-center justify-between"><button onClick={() => setPane('nav')} className="md:hidden"><Menu size={21} /></button><div><p className="text-[10px] font-bold uppercase tracking-[.2em] text-pine/40">Nexus stream</p><h1 className="font-serif text-2xl">{selectedMailbox ? mailboxes.find(box => box.id === selectedMailbox)?.display_name : selectedAccount ? accountMap.get(selectedAccount)?.display_name || accountMap.get(selectedAccount)?.email : 'All Inboxes'}</h1></div><div className="flex gap-1"><button onClick={markViewRead} disabled={markingRead || unreadCount === 0} className="icon-button disabled:opacity-35" title={unreadCount ? `将当前视图的 ${unreadCount}+ 封未读邮件标记为已读` : '当前视图没有未读邮件'} aria-label="全部已读">{markingRead ? <LoaderCircle size={17} className="animate-spin" /> : <CheckCheck size={17} />}</button><button onClick={refresh} className="icon-button" aria-label="刷新"><RefreshCw size={17} className={loading ? 'animate-spin' : ''} /></button></div></div>
           <div className="relative mt-4"><Search className="absolute left-3 top-1/2 -translate-y-1/2 text-black/30" size={16} /><input value={query} onChange={event => setQuery(event.target.value)} className="w-full rounded-xl border border-black/5 bg-white py-2.5 pl-9 pr-8 text-sm outline-none ring-pine/20 focus:ring-2" placeholder="搜索主题、发件人或正文…" />{query && <button onClick={() => setQuery('')} className="absolute right-2.5 top-1/2 -translate-y-1/2 text-black/30"><X size={15} /></button>}</div>
         </header>
         <div className="flex-1 overflow-y-auto p-2" aria-label="邮件列表">
@@ -166,13 +228,14 @@ function MailboxApp({ onLogout }: { onLogout: () => void }) {
       </section>
 
       <main className={`${pane === 'detail' ? 'flex' : 'hidden'} md:flex min-w-0 flex-1 flex-col bg-white`}>
-        {selected ? <MessageDetail selected={selected} details={details} autoLoadRemoteImages={preferences.autoLoadRemoteImages} onBack={() => setPane('list')} onStar={() => mutateMessage({ is_starred: !selected.is_starred })} onArchive={() => mutateMessage({ archive: true })} onReply={() => compose()} /> : <Welcome count={messages.filter(item => !item.is_read).length} />}
+        {selected ? <MessageDetail selected={selected} details={details} autoLoadRemoteImages={preferences.autoLoadRemoteImages} onBack={() => setPane('list')} onStar={() => mutateMessage({ is_starred: !selected.is_starred })} onArchive={() => mutateMessage({ archive: true })} onReply={() => compose()} onNotice={announce} /> : <Welcome count={unreadCount} />}
       </main>
     </div>
     {showAccounts && <AccountDialog onClose={() => setShowAccounts(false)} onCreated={() => { setShowAccounts(false); loadAccounts() }} />}
     {showOutbox && <OutboxDialog onClose={() => setShowOutbox(false)} onEdit={draft => { setShowOutbox(false); compose(draft) }} />}
     {showComposer && <Composer accounts={accounts} replyTo={composerDraft ? null : selected} initialDraft={composerDraft} onClose={() => setShowComposer(false)} onSent={() => { setShowComposer(false); refresh() }} />}
     {showSettings && <SettingsDialog preferences={preferences} accounts={accounts} onChange={updatePreferences} onClose={() => setShowSettings(false)} onAddAccount={() => { setShowSettings(false); setShowAccounts(true) }} onLogout={logout} />}
+    {toast && <div role="status" className="pointer-events-none fixed bottom-6 left-1/2 z-50 -translate-x-1/2 rounded-full bg-pine px-5 py-2.5 text-xs font-semibold text-white shadow-panel">{toast}</div>}
   </div>
 }
 
@@ -186,7 +249,7 @@ function MessageRow({ message, account, active, onClick }: { message: Message; a
   </button>
 }
 
-function MessageDetail({ selected, details, autoLoadRemoteImages, onBack, onStar, onArchive, onReply }: { selected: Message; details: { message: Message; attachments: Attachment[] } | null; autoLoadRemoteImages: boolean; onBack: () => void; onStar: () => void; onArchive: () => void; onReply: () => void }) {
+function MessageDetail({ selected, details, autoLoadRemoteImages, onBack, onStar, onArchive, onReply, onNotice }: { selected: Message; details: { message: Message; attachments: Attachment[]; otp_code?: string } | null; autoLoadRemoteImages: boolean; onBack: () => void; onStar: () => void; onArchive: () => void; onReply: () => void; onNotice: (text: string) => void }) {
   const message = details?.message ?? selected
   const bodyHTML = message.body_html ?? ''
   const [loadRemoteImages, setLoadRemoteImages] = useState(autoLoadRemoteImages)
@@ -195,11 +258,19 @@ function MessageDetail({ selected, details, autoLoadRemoteImages, onBack, onStar
   useEffect(() => setLoadRemoteImages(autoLoadRemoteImages), [message.id, autoLoadRemoteImages])
   const renderedHTML = useMemo(() => prepareMessageHTML(bodyHTML, details?.attachments ?? [], message.id, loadRemoteImages), [bodyHTML, details?.attachments, message.id, loadRemoteImages])
   const hasRemoteImages = bodyHTML.includes('data-nexusmail-remote-src')
+  // The chip is both the Safari path (no notification buttons there) and the way
+  // back to a code whose notification was dismissed or missed on a reconnect.
+  const otpCode = details?.otp_code ?? ''
+  async function copyCode() {
+    const copied = await copyText(otpCode)
+    onNotice(copied ? `已复制验证码 ${otpCode}` : `复制失败，验证码为 ${otpCode}`)
+  }
   return <>
     <header className="flex items-center justify-between border-b border-black/5 px-5 py-4"><button onClick={onBack} className="md:hidden icon-button"><ChevronDown className="rotate-90" size={19} /></button><div className="flex gap-1"><button onClick={onArchive} className="icon-button" title="归档 (e)"><Archive size={18} /></button><button onClick={onStar} className="icon-button" title="星标"><Star size={18} className={message.is_starred ? 'fill-amber-400 text-amber-400' : ''} /></button></div><button onClick={onReply} className="button-secondary"><SquarePen size={16} />回复</button></header>
     <article className="flex-1 overflow-y-auto px-6 py-8 lg:px-12 xl:px-16">
       <div className="mx-auto max-w-3xl"><p className="text-[10px] font-bold uppercase tracking-[.2em] text-pine/40">{formatFullDate(message.received_at)}</p><h1 className="mt-3 font-serif text-3xl leading-tight lg:text-4xl">{message.subject || '（无主题）'}</h1>
         <div className="mt-7 flex items-center gap-3 border-b border-black/5 pb-6"><Avatar label={displaySender(message.sender)} /><div className="min-w-0"><div className="truncate text-sm font-bold">{displaySender(message.sender)}</div><div className="truncate text-xs text-black/40">发给 {message.recipients || '我'}</div></div></div>
+        {otpCode && <button onClick={copyCode} className="mt-6 flex items-center gap-3 rounded-2xl bg-sage/60 px-4 py-3 text-left transition hover:bg-sage" aria-label={`复制验证码 ${otpCode}`}><span className="grid h-9 w-9 place-items-center rounded-xl bg-white/70 text-pine"><Copy size={16} /></span><span><span className="block font-mono text-lg font-bold tracking-[.18em] text-pine">{otpCode}</span><span className="text-[11px] text-pine/55">检测到验证码，点击复制</span></span></button>}
         {!details && <div className="grid h-52 place-items-center"><LoaderCircle className="animate-spin text-pine/40" /></div>}
         {details && message.body_state === 'error' && <div className="my-10 rounded-2xl bg-amber-50 p-5 text-sm text-amber-800">正文获取失败，下次账号同步时会自动重试。</div>}
         {details && message.body_state !== 'ready' && message.body_state !== 'error' && <div className="my-10 rounded-2xl bg-sage/50 p-5 text-sm text-pine">正文正在从邮件服务商异步获取，稍后会自动刷新。</div>}
@@ -309,6 +380,7 @@ function SettingsDialog({ preferences, accounts, onChange, onClose, onAddAccount
       <div className="flex-1 overflow-y-auto px-7 py-2">
         <SettingsSection icon={<Bell size={14} />} title="通知">
           <SettingsToggle label="新邮件桌面通知" hint="收到新邮件时弹出系统通知，需要浏览器授权。" checked={preferences.desktopNotifications} onChange={value => onChange({ desktopNotifications: value })} />
+          <SettingsToggle label="验证码通知" hint="识别到验证码时改为弹出带「复制验证码」按钮的通知，点按钮即可复制。需先开启上面的桌面通知。" checked={preferences.verificationCodeNotifications} onChange={value => onChange({ verificationCodeNotifications: value })} />
           {permission === 'default' && <div className="flex items-center justify-between gap-3 rounded-xl bg-sage/50 px-3.5 py-3 text-xs text-pine"><span>浏览器尚未授权通知。</span><button onClick={askPermission} disabled={asking} className="button-secondary shrink-0">{asking ? '请求中…' : '授权'}</button></div>}
           {permission === 'denied' && <p className="rounded-xl bg-amber-50 px-3.5 py-3 text-xs leading-5 text-amber-800">浏览器已拒绝通知权限，需在地址栏的站点设置中重新允许后才会生效。</p>}
           {permission === 'unsupported' && <p className="rounded-xl bg-black/[.03] px-3.5 py-3 text-xs leading-5 text-black/45">当前浏览器或非 HTTPS 环境不支持桌面通知。</p>}
@@ -400,12 +472,14 @@ function notify() {
   catch { /* notifications are best-effort */ }
 }
 
-function useRealtime(onChange: () => void) {
+function useRealtime(onChange: () => void, onEvent: (payload: EventEnvelope) => void) {
   // Events are not persisted server-side, so the socket must outlive filter
-  // changes. Holding the callback in a ref keeps one connection for the
+  // changes. Holding the callbacks in refs keeps one connection for the
   // session instead of reconnecting whenever the mailbox or query changes.
   const handler = useRef(onChange)
+  const events = useRef(onEvent)
   useEffect(() => { handler.current = onChange }, [onChange])
+  useEffect(() => { events.current = onEvent }, [onEvent])
   useEffect(() => {
     let socket: WebSocket | undefined; let timer = 0; let coalesce = 0; let stopped = false; let delay = 250
     // A backlog of body fetches emits a burst of events; coalesce them into one refresh.
@@ -414,7 +488,9 @@ function useRealtime(onChange: () => void) {
       const scheme = location.protocol === 'https:' ? 'wss' : 'ws'; socket = new WebSocket(`${scheme}://${location.host}/api/v1/ws`)
       // Any event missed while reconnecting is unrecoverable, so resync on open.
       socket.onopen = () => { delay = 250; schedule() }
-      socket.onmessage = event => { const payload = JSON.parse(event.data) as EventEnvelope; if (realtimeEvents.includes(payload.type)) { schedule(); if (payload.type === 'NEW_EMAIL') notify() } }
+      // The payload is forwarded verbatim: only the caller knows whether the event
+      // carries a verification code worth notifying about.
+      socket.onmessage = event => { const payload = JSON.parse(event.data) as EventEnvelope; if (realtimeEvents.includes(payload.type)) { schedule(); events.current(payload) } }
       socket.onclose = () => { if (!stopped) { timer = window.setTimeout(connect, delay); delay = Math.min(delay * 2, 10000) } }
     }
     connect()

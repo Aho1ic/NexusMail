@@ -1,5 +1,6 @@
 export type Preferences = {
   desktopNotifications: boolean
+  verificationCodeNotifications: boolean
   autoLoadRemoteImages: boolean
   keyboardShortcuts: boolean
 }
@@ -10,6 +11,7 @@ const storageKey = 'nexusmail.preferences'
 // arrival, block remote images until asked, and keep the single-key shortcuts.
 export const defaultPreferences: Preferences = {
   desktopNotifications: true,
+  verificationCodeNotifications: true,
   autoLoadRemoteImages: false,
   keyboardShortcuts: true,
 }
@@ -28,6 +30,7 @@ export function loadPreferences(): Preferences {
     const parsed = JSON.parse(raw) as Record<string, unknown>
     return {
       desktopNotifications: coerce(parsed?.desktopNotifications, defaultPreferences.desktopNotifications),
+      verificationCodeNotifications: coerce(parsed?.verificationCodeNotifications, defaultPreferences.verificationCodeNotifications),
       autoLoadRemoteImages: coerce(parsed?.autoLoadRemoteImages, defaultPreferences.autoLoadRemoteImages),
       keyboardShortcuts: coerce(parsed?.keyboardShortcuts, defaultPreferences.keyboardShortcuts),
     }

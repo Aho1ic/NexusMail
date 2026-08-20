@@ -1,4 +1,4 @@
-import type { Account, Attachment, Draft, DraftInput, Mailbox, Message } from '../types'
+import type { Account, Attachment, Draft, DraftInput, Mailbox, MarkReadResult, Message } from '../types'
 
 const csrfKey = 'nexusmail.csrf'
 
@@ -34,7 +34,8 @@ export const api = {
   addAccount: (input: unknown) => request<Account | { authorization_url: string }>('/api/v1/accounts', { method: 'POST', body: JSON.stringify(input) }),
   mailboxes: (accountID: number) => request<{ items: Mailbox[] }>(`/api/v1/accounts/${accountID}/mailboxes`),
   messages: (params: URLSearchParams) => request<{ items: Message[]; next_cursor?: string }>(`/api/v1/messages?${params}`),
-  message: (id: number) => request<{ message: Message; attachments: Attachment[] }>(`/api/v1/messages/${id}`),
+  markAllRead: (params: URLSearchParams) => request<MarkReadResult>(`/api/v1/messages/mark-read?${params}`, { method: 'POST' }),
+  message: (id: number) => request<{ message: Message; attachments: Attachment[]; otp_code?: string }>(`/api/v1/messages/${id}`),
   patchMessage: (id: number, patch: object) => request<Message>(`/api/v1/messages/${id}`, { method: 'PATCH', body: JSON.stringify(patch) }),
   drafts: (status = '') => request<{ items: Draft[] }>(`/api/v1/drafts${status ? `?status=${status}` : ''}`),
   draft: (id: number) => request<{ draft: Draft; attachments: Attachment[] }>(`/api/v1/drafts/${id}`),

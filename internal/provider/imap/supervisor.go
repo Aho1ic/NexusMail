@@ -106,6 +106,18 @@ const realtimePollInterval = 5 * time.Second
 
 const periodicSyncInterval = 5 * time.Minute
 
+// bulkFlagChunk caps the UIDs per STORE so a large mark-read stays inside the
+// command line limits servers enforce and yields the connection between chunks.
+const bulkFlagChunk = 500
+
+// otpFreshness bounds how old a message may be for its verification code to ride
+// on a realtime event. A first sync imports 30 days of mail and the body prefetch
+// walks the whole backlog, both of which look like arrivals to the event stream;
+// without this the browser would raise a persistent notification for every code
+// the account ever received. Codes expire in minutes, so an older one is useless
+// anyway and is still reachable from the message detail.
+const otpFreshness = 10 * time.Minute
+
 func NewSupervisor(repo ports.Repository, blobs ports.BlobStore, accounts *accountservice.Service, tokens TokenProvider, events ports.Publisher) *Supervisor {
 	return &Supervisor{
 		repo: repo, blobs: blobs, accounts: accounts, tokens: tokens, events: events,
@@ -566,7 +578,18 @@ func (s *Supervisor) syncMailbox(ctx context.Context, client *imapclient.Client,
 				return err
 			}
 			if created {
-				s.events.Publish(ports.Event{Type: "NEW_EMAIL", Data: map[string]any{"message_id": messageID, "account_id": mailbox.AccountID, "mailbox_id": mailbox.ID}})
+				data := map[string]any{"message_id": messageID, "account_id": mailbox.AccountID, "mailbox_id": mailbox.ID}
+				// The body is still empty at this point, so only the subject can be
+				// scanned. It catches the common "【服务】验证码 123456" shape without
+				// waiting for the prefetch; fetchBody re-runs detection on the full
+				// text and replaces this notification.
+				if fetched.Envelope != nil && withinOTPWindow(fetched.InternalDate) {
+					if code, ok := mailparser.DetectOTP(fetched.Envelope.Subject, "", ""); ok {
+						data["otp_code"] = code
+						data["otp_subject"] = fetched.Envelope.Subject
+					}
+				}
+				s.events.Publish(ports.Event{Type: "NEW_EMAIL", Data: data})
 			}
 			if uint32(fetched.UID) > lastUID {
 				lastUID = uint32(fetched.UID)
@@ -780,25 +803,37 @@ func waitBackoff(ctx context.Context, delay time.Duration) bool {
 // FetchBody retrieves a message body for a waiting caller and takes priority
 // over background prefetch.
 func (s *Supervisor) FetchBody(ctx context.Context, messageID int64) error {
-	return s.fetchBody(ctx, messageID, false)
+	_, err := s.fetchBody(ctx, messageID, false)
+	return err
 }
 
-func (s *Supervisor) fetchBody(ctx context.Context, messageID int64, background bool) (resultErr error) {
+// otpNotice carries what a verification-code notification needs. The subject
+// travels with the code so the browser can say which service the code is for
+// without another round-trip.
+type otpNotice struct {
+	Code    string
+	Subject string
+}
+
+// fetchBody returns any verification code the body carries instead of publishing
+// it, because this runs while holding the account's command connection and the
+// new-mail latency budget leaves no room for extra work under that lock.
+func (s *Supervisor) fetchBody(ctx context.Context, messageID int64, background bool) (otp otpNotice, resultErr error) {
 	select {
 	case s.bodySlots <- struct{}{}:
 		defer func() { <-s.bodySlots }()
 	case <-ctx.Done():
-		return ctx.Err()
+		return otpNotice{}, ctx.Err()
 	}
 	message, _, err := s.repo.GetMessage(ctx, messageID)
 	if err != nil {
-		return err
+		return otpNotice{}, err
 	}
 	if message.BodyState == "ready" {
-		return nil
+		return otpNotice{}, nil
 	}
 	if err := s.repo.SetMessageBodyState(ctx, messageID, "fetching"); err != nil {
-		return err
+		return otpNotice{}, err
 	}
 	defer func() {
 		if resultErr != nil {
@@ -807,15 +842,15 @@ func (s *Supervisor) fetchBody(ctx context.Context, messageID int64, background 
 	}()
 	location, err := s.repo.MessageLocation(ctx, messageID)
 	if err != nil {
-		return err
+		return otpNotice{}, err
 	}
 	rt, err := s.runtime(location.Account.ID)
 	if err != nil {
-		return err
+		return otpNotice{}, err
 	}
 	if background {
 		if !rt.lockBackground(ctx) {
-			return ctx.Err()
+			return otpNotice{}, ctx.Err()
 		}
 	} else {
 		rt.lock()
@@ -823,10 +858,10 @@ func (s *Supervisor) fetchBody(ctx context.Context, messageID int64, background 
 	defer rt.unlock()
 	client := rt.client.Load()
 	if client == nil {
-		return errors.New("account is offline")
+		return otpNotice{}, errors.New("account is offline")
 	}
 	if _, err := client.Select(location.Mailbox.RemoteName, &goimap.SelectOptions{ReadOnly: true}).Wait(); err != nil {
-		return err
+		return otpNotice{}, err
 	}
 	section := &goimap.FetchItemBodySection{Peek: true}
 	items, err := client.Fetch(goimap.UIDSetNum(goimap.UID(location.UID)), &goimap.FetchOptions{UID: true, BodySection: []*goimap.FetchItemBodySection{section}}).Collect()
@@ -834,18 +869,34 @@ func (s *Supervisor) fetchBody(ctx context.Context, messageID int64, background 
 		if err == nil {
 			err = errors.New("message body not found")
 		}
-		return err
+		return otpNotice{}, err
 	}
 	body := items[0].FindBodySection(section)
 	parsed, err := mailparser.Parse(bytes.NewReader(body))
 	if err != nil {
-		return err
+		return otpNotice{}, err
 	}
 	blob, err := s.blobs.Put(ctx, bytes.NewReader(body), "cache")
 	if err != nil {
-		return err
+		return otpNotice{}, err
 	}
-	return s.repo.UpdateMessageBody(ctx, messageID, parsed.Text, parsed.HTML, parsed.Snippet, &blob.ID)
+	if err := s.repo.UpdateMessageBody(ctx, messageID, parsed.Text, parsed.HTML, parsed.Snippet, &blob.ID); err != nil {
+		return otpNotice{}, err
+	}
+	if !withinOTPWindow(time.UnixMilli(message.ReceivedAt)) {
+		return otpNotice{}, nil
+	}
+	code, ok := mailparser.DetectOTP(message.Subject, parsed.Text, parsed.HTML)
+	if !ok {
+		return otpNotice{}, nil
+	}
+	return otpNotice{Code: code, Subject: message.Subject}, nil
+}
+
+// withinOTPWindow reports whether a message is recent enough that surfacing its
+// verification code as a notification is still useful.
+func withinOTPWindow(received time.Time) bool {
+	return !received.IsZero() && time.Since(received) <= otpFreshness
 }
 
 func (s *Supervisor) enqueueBodyCandidates(ctx context.Context, accountID int64) {
@@ -882,11 +933,19 @@ func (s *Supervisor) bodyWorker(ctx context.Context) {
 			return
 		case id := <-s.bodyQueue:
 			fetchCtx, cancel := context.WithTimeout(ctx, 45*time.Second)
-			err := s.fetchBody(fetchCtx, id, true)
+			otp, err := s.fetchBody(fetchCtx, id, true)
 			cancel()
 			s.bodySeen.Delete(id)
 			if err == nil {
-				s.events.Publish(ports.Event{Type: "MESSAGE_UPDATED", Data: map[string]any{"message_id": id}})
+				// Published after fetchBody released the command lock. The code is
+				// carried on the event so the browser can raise a copyable
+				// notification without another round-trip.
+				data := map[string]any{"message_id": id}
+				if otp.Code != "" {
+					data["otp_code"] = otp.Code
+					data["otp_subject"] = otp.Subject
+				}
+				s.events.Publish(ports.Event{Type: "MESSAGE_UPDATED", Data: data})
 			}
 			select {
 			case <-ctx.Done():
@@ -1031,6 +1090,85 @@ func (s *Supervisor) Archive(ctx context.Context, messageID int64) error {
 		destinationUID = firstDestinationUID(copyData.DestUIDs)
 	}
 	return s.repo.MoveMessageLocation(ctx, messageID, location.Mailbox.ID, destination.ID, destinationUID)
+}
+
+// SetSeenBulk adds \Seen to many messages, grouped so each account's command
+// connection is taken once. It returns the message IDs the provider accepted so
+// the caller only writes through the rows that really changed remotely.
+//
+// Failures are per account: one offline mailbox must not discard the flags that
+// other accounts already stored.
+func (s *Supervisor) SetSeenBulk(ctx context.Context, messageIDs []int64) ([]int64, error) {
+	locations, err := s.repo.MessageLocations(ctx, messageIDs)
+	if err != nil {
+		return nil, err
+	}
+	groups := make(map[int64]map[int64][]ports.MessageLocation)
+	for _, location := range locations {
+		byMailbox := groups[location.Account.ID]
+		if byMailbox == nil {
+			byMailbox = make(map[int64][]ports.MessageLocation)
+			groups[location.Account.ID] = byMailbox
+		}
+		byMailbox[location.Mailbox.ID] = append(byMailbox[location.Mailbox.ID], location)
+	}
+	done := make([]int64, 0, len(locations))
+	var failures []error
+	for accountID, byMailbox := range groups {
+		if ctx.Err() != nil {
+			return done, ctx.Err()
+		}
+		updated, err := s.setSeenAccount(ctx, accountID, byMailbox)
+		done = append(done, updated...)
+		if err != nil {
+			failures = append(failures, fmt.Errorf("account %d: %w", accountID, err))
+		}
+	}
+	return done, errors.Join(failures...)
+}
+
+// setSeenAccount holds one account's command lock for the whole account and no
+// longer. The 5s inbox probe and the IDLE-driven sync contend for the same lock,
+// so the UID list is chunked and the lock is released before the next account.
+func (s *Supervisor) setSeenAccount(ctx context.Context, accountID int64, byMailbox map[int64][]ports.MessageLocation) ([]int64, error) {
+	rt, err := s.runtime(accountID)
+	if err != nil {
+		return nil, err
+	}
+	rt.lock()
+	defer rt.unlock()
+	client := rt.client.Load()
+	if client == nil {
+		return nil, errors.New("account is offline")
+	}
+	done := make([]int64, 0)
+	var failures []error
+	for _, group := range byMailbox {
+		if ctx.Err() != nil {
+			return done, ctx.Err()
+		}
+		if _, err := client.Select(group[0].Mailbox.RemoteName, nil).Wait(); err != nil {
+			failures = append(failures, fmt.Errorf("select %q: %w", group[0].Mailbox.RemoteName, err))
+			continue
+		}
+		for start := 0; start < len(group); start += bulkFlagChunk {
+			end := min(start+bulkFlagChunk, len(group))
+			chunk := group[start:end]
+			uids := make([]goimap.UID, len(chunk))
+			for index, location := range chunk {
+				uids[index] = goimap.UID(location.UID)
+			}
+			store := &goimap.StoreFlags{Op: goimap.StoreFlagsAdd, Silent: true, Flags: []goimap.Flag{goimap.FlagSeen}}
+			if _, err := client.Store(goimap.UIDSetNum(uids...), store, nil).Collect(); err != nil {
+				failures = append(failures, err)
+				continue
+			}
+			for _, location := range chunk {
+				done = append(done, location.MessageID)
+			}
+		}
+	}
+	return done, errors.Join(failures...)
 }
 
 func firstDestinationUID(set goimap.NumSet) *uint32 {

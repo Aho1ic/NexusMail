@@ -24,9 +24,10 @@ type MessagePage struct {
 }
 
 type MessageLocation struct {
-	Account domain.Account
-	Mailbox domain.Mailbox
-	UID     uint32
+	MessageID int64
+	Account   domain.Account
+	Mailbox   domain.Mailbox
+	UID       uint32
 }
 
 type MessagePatch struct {
@@ -49,6 +50,7 @@ type Repository interface {
 	ResetMailbox(context.Context, int64, uint32) error
 	CreateOrUpdateMessage(context.Context, *domain.Message, int64, uint32, []string, time.Time) (bool, error)
 	MessageLocation(context.Context, int64) (MessageLocation, error)
+	MessageLocations(context.Context, []int64) ([]MessageLocation, error)
 	MoveMessageLocation(context.Context, int64, int64, int64, *uint32) error
 	SetMessageBodyState(context.Context, int64, string) error
 	UpdateMessageBody(context.Context, int64, string, string, string, *int64) error
@@ -57,8 +59,10 @@ type Repository interface {
 	UpdateAttachmentBlob(context.Context, int64, int64) error
 	ListBodyCandidateIDs(context.Context, int64, int64, int) ([]int64, error)
 	ListMessages(context.Context, MessageFilter) (MessagePage, error)
+	UnreadMessageIDs(context.Context, MessageFilter, int) ([]int64, error)
 	GetMessage(context.Context, int64) (domain.Message, []domain.Attachment, error)
 	UpdateMessage(context.Context, int64, MessagePatch) (domain.Message, error)
+	UpdateMessages(context.Context, []int64, MessagePatch) error
 	CreateDraft(context.Context, *domain.Draft) error
 	ListDrafts(context.Context, string) ([]domain.Draft, error)
 	GetDraft(context.Context, int64) (domain.Draft, []domain.DraftAttachment, error)

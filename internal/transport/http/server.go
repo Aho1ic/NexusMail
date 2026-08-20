@@ -17,6 +17,7 @@ import (
 
 	"nexusmail/internal/config"
 	"nexusmail/internal/domain"
+	mailparser "nexusmail/internal/mail"
 	"nexusmail/internal/ports"
 	imapprovider "nexusmail/internal/provider/imap"
 	"nexusmail/internal/provider/oauth"
@@ -78,6 +79,7 @@ func (s *Server) routes() *gin.Engine {
 	protected.GET("/accounts", s.listAccounts)
 	protected.GET("/accounts/:id/mailboxes", s.listMailboxes)
 	protected.GET("/messages", s.listMessages)
+	protected.POST("/messages/mark-read", s.markMessagesRead)
 	protected.GET("/messages/:id", s.getMessage)
 	protected.PATCH("/messages/:id", s.patchMessage)
 	protected.GET("/messages/:id/attachments/:attachment_id", s.downloadAttachment)
@@ -256,6 +258,31 @@ func (s *Server) listMessages(c *gin.Context) {
 	c.JSON(200, page)
 }
 
+// markMessagesRead marks the current view read. The scope is expressed with the
+// same query parameters as the feed so "everything I can see" cannot drift
+// between the list and the button acting on it.
+func (s *Server) markMessagesRead(c *gin.Context) {
+	filter := ports.MessageFilter{Folder: c.Query("folder"), Query: strings.TrimSpace(c.Query("query"))}
+	if value, ok := optionalInt64(c, "account_id"); ok {
+		filter.AccountID = value
+	}
+	if value, ok := optionalInt64(c, "mailbox_id"); ok {
+		filter.MailboxID = value
+	}
+	result, err := s.messages.MarkRead(c.Request.Context(), filter)
+	if err != nil {
+		// A partial success still changed state on the provider and locally, so it
+		// is reported as success with a flag rather than thrown away as an error.
+		if result.Updated == 0 {
+			writeError(c, err)
+			return
+		}
+		c.JSON(200, gin.H{"updated": result.Updated, "capped": result.Capped, "partial": true})
+		return
+	}
+	c.JSON(200, gin.H{"updated": result.Updated, "capped": result.Capped})
+}
+
 func (s *Server) getMessage(c *gin.Context) {
 	id, ok := idParam(c, "id")
 	if !ok {
@@ -287,7 +314,14 @@ func (s *Server) getMessage(c *gin.Context) {
 			return
 		}
 	}
-	c.JSON(status, gin.H{"message": message, "attachments": attachments})
+	body := gin.H{"message": message, "attachments": attachments}
+	// The code is derived on read rather than stored: it is cheap to recompute and
+	// a column would need a migration the runner cannot apply. Only the detail
+	// endpoint pays for it — the feed would run this over a whole page of bodies.
+	if code, ok := mailparser.DetectOTP(message.Subject, message.BodyText, message.BodyHTML); ok {
+		body["otp_code"] = code
+	}
+	c.JSON(status, body)
 }
 
 func (s *Server) patchMessage(c *gin.Context) {

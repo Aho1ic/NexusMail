@@ -25,6 +25,14 @@ import (
 
 var ErrConflict = errors.New("revision conflict")
 
+const (
+	// maxBulkMessageIDs bounds one bulk mark-read so a stale view cannot queue an
+	// unbounded IMAP STORE run against the provider.
+	maxBulkMessageIDs = 2000
+	// sqliteParameterChunk keeps IN (...) lists clear of SQLite's variable limit.
+	sqliteParameterChunk = 500
+)
+
 type Store struct {
 	db      *gorm.DB
 	sqlDB   *sql.DB
@@ -206,28 +214,12 @@ func (s *Store) ListMessages(ctx context.Context, filter ports.MessageFilter) (p
 		limit = 100
 	}
 	query := s.db.WithContext(ctx).Model(&domain.Message{}).Distinct("messages.*")
-	if filter.AccountID != nil {
-		query = query.Where("messages.account_id = ?", *filter.AccountID)
-	}
+	query = applyMessageScope(query, filter)
 	if filter.IsRead != nil {
 		query = query.Where("messages.is_read = ?", *filter.IsRead)
 	}
-	if filter.MailboxID != nil || filter.Folder != "" {
-		query = query.Joins("JOIN mailbox_messages mm ON mm.message_id = messages.id").Joins("JOIN mailboxes mb ON mb.id = mm.mailbox_id")
-		if filter.MailboxID != nil {
-			query = query.Where("mb.id = ?", *filter.MailboxID)
-		}
-		if filter.Folder != "" {
-			query = query.Where("mb.role = ?", filter.Folder)
-		}
-	}
 	if filter.Query != "" {
-		if utf8.RuneCountInString(filter.Query) >= 3 {
-			query = query.Joins("JOIN message_fts ON message_fts.rowid = messages.id").Where("message_fts MATCH ?", quoteFTS(filter.Query))
-		} else {
-			like := "%" + escapeLike(filter.Query) + "%"
-			query = query.Where("(messages.subject LIKE ? ESCAPE '\\' OR messages.sender LIKE ? ESCAPE '\\' OR messages.recipients LIKE ? ESCAPE '\\' OR messages.body_text LIKE ? ESCAPE '\\')", like, like, like, like)
-		}
+		query = applyMessageSearch(query, filter.Query)
 	}
 	if filter.Cursor != "" {
 		cursor, err := decodeCursor(filter.Cursor)
@@ -247,6 +239,82 @@ func (s *Store) ListMessages(ctx context.Context, filter ports.MessageFilter) (p
 		page.NextCursor = encodeCursor(cursorValue{ReceivedAt: last.ReceivedAt, ID: last.ID})
 	}
 	return page, nil
+}
+
+// applyMessageSearch applies the FTS or LIKE predicate shared by the message feed
+// and any other query that filters on message text.
+func applyMessageSearch(query *gorm.DB, value string) *gorm.DB {
+	if utf8.RuneCountInString(value) >= 3 {
+		return query.Joins("JOIN message_fts ON message_fts.rowid = messages.id").Where("message_fts MATCH ?", quoteFTS(value))
+	}
+	like := "%" + escapeLike(value) + "%"
+	return query.Where("(messages.subject LIKE ? ESCAPE '\\' OR messages.sender LIKE ? ESCAPE '\\' OR messages.recipients LIKE ? ESCAPE '\\' OR messages.body_text LIKE ? ESCAPE '\\')", like, like, like, like)
+}
+
+// applyMessageScope adds the account, mailbox and folder predicates shared by the
+// message feed and the bulk mark-read query, so the two can never disagree about
+// which messages "the current view" contains.
+func applyMessageScope(query *gorm.DB, filter ports.MessageFilter) *gorm.DB {
+	if filter.AccountID != nil {
+		query = query.Where("messages.account_id = ?", *filter.AccountID)
+	}
+	if filter.MailboxID != nil || filter.Folder != "" {
+		query = query.Joins("JOIN mailbox_messages mm ON mm.message_id = messages.id").Joins("JOIN mailboxes mb ON mb.id = mm.mailbox_id")
+		if filter.MailboxID != nil {
+			query = query.Where("mb.id = ?", *filter.MailboxID)
+		}
+		if filter.Folder != "" {
+			query = query.Where("mb.role = ?", filter.Folder)
+		}
+	}
+	return query
+}
+
+// UnreadMessageIDs lists the unread messages a view contains, newest first, up to
+// limit. It does not reuse ListMessages because that clamps to a page of 100,
+// while "mark everything read" has to reach the whole backlog. The cap is still
+// bounded so one click cannot turn into an unbounded IMAP STORE run.
+func (s *Store) UnreadMessageIDs(ctx context.Context, filter ports.MessageFilter, limit int) ([]int64, error) {
+	if limit <= 0 || limit > maxBulkMessageIDs {
+		limit = maxBulkMessageIDs
+	}
+	query := applyMessageScope(s.db.WithContext(ctx).Model(&domain.Message{}), filter)
+	// The search term is part of the view: marking a filtered list read must not
+	// reach the mail the filter is hiding.
+	if filter.Query != "" {
+		query = applyMessageSearch(query, filter.Query)
+	}
+	var ids []int64
+	err := query.Where("messages.is_read = 0 AND messages.direction = 'incoming'").
+		Distinct().Order("messages.received_at DESC, messages.id DESC").Limit(limit).
+		Pluck("messages.id", &ids).Error
+	return ids, err
+}
+
+// UpdateMessages applies one patch to many messages in a single transaction.
+// writeMu is not re-entrant, so nothing here may call another locking write.
+func (s *Store) UpdateMessages(ctx context.Context, ids []int64, patch ports.MessagePatch) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	updates := map[string]any{"updated_at": time.Now().UnixMilli()}
+	if patch.IsRead != nil {
+		updates["is_read"] = *patch.IsRead
+	}
+	if patch.IsStarred != nil {
+		updates["is_starred"] = *patch.IsStarred
+	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		for start := 0; start < len(ids); start += sqliteParameterChunk {
+			end := min(start+sqliteParameterChunk, len(ids))
+			if err := tx.Model(&domain.Message{}).Where("id IN ?", ids[start:end]).Updates(updates).Error; err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 }
 
 func (s *Store) GetMessage(ctx context.Context, id int64) (domain.Message, []domain.Attachment, error) {

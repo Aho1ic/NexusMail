@@ -72,7 +72,86 @@ func (s *Store) MessageLocation(ctx context.Context, messageID int64) (ports.Mes
 		return location, err
 	}
 	location.UID = mapping.UID
+	location.MessageID = messageID
 	return location, nil
+}
+
+// MessageLocations resolves many messages at once. MessageLocation costs three
+// round-trips per message, which a bulk flag update would multiply by the whole
+// backlog, so accounts and mailboxes are fetched once and joined in memory.
+// Messages with no remote mapping are omitted rather than failing the batch.
+func (s *Store) MessageLocations(ctx context.Context, messageIDs []int64) ([]ports.MessageLocation, error) {
+	if len(messageIDs) == 0 {
+		return nil, nil
+	}
+	type mapping struct {
+		MessageID int64  `gorm:"column:message_id"`
+		AccountID int64  `gorm:"column:account_id"`
+		MailboxID int64  `gorm:"column:mailbox_id"`
+		UID       uint32 `gorm:"column:uid"`
+	}
+	var mappings []mapping
+	for start := 0; start < len(messageIDs); start += sqliteParameterChunk {
+		end := min(start+sqliteParameterChunk, len(messageIDs))
+		var chunk []mapping
+		// The window picks one mailbox per message with the same inbox-first
+		// preference MessageLocation uses, so single and bulk updates target the
+		// same copy of a message that lives in several mailboxes.
+		err := s.db.WithContext(ctx).Raw(`SELECT message_id, account_id, mailbox_id, uid FROM (
+                SELECT mm.message_id, mb.account_id, mm.mailbox_id, mm.uid,
+                    ROW_NUMBER() OVER (PARTITION BY mm.message_id ORDER BY
+                        CASE mb.role WHEN 'inbox' THEN 0 WHEN 'archive' THEN 1 ELSE 2 END, mm.mailbox_id) AS rank
+                FROM mailbox_messages mm JOIN mailboxes mb ON mb.id = mm.mailbox_id
+                WHERE mm.message_id IN ?
+            ) WHERE rank = 1`, messageIDs[start:end]).Scan(&chunk).Error
+		if err != nil {
+			return nil, err
+		}
+		mappings = append(mappings, chunk...)
+	}
+	if len(mappings) == 0 {
+		return nil, nil
+	}
+	accountIDs := make(map[int64]struct{}, len(mappings))
+	mailboxIDs := make(map[int64]struct{}, len(mappings))
+	for _, item := range mappings {
+		accountIDs[item.AccountID] = struct{}{}
+		mailboxIDs[item.MailboxID] = struct{}{}
+	}
+	var accountRows []domain.Account
+	if err := s.db.WithContext(ctx).Where("id IN ?", keysOf(accountIDs)).Find(&accountRows).Error; err != nil {
+		return nil, err
+	}
+	var mailboxRows []domain.Mailbox
+	if err := s.db.WithContext(ctx).Where("id IN ?", keysOf(mailboxIDs)).Find(&mailboxRows).Error; err != nil {
+		return nil, err
+	}
+	accounts := make(map[int64]domain.Account, len(accountRows))
+	for _, account := range accountRows {
+		accounts[account.ID] = account
+	}
+	mailboxes := make(map[int64]domain.Mailbox, len(mailboxRows))
+	for _, mailbox := range mailboxRows {
+		mailboxes[mailbox.ID] = mailbox
+	}
+	locations := make([]ports.MessageLocation, 0, len(mappings))
+	for _, item := range mappings {
+		account, hasAccount := accounts[item.AccountID]
+		mailbox, hasMailbox := mailboxes[item.MailboxID]
+		if !hasAccount || !hasMailbox {
+			continue
+		}
+		locations = append(locations, ports.MessageLocation{MessageID: item.MessageID, Account: account, Mailbox: mailbox, UID: item.UID})
+	}
+	return locations, nil
+}
+
+func keysOf(source map[int64]struct{}) []int64 {
+	keys := make([]int64, 0, len(source))
+	for key := range source {
+		keys = append(keys, key)
+	}
+	return keys
 }
 
 func (s *Store) MoveMessageLocation(ctx context.Context, messageID, sourceMailboxID, destinationMailboxID int64, destinationUID *uint32) error {

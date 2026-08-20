@@ -247,6 +247,225 @@ func TestRemoteDraftConflictCopyReleasesRemoteUID(t *testing.T) {
 	}
 }
 
+// TestUnreadMessageIDsScopeAndBulkUpdate pins the two queries behind "mark the
+// current view read": the view must resolve to exactly the unread incoming mail
+// the feed shows, and one patch must reach every id in a single transaction.
+func TestUnreadMessageIDsScopeAndBulkUpdate(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+	account, inbox := seedAccountMailbox(t, store)
+	now := time.Now().UnixMilli()
+	archive := domain.Mailbox{AccountID: account.ID, RemoteName: "Archive", DisplayName: "Archive", Role: "archive", SyncMode: "lazy", UIDValidity: 42, CreatedAt: now, UpdatedAt: now}
+	if err := store.UpsertMailbox(ctx, &archive); err != nil {
+		t.Fatal(err)
+	}
+	mailboxes, err := store.ListMailboxes(ctx, account.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, mailbox := range mailboxes {
+		if mailbox.Role == "archive" {
+			archive = mailbox
+		}
+	}
+
+	older := seedMessage(t, store, account.ID, inbox.ID, 1, "older unread", "incoming", false, now)
+	newer := seedMessage(t, store, account.ID, inbox.ID, 2, "newer unread", "incoming", false, now+1_000)
+	alreadyRead := seedMessage(t, store, account.ID, inbox.ID, 3, "already read", "incoming", true, now+2_000)
+	outgoing := seedMessage(t, store, account.ID, inbox.ID, 4, "sent copy", "outgoing", false, now+3_000)
+	archived := seedMessage(t, store, account.ID, archive.ID, 1, "archived unread", "incoming", false, now+4_000)
+	// The same message filed in two mailboxes must still be counted once.
+	linkMessage(t, store, account.ID, archive.ID, 2, "newer unread", "incoming", false, now+1_000)
+
+	all, err := store.UnreadMessageIDs(ctx, ports.MessageFilter{}, 0)
+	if err != nil {
+		t.Fatalf("unread ids: %v", err)
+	}
+	// Newest first, read mail and the outgoing copy excluded, no duplicate for the
+	// message linked twice.
+	if want := []int64{archived, newer, older}; !equalIDs(all, want) {
+		t.Fatalf("unscoped unread = %v, want %v (read=%d outgoing=%d)", all, want, alreadyRead, outgoing)
+	}
+
+	inboxOnly, err := store.UnreadMessageIDs(ctx, ports.MessageFilter{Folder: "inbox"}, 0)
+	if err != nil {
+		t.Fatalf("unread ids for inbox: %v", err)
+	}
+	if want := []int64{newer, older}; !equalIDs(inboxOnly, want) {
+		t.Fatalf("inbox unread = %v, want %v", inboxOnly, want)
+	}
+
+	byMailbox, err := store.UnreadMessageIDs(ctx, ports.MessageFilter{MailboxID: &archive.ID}, 0)
+	if err != nil {
+		t.Fatalf("unread ids for mailbox: %v", err)
+	}
+	if want := []int64{archived, newer}; !equalIDs(byMailbox, want) {
+		t.Fatalf("archive unread = %v, want %v", byMailbox, want)
+	}
+
+	otherAccount := account.ID + 1_000
+	foreign, err := store.UnreadMessageIDs(ctx, ports.MessageFilter{AccountID: &otherAccount}, 0)
+	if err != nil || len(foreign) != 0 {
+		t.Fatalf("unread ids for another account = %v err=%v, want empty", foreign, err)
+	}
+
+	// The search box is part of the view: marking a filtered list read must leave
+	// the unread mail the filter hides alone.
+	searched, err := store.UnreadMessageIDs(ctx, ports.MessageFilter{Folder: "inbox", Query: "older"}, 0)
+	if err != nil {
+		t.Fatalf("unread ids for a search: %v", err)
+	}
+	if want := []int64{older}; !equalIDs(searched, want) {
+		t.Fatalf("searched unread = %v, want %v", searched, want)
+	}
+	// Terms under three runes fall back to LIKE rather than the trigram index.
+	short, err := store.UnreadMessageIDs(ctx, ports.MessageFilter{Query: "ed"}, 0)
+	if err != nil {
+		t.Fatalf("unread ids for a short search: %v", err)
+	}
+	if want := []int64{archived}; !equalIDs(short, want) {
+		t.Fatalf("short-search unread = %v, want %v", short, want)
+	}
+
+	// A caller-supplied limit truncates from the newest end; a limit above the
+	// hard cap is clamped instead of trusted.
+	limited, err := store.UnreadMessageIDs(ctx, ports.MessageFilter{}, 1)
+	if err != nil || !equalIDs(limited, []int64{archived}) {
+		t.Fatalf("limit 1 = %v err=%v, want [%d]", limited, err, archived)
+	}
+	oversized, err := store.UnreadMessageIDs(ctx, ports.MessageFilter{}, maxBulkMessageIDs*10)
+	if err != nil || len(oversized) != 3 {
+		t.Fatalf("oversized limit = %v err=%v, want 3 ids", oversized, err)
+	}
+
+	value := true
+	if err := store.UpdateMessages(ctx, all, ports.MessagePatch{IsRead: &value}); err != nil {
+		t.Fatalf("bulk update: %v", err)
+	}
+	for _, id := range all {
+		message, err := store.GetMessageOnly(ctx, id)
+		if err != nil || !message.IsRead {
+			t.Fatalf("message %d is_read=%v err=%v, want read", id, message.IsRead, err)
+		}
+	}
+	if remaining, err := store.UnreadMessageIDs(ctx, ports.MessageFilter{}, 0); err != nil || len(remaining) != 0 {
+		t.Fatalf("unread after bulk update = %v err=%v, want empty", remaining, err)
+	}
+	// The outgoing message was never in scope, so the bulk patch must not have
+	// touched it.
+	if message, err := store.GetMessageOnly(ctx, outgoing); err != nil || message.IsRead {
+		t.Fatalf("outgoing message is_read=%v err=%v, want untouched", message.IsRead, err)
+	}
+	if err := store.UpdateMessages(ctx, nil, ports.MessagePatch{IsRead: &value}); err != nil {
+		t.Fatalf("empty bulk update must be a no-op, got %v", err)
+	}
+}
+
+// TestMessageLocationsBatch pins that the batch resolver agrees with the single
+// lookup, including the inbox-first choice for a message filed twice, and that a
+// message with no remote mapping is skipped rather than failing the batch.
+func TestMessageLocationsBatch(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+	account, inbox := seedAccountMailbox(t, store)
+	now := time.Now().UnixMilli()
+	archive := domain.Mailbox{AccountID: account.ID, RemoteName: "Archive", DisplayName: "Archive", Role: "archive", SyncMode: "lazy", UIDValidity: 42, CreatedAt: now, UpdatedAt: now}
+	if err := store.UpsertMailbox(ctx, &archive); err != nil {
+		t.Fatal(err)
+	}
+	mailboxes, err := store.ListMailboxes(ctx, account.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, mailbox := range mailboxes {
+		if mailbox.Role == "archive" {
+			archive = mailbox
+		}
+	}
+
+	first := seedMessage(t, store, account.ID, inbox.ID, 11, "first", "incoming", false, now)
+	second := seedMessage(t, store, account.ID, archive.ID, 12, "second", "incoming", false, now+1_000)
+	// Filed in the archive first, then the inbox: the inbox copy must win.
+	linkMessage(t, store, account.ID, inbox.ID, 13, "second", "incoming", false, now+1_000)
+
+	locations, err := store.MessageLocations(ctx, []int64{first, second, second + 9_999})
+	if err != nil {
+		t.Fatalf("message locations: %v", err)
+	}
+	if len(locations) != 2 {
+		t.Fatalf("locations = %#v, want 2 entries (unmapped id skipped)", locations)
+	}
+	byID := make(map[int64]ports.MessageLocation, len(locations))
+	for _, location := range locations {
+		byID[location.MessageID] = location
+	}
+	for _, id := range []int64{first, second} {
+		single, err := store.MessageLocation(ctx, id)
+		if err != nil {
+			t.Fatalf("single location for %d: %v", id, err)
+		}
+		batch, ok := byID[id]
+		if !ok {
+			t.Fatalf("message %d missing from batch result %#v", id, locations)
+		}
+		if batch.Mailbox.ID != single.Mailbox.ID || batch.UID != single.UID || batch.Account.ID != single.Account.ID {
+			t.Fatalf("batch location %#v disagrees with single %#v", batch, single)
+		}
+	}
+	if byID[second].Mailbox.Role != "inbox" {
+		t.Fatalf("message in two mailboxes resolved to %q, want inbox", byID[second].Mailbox.Role)
+	}
+	if empty, err := store.MessageLocations(ctx, nil); err != nil || len(empty) != 0 {
+		t.Fatalf("empty batch = %#v err=%v, want empty", empty, err)
+	}
+}
+
+func seedMessage(t *testing.T, store *Store, accountID, mailboxID int64, uid uint32, subject, direction string, read bool, receivedAt int64) int64 {
+	t.Helper()
+	id, created := upsertMessage(t, store, accountID, mailboxID, uid, subject, direction, read, receivedAt)
+	if !created {
+		t.Fatalf("seed message %q already existed", subject)
+	}
+	return id
+}
+
+// linkMessage files an existing message into a second mailbox by reusing its
+// dedupe key, which is how a real sync sees the same mail in two folders.
+func linkMessage(t *testing.T, store *Store, accountID, mailboxID int64, uid uint32, subject, direction string, read bool, receivedAt int64) {
+	t.Helper()
+	if _, created := upsertMessage(t, store, accountID, mailboxID, uid, subject, direction, read, receivedAt); created {
+		t.Fatalf("link of %q created a second row instead of reusing the dedupe key", subject)
+	}
+}
+
+func upsertMessage(t *testing.T, store *Store, accountID, mailboxID int64, uid uint32, subject, direction string, read bool, receivedAt int64) (int64, bool) {
+	t.Helper()
+	digest := sha256.Sum256([]byte(subject))
+	message := domain.Message{
+		AccountID: accountID, Direction: direction, DedupeKey: digest[:], Subject: subject,
+		Sender: "Sender <sender@example.com>", Recipients: "receiver@example.com",
+		FromJSON: "[]", ToJSON: "[]", CCJSON: "[]", BCCJSON: "[]", ReplyToJSON: "[]", ReferencesJSON: "[]",
+		BodyState: "metadata", IsRead: read, ReceivedAt: receivedAt, CreatedAt: receivedAt, UpdatedAt: receivedAt,
+	}
+	created, err := store.CreateOrUpdateMessage(context.Background(), &message, mailboxID, uid, nil, time.UnixMilli(receivedAt))
+	if err != nil {
+		t.Fatalf("upsert message %q: %v", subject, err)
+	}
+	return message.ID, created
+}
+
+func equalIDs(got, want []int64) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for index := range got {
+		if got[index] != want[index] {
+			return false
+		}
+	}
+	return true
+}
+
 func openTestStore(t *testing.T) *Store {
 	t.Helper()
 	store, err := Open(filepath.Join(t.TempDir(), "mail.db"))

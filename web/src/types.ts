@@ -14,6 +14,9 @@ export type Message = {
   has_attachments: boolean;
 }
 export type Attachment = { id: number; message_id: number; filename: string; content_type: string; content_id?: string; size_bytes: number; fetch_state: string }
+// capped means more unread mail remained than one call may touch; partial means
+// some accounts failed while the reported messages were still applied.
+export type MarkReadResult = { updated: number; capped?: boolean; partial?: boolean }
 export type Draft = {
   id: number; account_id: number; revision: number; to: string; cc: string; bcc: string;
   subject: string; body_text: string; status: string; remote_sync_state: string; updated_at: number;

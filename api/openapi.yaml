@@ -115,6 +115,34 @@ paths:
                 properties:
                   items: { type: array, items: { $ref: '#/components/schemas/Message' } }
                   next_cursor: { type: string }
+  /api/v1/messages/mark-read:
+    post:
+      summary: Mark every unread message in the current view as read
+      description: >-
+        The view is described with the same account_id/mailbox_id/folder/query
+        parameters as the feed, so an active search narrows this call the same way
+        it narrows the list. \Seen is set on the provider first and only the
+        messages it accepted are written locally, so one bounded pass is applied
+        at most; capped reports that more unread mail remains than a single call
+        may touch.
+      parameters:
+        - { in: query, name: account_id, schema: { type: integer, format: int64 } }
+        - { in: query, name: mailbox_id, schema: { type: integer, format: int64 } }
+        - { in: query, name: folder, schema: { type: string } }
+        - { in: query, name: query, description: Same full-text term as the feed; restricts the pass to the matching messages, schema: { type: string } }
+      responses:
+        '200':
+          description: Number of messages marked read
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  updated: { type: integer }
+                  capped: { type: boolean, description: More unread mail remains; call again to continue }
+                  partial: { type: boolean, description: Some accounts failed; the reported messages were still applied }
+        '400': { $ref: '#/components/responses/Error' }
+        '503': { $ref: '#/components/responses/Error' }
   /api/v1/messages/{id}:
     get:
       summary: Read a message; queues body retrieval when necessary
@@ -279,6 +307,9 @@ components:
             properties:
               message: { $ref: '#/components/schemas/Message' }
               attachments: { type: array, items: { $ref: '#/components/schemas/Attachment' } }
+              otp_code:
+                type: string
+                description: Verification code detected in the subject or body; absent when none was found. Derived on read, never stored.
     Queued:
       description: Accepted for asynchronous delivery
       content:
@@ -410,7 +441,14 @@ components:
         type: { type: string, enum: [NEW_EMAIL, MESSAGE_UPDATED, ACCOUNT_STATUS, SYNC_PROGRESS, DRAFT_UPDATED, OUTBOX_UPDATED] }
         sequence: { type: integer, format: int64 }
         occurred_at: { type: integer, format: int64 }
-        data: { type: object, additionalProperties: true }
+        data:
+          type: object
+          additionalProperties: true
+          description: >-
+            NEW_EMAIL and MESSAGE_UPDATED carry otp_code and otp_subject when a
+            verification code was detected in a message received within the last
+            ten minutes. MESSAGE_UPDATED from a bulk mark-read carries bulk and
+            count instead of message_id.
     ErrorEnvelope:
       type: object
       required: [error]
