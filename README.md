@@ -33,7 +33,7 @@ docker compose up --build
 **每次推送到 `main`** 都会触发 `.github/workflows/publish-image.yml` 构建并推送镜像：
 
 - GHCR：`ghcr.io/aho1ic/nexusmail`（无需配置，使用工作流内置的 `GITHUB_TOKEN`）
-- Docker Hub：`docker.io/<DOCKERHUB_USERNAME>/nexusmail`（需配置下述两个 secret，未配置时自动跳过，只发 GHCR）
+- Docker Hub：`docker.io/aho1ic901/nexusmail`（需配置下述两个 secret，未配置时自动跳过，只发 GHCR）
 
 标签规则：
 
