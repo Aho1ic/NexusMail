@@ -4,8 +4,6 @@ on:
   push:
     branches:
       - main
-    paths:
-      - VERSION
   workflow_dispatch:
 
 env:
@@ -20,24 +18,80 @@ jobs:
 
     steps:
       - name: Check out repository
+        # Two commits deep so the VERSION file can be compared against its
+        # previous state; a shallow single-commit checkout has nothing to diff.
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
 
-      - name: Read and validate version
+      - name: Resolve version and release status
         id: version
         shell: bash
         run: |
+          set -euo pipefail
           version="$(tr -d '[:space:]' < VERSION)"
           if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
             echo "VERSION must contain a semantic version, got: $version" >&2
             exit 1
           fi
-          echo "value=$version" >> "$GITHUB_OUTPUT"
 
-      - name: Log in to Docker Hub
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          # A release is a push that actually changed VERSION, or any manual run.
+          # Every other push still publishes, but only under a commit-SHA tag, so
+          # a semantic tag keeps pointing at the single build that claimed it.
+          release=false
+          if [[ "${{ github.event_name }}" != "push" ]]; then
+            release=true
+          else
+            before="${{ github.event.before }}"
+            if [[ -z "$before" || "$before" == "0000000000000000000000000000000000000000" ]]; then
+              before="HEAD^"
+            fi
+            if ! git diff --quiet "$before" HEAD -- VERSION 2>/dev/null; then
+              release=true
+            fi
+          fi
+
+          # The build that goes into a non-release image is labelled with the commit
+          # it came from, so the version in the startup log identifies it exactly.
+          build_version="$version"
+          if [[ "$release" != "true" ]]; then
+            build_version="${version}-${GITHUB_SHA::7}"
+          fi
+
+          {
+            # Registry paths must be lowercase; this owner login is not.
+            echo "owner=${GITHUB_REPOSITORY_OWNER,,}"
+            echo "value=$version"
+            echo "build=$build_version"
+            echo "release=$release"
+          } >> "$GITHUB_OUTPUT"
+          echo "Publishing $build_version (release=$release)"
+
+      - name: Resolve target registries
+        id: registries
+        shell: bash
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # GHCR needs no configuration beyond the built-in token. Docker Hub is
+          # opt-in: without both secrets its steps are skipped rather than failing
+          # the run, so a missing secret cannot cost the GHCR image as well.
+          images="ghcr.io/${{ steps.version.outputs.owner }}/${IMAGE_NAME}"
+          dockerhub=false
+          if [[ -n "$DOCKERHUB_USERNAME" && -n "$DOCKERHUB_TOKEN" ]]; then
+            dockerhub=true
+            images="${images}"$'\n'"docker.io/${DOCKERHUB_USERNAME}/${IMAGE_NAME}"
+          else
+            echo "::notice::DOCKERHUB_USERNAME/DOCKERHUB_TOKEN not set — publishing to GHCR only."
+          fi
+          echo "dockerhub=$dockerhub" >> "$GITHUB_OUTPUT"
+          {
+            echo 'images<<IMAGES_EOF'
+            echo "$images"
+            echo 'IMAGES_EOF'
+          } >> "$GITHUB_OUTPUT"
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v3
@@ -46,19 +100,29 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Log in to Docker Hub
+        if: steps.registries.outputs.dockerhub == 'true'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
       - name: Extract image metadata
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: |
-            docker.io/${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}
-            ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}
+          images: ${{ steps.registries.outputs.images }}
           tags: |
-            type=raw,value=${{ steps.version.outputs.value }}
-            type=raw,value=v${{ steps.version.outputs.value }}
+            type=sha,format=short
+            type=raw,value=${{ steps.version.outputs.value }},enable=${{ steps.version.outputs.release }}
+            type=raw,value=v${{ steps.version.outputs.value }},enable=${{ steps.version.outputs.release }}
             type=raw,value=latest
           labels: |
-            org.opencontainers.image.version=${{ steps.version.outputs.value }}
+            org.opencontainers.image.version=${{ steps.version.outputs.build }}
+            org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
 
       - name: Build and push images
@@ -69,4 +133,21 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
-            VERSION=${{ steps.version.outputs.value }}
+            VERSION=${{ steps.version.outputs.build }}
+          # The Go build is CGO/static and takes ~35s natively; under QEMU it costs
+          # far more, so the layer cache is what keeps a per-push build practical.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Summarise published tags
+        shell: bash
+        run: |
+          {
+            echo "### Published"
+            echo
+            echo "Version \`${{ steps.version.outputs.build }}\` (release: ${{ steps.version.outputs.release }})"
+            echo
+            echo '```'
+            echo "${{ steps.meta.outputs.tags }}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
