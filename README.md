@@ -45,6 +45,8 @@ docker compose up --build
 
 非发布构建注入的版本号带 `-<短 SHA>` 后缀（如 `0.2.0-c1dca66`），启动日志可直接定位来源提交。
 
+镜像为 `linux/amd64` + `linux/arm64` 双架构 manifest list。两个架构各在原生 runner 上构建（arm64 用 `ubuntu-24.04-arm`，公开仓库免费），按 digest 推送后再合并成 manifest list —— 避免 QEMU 模拟这个 CGO 静态构建。合并前不会有任何标签指向单架构镜像，合并后会回读 manifest 断言两个架构都在，缺一即失败。
+
 Docker Hub 需要的两个 Actions secret：
 
 ```bash
