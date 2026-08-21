@@ -278,7 +278,7 @@ function MessageDetail({ selected, details, autoLoadRemoteImages, onBack, onStar
     <header className="flex items-center justify-between border-b border-black/5 px-5 py-4"><button onClick={onBack} className="md:hidden icon-button"><ChevronDown className="rotate-90" size={19} /></button><div className="flex gap-1"><button onClick={onArchive} className="icon-button" title="归档 (e)"><Archive size={18} /></button><button onClick={onStar} className="icon-button" title="星标"><Star size={18} className={message.is_starred ? 'fill-amber-400 text-amber-400' : ''} /></button></div><button onClick={onReply} className="button-secondary"><SquarePen size={16} />回复</button></header>
     <article className="flex-1 overflow-y-auto px-6 py-8 lg:px-12 xl:px-16">
       <div className="mx-auto max-w-3xl"><p className="text-[10px] font-bold uppercase tracking-[.2em] text-pine/40">{formatFullDate(message.received_at)}</p><h1 className="mt-3 font-serif text-3xl leading-tight lg:text-4xl">{message.subject || '（无主题）'}</h1>
-        <div className="mt-7 flex items-center gap-3 border-b border-black/5 pb-6"><Avatar label={displaySender(message.sender)} /><div className="min-w-0"><div className="truncate text-sm font-bold">{displaySender(message.sender)}</div><div className="truncate text-xs text-black/40">发给 {decodeEncodedWords(message.recipients) || '我'}</div></div></div>
+        <div className="mt-7 flex items-center gap-3 border-b border-black/5 pb-6"><Avatar label={displaySender(message.sender)} /><div className="min-w-0"><div className="truncate font-serif text-lg">{displaySender(message.sender)}</div><div className="truncate text-xs text-black/40">发给 {decodeEncodedWords(message.recipients) || '我'}</div></div></div>
         {otpCode && <button onClick={copyCode} className="mt-6 flex items-center gap-3 rounded-2xl bg-sage/60 px-4 py-3 text-left transition hover:bg-sage" aria-label={`复制验证码 ${otpCode}`}><span className="grid h-9 w-9 place-items-center rounded-xl bg-white/70 text-pine"><Copy size={16} /></span><span><span className="block font-mono text-lg font-bold tracking-[.18em] text-pine">{otpCode}</span><span className="text-[11px] text-pine/55">检测到验证码，点击复制</span></span></button>}
         {!details && <div className="grid h-52 place-items-center"><LoaderCircle className="animate-spin text-pine/40" /></div>}
         {details && message.body_state === 'error' && <div className="my-10 rounded-2xl bg-amber-50 p-5 text-sm text-amber-800">正文获取失败，下次账号同步时会自动重试。</div>}
@@ -470,10 +470,18 @@ const bodyStyles = `
   .nexusmail-scroll{max-width:100%;overflow-x:auto}
   /* Only tables that carry a header row or an explicit border are data tables;
      giving layout tables the same rules would draw grid lines through a design
-     that never asked for them. */
+     that never asked for them. The cell rules key off a class placed on the
+     table's own cells rather than a descendant selector, because mail nests
+     tables freely and "table.nexusmail-data td" would rule every cell below it. */
   table.nexusmail-data{border-collapse:collapse}
-  table.nexusmail-data td,table.nexusmail-data th{border:1px solid #e3e6e1;padding:8px 10px;vertical-align:top}
-  table.nexusmail-data th{background:#f4f6f3;text-align:left;font-weight:600}
+  .nexusmail-cell{border:1px solid #e3e6e1;padding:8px 10px;vertical-align:top}
+  th.nexusmail-cell{background:#f4f6f3;text-align:left;font-weight:600}
+  /* A blocked image is a placeholder, not content: without a src the browser
+     paints its alt text into the flow, and inside the 16-24px boxes mail uses for
+     icons that text wraps one glyph per line. Hiding it costs nothing, since the
+     alt stays in the DOM for assistive tech and the opt-in button restores the
+     real image. */
+  img[data-nexusmail-blocked]{visibility:hidden}
 `
 
 // The base target sends every link to a new tab. Without it a click navigates the
@@ -495,9 +503,12 @@ function prepareMessageHTML(input: string, attachments: Attachment[], messageID:
     const attachmentID = contentID ? contentIDs.get(contentID) : undefined
     if (attachmentID) element.src = `/api/v1/messages/${messageID}/attachments/${attachmentID}`
   })
-  if (loadRemote) document.querySelectorAll<HTMLElement>('[data-nexusmail-remote-src]').forEach(element => {
+  document.querySelectorAll<HTMLElement>('[data-nexusmail-remote-src]').forEach(element => {
     const source = element.dataset.nexusmailRemoteSrc
-    if (source) element.setAttribute('src', source)
+    if (loadRemote && source) { element.setAttribute('src', source); return }
+    // Marking the element lets the stylesheet suppress the alt text a src-less
+    // image would otherwise paint into the message body.
+    if (!element.hasAttribute('src')) element.setAttribute('data-nexusmail-blocked', '')
   })
   annotateTables(document)
   return document.body.innerHTML
@@ -509,8 +520,17 @@ function prepareMessageHTML(input: string, attachments: Attachment[], messageID:
 // wrapper, since a fixed pixel width wider than the pane is the norm in newsletters.
 function annotateTables(document: Document) {
   document.querySelectorAll('table').forEach(table => {
+    // Both tests must look at the table's own cells only. querySelector('th')
+    // searches descendants, so a wrapper holding one data table deep inside was
+    // ruled too — in a GitHub notification that marked 7 of 24 tables and drew a
+    // border around every layout spacer, which is the grid of empty boxes that
+    // made the message look broken.
+    const cells = ownCells(table)
     const border = Number(table.getAttribute('border') ?? '0')
-    if (table.querySelector('th') || border > 0) table.classList.add('nexusmail-data')
+    if (cells.some(cell => cell.tagName === 'TH') || border > 0) {
+      table.classList.add('nexusmail-data')
+      cells.forEach(cell => cell.classList.add('nexusmail-cell'))
+    }
     // closest() starts at the element itself, so the ancestor test has to begin
     // one level up; a nested table must not get its own scroll box.
     if (table.parentElement?.closest('table')) return
@@ -519,6 +539,13 @@ function annotateTables(document: Document) {
     table.replaceWith(wrapper)
     wrapper.append(table)
   })
+}
+
+// ownCells returns the cells this table owns, excluding those belonging to a
+// nested table.
+function ownCells(table: HTMLTableElement) {
+  return Array.from(table.querySelectorAll<HTMLTableCellElement>('th,td'))
+    .filter(cell => cell.closest('table') === table)
 }
 
 const realtimeEvents = ['NEW_EMAIL', 'MESSAGE_UPDATED', 'ACCOUNT_STATUS', 'OUTBOX_UPDATED']

@@ -127,4 +127,79 @@ describe('message body rendering', () => {
     expect(table?.classList.contains('nexusmail-data')).toBe(false)
     expect(table?.parentElement?.className).toBe('nexusmail-scroll')
   })
+
+  // The ruling test used querySelector('th'), which searches descendants: a wrapper
+  // holding one data table several levels down was ruled as well. In a GitHub
+  // notification that marked 7 of 24 tables, and because the cell rule was a
+  // descendant selector every layout spacer got a border — a grid of empty boxes.
+  it('does not rule a layout table that merely contains a data table', async () => {
+    detail = message({
+      body_html: '<table><tr><td>'
+        + '<table><tr><td><table border="1"><tr><th>状态</th></tr><tr><td>成功</td></tr></table></td></tr></table>'
+        + '</td></tr><tr><td></td></tr></table>',
+    })
+    const frame = await openMessage()
+    const rendered = new DOMParser().parseFromString(frame.getAttribute('srcdoc') ?? '', 'text/html')
+    const tables = Array.from(rendered.querySelectorAll('table'))
+
+    expect(tables).toHaveLength(3)
+    expect(tables[0].classList.contains('nexusmail-data')).toBe(false)
+    expect(tables[1].classList.contains('nexusmail-data')).toBe(false)
+    expect(tables[2].classList.contains('nexusmail-data')).toBe(true)
+    // Only the innermost table's own cells carry the border class, so the two
+    // spacer cells of the outer table stay unruled.
+    const ruled = Array.from(rendered.querySelectorAll('.nexusmail-cell'))
+    expect(ruled).toHaveLength(2)
+    expect(ruled.map(cell => cell.textContent)).toEqual(['状态', '成功'])
+    expect(ruled.every(cell => cell.closest('table') === tables[2])).toBe(true)
+  })
+
+  it('rules only the data table own cells when a table is nested inside it', async () => {
+    const frame = await openMessage()
+    const rendered = new DOMParser().parseFromString(frame.getAttribute('srcdoc') ?? '', 'text/html')
+
+    // The nested table's single cell belongs to the nested table, not the ruled one.
+    const nestedCell = rendered.querySelectorAll('table')[1].querySelector('td')
+    expect(nestedCell?.textContent).toBe('嵌套')
+    expect(nestedCell?.classList.contains('nexusmail-cell')).toBe(false)
+  })
+
+  // A src-less image paints its alt text into the flow. Inside the 16-24px boxes mail
+  // uses for status icons that text wraps one glyph per line, which is what turned a
+  // notification into a column of stray words.
+  it('suppresses the alt text of a blocked remote image until it is loaded', async () => {
+    const body = '<img data-nexusmail-remote-src="https://cdn.example.com/icon.png" alt="prepare" width="16" height="16" />'
+    detail = message({ body_html: body })
+    const frame = await openMessage()
+    const srcDoc = frame.getAttribute('srcdoc') ?? ''
+    const rendered = new DOMParser().parseFromString(srcDoc, 'text/html')
+    const image = rendered.querySelector('img')
+
+    expect(image?.hasAttribute('data-nexusmail-blocked')).toBe(true)
+    expect(image?.hasAttribute('src')).toBe(false)
+    // The alt survives for assistive tech; only the painted text is hidden.
+    expect(image?.getAttribute('alt')).toBe('prepare')
+    expect(srcDoc).toContain('img[data-nexusmail-blocked]{visibility:hidden}')
+
+    fireEvent.click(screen.getByText(/点击临时加载/))
+    const loaded = await waitFor(() => {
+      const next = new DOMParser()
+        .parseFromString((screen.getByTitle('邮件正文') as HTMLIFrameElement).getAttribute('srcdoc') ?? '', 'text/html')
+        .querySelector('img')
+      expect(next?.getAttribute('src')).toBe('https://cdn.example.com/icon.png')
+      return next
+    })
+    expect(loaded?.hasAttribute('data-nexusmail-blocked')).toBe(false)
+  })
+
+  it('renders the sender name in the same face as the subject', async () => {
+    await openMessage()
+
+    const subject = screen.getByRole('heading', { level: 1, name: '账单' })
+    // Both sit in the reading pane header; the sender used the sans-serif body face
+    // while the subject used the serif display face.
+    const sender = screen.getAllByText('阿里云').find(node => node.className.includes('font-serif'))
+    expect(subject.className).toContain('font-serif')
+    expect(sender).toBeDefined()
+  })
 })
