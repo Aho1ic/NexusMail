@@ -18,11 +18,12 @@ jobs:
 
     steps:
       - name: Check out repository
-        # Two commits deep so the VERSION file can be compared against its
-        # previous state; a shallow single-commit checkout has nothing to diff.
+        # Full history: the VERSION diff is taken against the pushed-from commit,
+        # which can be arbitrarily far back when a push carries several commits.
+        # A shallow clone simply would not contain it, and the diff would fail.
         uses: actions/checkout@v4
         with:
-          fetch-depth: 2
+          fetch-depth: 0
 
       - name: Resolve version and release status
         id: version
@@ -46,9 +47,20 @@ jobs:
             if [[ -z "$before" || "$before" == "0000000000000000000000000000000000000000" ]]; then
               before="HEAD^"
             fi
-            if ! git diff --quiet "$before" HEAD -- VERSION 2>/dev/null; then
-              release=true
-            fi
+            # git diff exits 0 for "same", 1 for "differs" and 128 when the ref is
+            # unusable — after a force-push, say. Those are separated deliberately:
+            # treating an unusable ref as a change would republish a semantic tag
+            # over an existing one, whereas skipping it only omits a tag that a
+            # manual run can still add.
+            set +e
+            git diff --quiet "$before" HEAD -- VERSION
+            diff_status=$?
+            set -e
+            case "$diff_status" in
+              0) ;;
+              1) release=true ;;
+              *) echo "::warning::Could not diff VERSION against ${before}; publishing without a semantic tag." ;;
+            esac
           fi
 
           # The build that goes into a non-release image is labelled with the commit
