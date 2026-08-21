@@ -88,13 +88,17 @@ jobs:
         id: registries
         shell: bash
         env:
-          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          # The username is a repository variable, not a secret. As a secret it
+          # would be masked, and Actions refuses to pass a job output that contains
+          # a secret value across jobs — the image list arrived empty in the build
+          # job, which failed with "tag is needed when pushing to registry".
+          DOCKERHUB_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
           DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
         run: |
           set -euo pipefail
           # GHCR needs no configuration beyond the built-in token. Docker Hub is
-          # opt-in: without both secrets its steps are skipped rather than failing
-          # the run, so a missing secret cannot cost the GHCR image as well.
+          # opt-in: without the variable and the secret its steps are skipped rather
+          # than failing the run, so a missing credential cannot cost the GHCR image.
           images="ghcr.io/${{ steps.version.outputs.owner }}/${IMAGE_NAME}"
           dockerhub=false
           if [[ -n "$DOCKERHUB_USERNAME" && -n "$DOCKERHUB_TOKEN" ]]; then
@@ -141,7 +145,7 @@ jobs:
         if: needs.prepare.outputs.dockerhub == 'true'
         uses: docker/login-action@v3
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          username: ${{ vars.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Set up Buildx
@@ -210,7 +214,7 @@ jobs:
         if: needs.prepare.outputs.dockerhub == 'true'
         uses: docker/login-action@v3
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          username: ${{ vars.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Set up Buildx
