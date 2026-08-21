@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"net/mail"
 	"strings"
 	"testing"
 	"time"
@@ -329,4 +330,66 @@ func inboxMailboxID(t *testing.T, h *harness) int64 {
 		t.Fatal(err)
 	}
 	return mailbox.ID
+}
+
+// TestFormatAddressKeepsDecodedNames covers the display and index form of an address.
+// net/mail's Address.String() re-encodes any non-ASCII display name into an RFC 2047
+// encoded-word, so a name go-imap had already decoded was stored — and shown — as a
+// literal "=?utf-8?q?...?=", which also left the readable name unsearchable in FTS5.
+func TestFormatAddressKeepsDecodedNames(t *testing.T) {
+	for _, testCase := range []struct {
+		name    string
+		display string
+		address string
+		want    string
+	}{
+		{name: "cjk name stays readable", display: "阿里云", address: "noreply@aliyun.com", want: "阿里云 <noreply@aliyun.com>"},
+		{name: "ascii name needs no quotes", display: "Ali Cloud", address: "noreply@aliyun.com", want: "Ali Cloud <noreply@aliyun.com>"},
+		{name: "empty name yields the bare address", display: "", address: "noreply@aliyun.com", want: "noreply@aliyun.com"},
+		{name: "whitespace-only name yields the bare address", display: "  ", address: "a@b.com", want: "a@b.com"},
+		{name: "specials force quoting", display: "Foo, Bar", address: "a@b.com", want: `"Foo, Bar" <a@b.com>`},
+		{name: "embedded quote is escaped", display: `He said "hi"`, address: "a@b.com", want: `"He said \"hi\"" <a@b.com>`},
+		{name: "angle brackets are quoted", display: "Foo <spoof@evil.com>", address: "a@b.com", want: `"Foo <spoof@evil.com>" <a@b.com>`},
+		// A header injection attempt must not survive into a stored address, because
+		// this value is later parsed back and written into an outgoing draft.
+		{name: "newlines are dropped", display: "Foo\r\nBcc: victim@example.com", address: "a@b.com", want: `"Foo Bcc: victim@example.com" <a@b.com>`},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			got := formatAddress(testCase.display, testCase.address)
+			if got != testCase.want {
+				t.Fatalf("formatAddress(%q, %q) = %q, want %q", testCase.display, testCase.address, got, testCase.want)
+			}
+			if strings.Contains(got, "=?") {
+				t.Fatalf("formatAddress(%q, %q) produced an encoded-word: %q", testCase.display, testCase.address, got)
+			}
+			// The stored form is parsed back when a draft built from it is sent, so a
+			// value that cannot round-trip would fail the send instead of the display.
+			parsed, err := mail.ParseAddress(got)
+			if err != nil {
+				t.Fatalf("mail.ParseAddress(%q) failed: %v", got, err)
+			}
+			if parsed.Address != testCase.address {
+				t.Fatalf("round-trip address = %q, want %q", parsed.Address, testCase.address)
+			}
+		})
+	}
+}
+
+// TestAddressesFromEnvelopeAreReadable pins the same behaviour at the call site that
+// produces the sender and recipients columns.
+func TestAddressesFromEnvelopeAreReadable(t *testing.T) {
+	got := addresses([]goimap.Address{
+		{Name: "阿里云", Mailbox: "noreply", Host: "aliyun.com"},
+		{Name: "", Mailbox: "plain", Host: "example.com"},
+		{Name: "skipped", Mailbox: "", Host: ""},
+	})
+	want := []string{"阿里云 <noreply@aliyun.com>", "plain@example.com"}
+	if len(got) != len(want) {
+		t.Fatalf("addresses() = %#v, want %#v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("addresses()[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
 }

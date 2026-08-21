@@ -1027,10 +1027,47 @@ func imapAddresses(input []goimap.Address) []*mail.Address {
 func encodeMailAddresses(input []*mail.Address) string {
 	values := make([]string, 0, len(input))
 	for _, value := range input {
-		values = append(values, value.String())
+		values = append(values, formatAddress(value.Name, value.Address))
 	}
 	encoded, _ := json.Marshal(values)
 	return string(encoded)
+}
+
+// specialsInDisplayName are the RFC 5322 "specials" that force a display name to
+// be quoted. A bare UTF-8 name needs no quoting, which is what keeps the stored
+// form readable.
+const specialsInDisplayName = `()<>[]:;@\,."`
+
+// formatAddress renders "Name <addr>" without RFC 2047 encoding. net/mail's
+// Address.String() cannot be used here: it re-encodes every non-ASCII display
+// name into an encoded-word, so a name go-imap had already decoded came back out
+// as a literal "=?utf-8?q?...?=" — visible in the UI and indexed that way by
+// FTS5, which also made the readable name unsearchable. Quoting still follows
+// RFC 5322 so the result round-trips through mail.ParseAddress when a draft
+// built from these values is sent.
+func formatAddress(name, address string) string {
+	// Whitespace is collapsed to single spaces. A CR or LF here is either a folded
+	// header the decoder left behind or an injection attempt; it has to go, but as a
+	// space rather than by deletion, so the two sides of the break do not fuse into
+	// one word. This value is parsed back and written into an outgoing draft.
+	name = strings.Join(strings.Fields(name), " ")
+	if name == "" {
+		return address
+	}
+	if strings.ContainsAny(name, specialsInDisplayName) {
+		var quoted strings.Builder
+		quoted.Grow(len(name) + 2)
+		quoted.WriteByte('"')
+		for _, r := range name {
+			if r == '"' || r == '\\' {
+				quoted.WriteByte('\\')
+			}
+			quoted.WriteRune(r)
+		}
+		quoted.WriteByte('"')
+		name = quoted.String()
+	}
+	return name + " <" + address + ">"
 }
 
 func (s *Supervisor) storeFetched(ctx context.Context, mailbox domain.Mailbox, fetched *imapclient.FetchMessageBuffer) (bool, int64, error) {
@@ -1111,7 +1148,7 @@ func addresses(input []goimap.Address) []string {
 	result := make([]string, 0, len(input))
 	for _, value := range input {
 		if value.Addr() != "" {
-			result = append(result, (&mail.Address{Name: value.Name, Address: value.Addr()}).String())
+			result = append(result, formatAddress(value.Name, value.Addr()))
 		}
 	}
 	return result

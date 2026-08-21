@@ -278,13 +278,13 @@ function MessageDetail({ selected, details, autoLoadRemoteImages, onBack, onStar
     <header className="flex items-center justify-between border-b border-black/5 px-5 py-4"><button onClick={onBack} className="md:hidden icon-button"><ChevronDown className="rotate-90" size={19} /></button><div className="flex gap-1"><button onClick={onArchive} className="icon-button" title="归档 (e)"><Archive size={18} /></button><button onClick={onStar} className="icon-button" title="星标"><Star size={18} className={message.is_starred ? 'fill-amber-400 text-amber-400' : ''} /></button></div><button onClick={onReply} className="button-secondary"><SquarePen size={16} />回复</button></header>
     <article className="flex-1 overflow-y-auto px-6 py-8 lg:px-12 xl:px-16">
       <div className="mx-auto max-w-3xl"><p className="text-[10px] font-bold uppercase tracking-[.2em] text-pine/40">{formatFullDate(message.received_at)}</p><h1 className="mt-3 font-serif text-3xl leading-tight lg:text-4xl">{message.subject || '（无主题）'}</h1>
-        <div className="mt-7 flex items-center gap-3 border-b border-black/5 pb-6"><Avatar label={displaySender(message.sender)} /><div className="min-w-0"><div className="truncate text-sm font-bold">{displaySender(message.sender)}</div><div className="truncate text-xs text-black/40">发给 {message.recipients || '我'}</div></div></div>
+        <div className="mt-7 flex items-center gap-3 border-b border-black/5 pb-6"><Avatar label={displaySender(message.sender)} /><div className="min-w-0"><div className="truncate text-sm font-bold">{displaySender(message.sender)}</div><div className="truncate text-xs text-black/40">发给 {decodeEncodedWords(message.recipients) || '我'}</div></div></div>
         {otpCode && <button onClick={copyCode} className="mt-6 flex items-center gap-3 rounded-2xl bg-sage/60 px-4 py-3 text-left transition hover:bg-sage" aria-label={`复制验证码 ${otpCode}`}><span className="grid h-9 w-9 place-items-center rounded-xl bg-white/70 text-pine"><Copy size={16} /></span><span><span className="block font-mono text-lg font-bold tracking-[.18em] text-pine">{otpCode}</span><span className="text-[11px] text-pine/55">检测到验证码，点击复制</span></span></button>}
         {!details && <div className="grid h-52 place-items-center"><LoaderCircle className="animate-spin text-pine/40" /></div>}
         {details && message.body_state === 'error' && <div className="my-10 rounded-2xl bg-amber-50 p-5 text-sm text-amber-800">正文获取失败，下次账号同步时会自动重试。</div>}
         {details && message.body_state !== 'ready' && message.body_state !== 'error' && <div className="my-10 rounded-2xl bg-sage/50 p-5 text-sm text-pine">正文正在从邮件服务商异步获取，稍后会自动刷新。</div>}
         {details && hasRemoteImages && !loadRemoteImages && <button onClick={() => setLoadRemoteImages(true)} className="mt-6 rounded-xl bg-amber-50 px-4 py-2 text-xs font-semibold text-amber-800">本邮件包含已阻止的远程图片，点击临时加载</button>}
-        {details && message.body_html ? <iframe title="邮件正文" sandbox="" referrerPolicy="no-referrer" srcDoc={`<!doctype html><meta charset="utf-8"><meta name="referrer" content="no-referrer"><style>body{font:15px/1.75 system-ui;color:#24332d;overflow-wrap:anywhere}img{max-width:100%;height:auto}a{color:#256b50}pre{white-space:pre-wrap}</style>${renderedHTML}`} className="mt-8 min-h-[520px] w-full border-0" /> : details && <pre className="mt-8 whitespace-pre-wrap font-sans text-[15px] leading-7 text-black/75">{message.body_text || message.snippet}</pre>}
+        {details && message.body_html ? <iframe title="邮件正文" sandbox="allow-popups allow-popups-to-escape-sandbox" referrerPolicy="no-referrer" srcDoc={messageDocument(renderedHTML)} className="mt-8 min-h-[520px] w-full border-0" /> : details && <pre className="mt-8 whitespace-pre-wrap font-sans text-[15px] leading-7 text-black/75">{message.body_text || message.snippet}</pre>}
         {!!details?.attachments?.length && <div className="mt-10 border-t border-black/5 pt-5"><h2 className="text-xs font-bold uppercase tracking-wider text-black/40">附件</h2><div className="mt-3 grid gap-2 sm:grid-cols-2">{details.attachments.map(att => <a key={att.id} href={`/api/v1/messages/${message.id}/attachments/${att.id}`} className="flex items-center gap-3 rounded-xl border border-black/5 p-3 hover:bg-paper"><span className="grid h-9 w-9 place-items-center rounded-lg bg-sage"><File size={17} /></span><span className="min-w-0"><span className="block truncate text-xs font-semibold">{att.filename}</span><span className="text-[10px] text-black/35">{formatBytes(att.size_bytes)}</span></span></a>)}</div></div>}
       </div>
     </article>
@@ -452,6 +452,41 @@ function EmptyState() { return <div className="grid h-72 place-items-center text
 function Avatar({ label }: { label: string }) { return <span className="grid h-11 w-11 shrink-0 place-items-center rounded-2xl bg-pine font-serif text-lg text-white">{label.trim().charAt(0).toUpperCase() || '?'}</span> }
 function ComposerField({ label, value, onChange, placeholder = '' }: { label: string; value: string; onChange: (value: string) => void; placeholder?: string }) { return <label className="mt-2 flex items-center border-b border-black/5 py-2"><span className="w-16 text-xs font-semibold text-black/40">{label}</span><input value={value} onChange={event => onChange(event.target.value)} placeholder={placeholder} className="min-w-0 flex-1 bg-transparent py-1 text-sm outline-none" /></label> }
 
+// bodyStyles keeps mail readable without overriding the sender's own layout.
+// overflow-wrap is break-word rather than anywhere on purpose: anywhere also
+// shrinks a cell's min-content width to a single character, which collapsed every
+// table-laid-out message into one-glyph-per-line columns that read as mojibake.
+// The remaining rules only bound what would otherwise overflow the reading pane.
+const bodyStyles = `
+  html{-webkit-text-size-adjust:100%}
+  body{margin:0;font:15px/1.75 system-ui,-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;color:#24332d;overflow-wrap:break-word}
+  img{max-width:100%;height:auto}
+  a{color:#256b50}
+  pre{white-space:pre-wrap}
+  table{max-width:100%}
+  td,th{overflow-wrap:break-word}
+  /* Wide fixed-width mail (the 600px newsletter) scrolls in place instead of
+     forcing the whole pane sideways or being squeezed out of proportion. */
+  .nexusmail-scroll{max-width:100%;overflow-x:auto}
+  /* Only tables that carry a header row or an explicit border are data tables;
+     giving layout tables the same rules would draw grid lines through a design
+     that never asked for them. */
+  table.nexusmail-data{border-collapse:collapse}
+  table.nexusmail-data td,table.nexusmail-data th{border:1px solid #e3e6e1;padding:8px 10px;vertical-align:top}
+  table.nexusmail-data th{background:#f4f6f3;text-align:left;font-weight:600}
+`
+
+// The base target sends every link to a new tab. Without it a click navigates the
+// frame itself, and because the frame is a sandboxed opaque origin nearly every
+// destination refuses to load there — the error the user sees instead of the page.
+// allow-popups permits the new tab, allow-popups-to-escape-sandbox keeps that tab
+// out of the sandbox so the destination behaves normally. Neither grants the frame
+// scripting, same-origin access or top-level navigation.
+function messageDocument(body: string) {
+  return `<!doctype html><html><head><meta charset="utf-8"><meta name="referrer" content="no-referrer">`
+    + `<base target="_blank"><style>${bodyStyles}</style></head><body>${body}</body></html>`
+}
+
 function prepareMessageHTML(input: string, attachments: Attachment[], messageID: number, loadRemote: boolean) {
   const document = new DOMParser().parseFromString(input, 'text/html')
   const contentIDs = new Map(attachments.filter(item => item.content_id).map(item => [item.content_id!.replace(/[<>]/g, ''), item.id]))
@@ -464,7 +499,26 @@ function prepareMessageHTML(input: string, attachments: Attachment[], messageID:
     const source = element.dataset.nexusmailRemoteSrc
     if (source) element.setAttribute('src', source)
   })
+  annotateTables(document)
   return document.body.innerHTML
+}
+
+// annotateTables separates the two jobs mail gives a table. A header row or an
+// explicit border means the table holds data and should be ruled; anything else is
+// scaffolding for a layout and is left alone. Outermost tables also get a scroll
+// wrapper, since a fixed pixel width wider than the pane is the norm in newsletters.
+function annotateTables(document: Document) {
+  document.querySelectorAll('table').forEach(table => {
+    const border = Number(table.getAttribute('border') ?? '0')
+    if (table.querySelector('th') || border > 0) table.classList.add('nexusmail-data')
+    // closest() starts at the element itself, so the ancestor test has to begin
+    // one level up; a nested table must not get its own scroll box.
+    if (table.parentElement?.closest('table')) return
+    const wrapper = document.createElement('div')
+    wrapper.className = 'nexusmail-scroll'
+    table.replaceWith(wrapper)
+    wrapper.append(table)
+  })
 }
 
 const realtimeEvents = ['NEW_EMAIL', 'MESSAGE_UPDATED', 'ACCOUNT_STATUS', 'OUTBOX_UPDATED']
@@ -513,7 +567,26 @@ function useKeyboard(enabled: boolean, messages: Message[], selected: Message | 
 
 function splitEmails(value: string) { return value.split(/[,;\n]/).map(item => item.trim()).filter(Boolean) }
 function decodeAddressList(value: string) { try { const parsed = JSON.parse(value); return Array.isArray(parsed) ? parsed.map(String) : [] } catch { return [] } }
-function displaySender(value: string) { return value.replace(/<.*?>/g, '').replace(/["']/g, '').trim() || value }
+function displaySender(value: string) { const decoded = decodeEncodedWords(value); return decoded.replace(/<.*?>/g, '').replace(/["']/g, '').trim() || decoded }
+
+const encodedWord = /=\?([^?]+)\?([bqBQ])\?([^?]*)\?=/g
+
+// decodeEncodedWords renders RFC 2047 encoded-words as text. The server stores the
+// decoded form now, but rows synced before that still hold "=?utf-8?q?...?=", and a
+// provider can also hand back a header the Go decoder could not parse. Decoding at
+// display time covers both without a migration.
+function decodeEncodedWords(value: string) {
+  if (!value.includes('=?')) return value
+  return value.replace(encodedWord, (whole, charset: string, encoding: string, payload: string) => {
+    try {
+      // Q encoding writes a space as "_" and everything else as =XX octets.
+      const bytes = encoding.toLowerCase() === 'b'
+        ? Uint8Array.from(atob(payload.replace(/\s/g, '')), character => character.charCodeAt(0))
+        : Uint8Array.from(payload.replace(/_/g, ' ').replace(/=([0-9a-fA-F]{2})/g, (_, hex: string) => String.fromCharCode(parseInt(hex, 16))), character => character.charCodeAt(0))
+      return new TextDecoder(charset.split('*')[0]).decode(bytes)
+    } catch { return whole }
+  })
+}
 function formatDate(value: number) { const date = new Date(value); const today = new Date(); return date.toDateString() === today.toDateString() ? date.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }) : date.toLocaleDateString('zh-CN', { month: 'numeric', day: 'numeric' }) }
 function formatFullDate(value: number) { return new Date(value).toLocaleString('zh-CN', { dateStyle: 'long', timeStyle: 'short' }) }
 function formatBytes(value: number) { if (value < 1024) return `${value} B`; if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`; return `${(value / 1024 / 1024).toFixed(1)} MB` }

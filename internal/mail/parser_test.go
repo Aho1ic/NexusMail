@@ -113,3 +113,50 @@ func TestSanitizeHTMLDefersRemoteImages(t *testing.T) {
 		t.Fatalf("remote URL was discarded instead of deferred: %s", got)
 	}
 }
+
+// TestSanitizeHTMLKeepsTableLayout covers the presentation half of the policy. Mail
+// is laid out with nested tables plus inline style, and stripping both left every
+// such message as unstyled rows with no padding, spacing or colour — which read on
+// screen as a garbled table rather than as a plain one.
+func TestSanitizeHTMLKeepsTableLayout(t *testing.T) {
+	got := sanitizeHTML(`<table width="600" border="1" cellpadding="8" cellspacing="0" bgcolor="#f5f5f5" style="border-collapse:collapse;width:600px">` +
+		`<tr><th style="padding:8px;text-align:left;background-color:#eee">项目</th></tr>` +
+		`<tr><td align="center" bgcolor="#ffffff" style="padding:20px;font-size:14px;color:#333">阿里云服务器续费</td></tr></table>`)
+	for _, want := range []string{
+		`width="600"`, `border="1"`, `cellpadding="8"`, `cellspacing="0"`, `bgcolor="#f5f5f5"`,
+		"border-collapse: collapse", "width: 600px", "padding: 8px", "text-align: left",
+		"background-color: #eee", `align="center"`, `bgcolor="#ffffff"`, "font-size: 14px", "color: #333",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("table layout lost %q: %s", want, got)
+		}
+	}
+}
+
+// TestSanitizeHTMLStyleCannotLeakOrEscape is the other side of allowing style. The
+// attribute must not become a second route to a remote fetch — that would defeat
+// blockRemoteImages — nor a way for a message to leave its own flow.
+func TestSanitizeHTMLStyleCannotLeakOrEscape(t *testing.T) {
+	for _, payload := range []string{
+		`<div style="background-image:url(https://tracker.example/x.gif)">a</div>`,
+		`<div style="background:#fff url(https://tracker.example/x.gif) no-repeat">a</div>`,
+		// bluemonday expands CSS unicode escapes before the handler runs, so the
+		// escaped spelling of url( has to be rejected by the same check.
+		`<div style="background:url\28 https://tracker.example/x.gif\29">a</div>`,
+		`<div style="list-style-image:url(https://tracker.example/x.gif)">a</div>`,
+		`<div style="border-image-source:url(https://tracker.example/x.gif)">a</div>`,
+		`<div style="behavior:url(#default#time2)">a</div>`,
+		`<div style="position:fixed;top:0;left:0;z-index:99999">overlay</div>`,
+		`<div style="transform:scale(40)">huge</div>`,
+		`<div style="width:expression(alert(1))">a</div>`,
+		`<td bgcolor="javascript:alert(1)">a</td>`,
+		`<td bgcolor="url(https://tracker.example/x.gif)">a</td>`,
+	} {
+		got := sanitizeHTML(payload)
+		for _, forbidden := range []string{"url(", "tracker.example", "position", "z-index", "transform", "expression", "javascript:", "behavior"} {
+			if strings.Contains(got, forbidden) {
+				t.Errorf("sanitizeHTML(%q) kept %q: %s", payload, forbidden, got)
+			}
+		}
+	}
+}

@@ -16,6 +16,7 @@ import (
 	messagecharset "github.com/emersion/go-message/charset"
 	message "github.com/emersion/go-message/mail"
 	"github.com/microcosm-cc/bluemonday"
+	"github.com/microcosm-cc/bluemonday/css"
 	"golang.org/x/net/html"
 )
 
@@ -117,6 +118,7 @@ func sanitizeHTML(input string) string {
 	policy := bluemonday.UGCPolicy()
 	policy.AllowAttrs("class").OnElements("pre", "code")
 	policy.AllowURLSchemes("cid")
+	allowPresentationalLayout(policy)
 	// Inline attachments arrive as data URIs, so the scheme cannot simply be dropped,
 	// but allowing it outright also allows data:text/html on a link — script execution
 	// the rest of the policy does not cover. bluemonday's own AllowDataURIImages is
@@ -127,6 +129,60 @@ func sanitizeHTML(input string) string {
 	policy.RequireNoReferrerOnLinks(true)
 	return blockRemoteImages(policy.Sanitize(input))
 }
+
+// layoutStyleProperties is the CSS allowlist for the style attribute. Mail is
+// laid out almost entirely with nested tables plus inline style, so dropping the
+// attribute outright collapsed every such message into unstyled rows with no
+// padding, spacing or colour. Only typography, colour and box metrics are listed:
+// position/z-index/transform would let a message escape its own flow, and every
+// property whose value can hold url() is excluded so a style declaration cannot
+// re-open the remote fetch blockRemoteImages exists to prevent.
+var layoutStyleProperties = []string{
+	"color", "background", "background-color", "font", "font-family", "font-size", "font-style",
+	"font-weight", "font-variant", "letter-spacing", "line-height", "text-align",
+	"text-decoration", "text-indent", "text-transform", "vertical-align",
+	"white-space", "word-break", "word-spacing", "overflow-wrap", "word-wrap",
+	"direction", "unicode-bidi",
+	"margin", "margin-top", "margin-right", "margin-bottom", "margin-left",
+	"padding", "padding-top", "padding-right", "padding-bottom", "padding-left",
+	"width", "min-width", "max-width", "height", "min-height", "max-height",
+	"border", "border-top", "border-right", "border-bottom", "border-left",
+	"border-color", "border-style", "border-width", "border-radius",
+	"border-top-color", "border-right-color", "border-bottom-color", "border-left-color",
+	"border-top-style", "border-right-style", "border-bottom-style", "border-left-style",
+	"border-top-width", "border-right-width", "border-bottom-width", "border-left-width",
+	"border-collapse", "border-spacing", "caption-side", "empty-cells", "table-layout",
+	"display", "float", "clear", "box-sizing", "opacity", "list-style-type",
+	"list-style-position", "text-overflow",
+}
+
+// presentationalTableAttrs restores the pre-CSS table attributes. Mail written for
+// broad client support carries the layout twice — once as style, once as these
+// attributes — so keeping only one half still renders wrong in the other clients'
+// dialect. Values stay bound to bluemonday's own numeric/enum matchers.
+func allowPresentationalLayout(policy *bluemonday.Policy) {
+	policy.AllowAttrs("cellpadding", "cellspacing", "border").Matching(bluemonday.Integer).OnElements("table")
+	policy.AllowAttrs("align").Matching(bluemonday.CellAlign).OnElements("table")
+	policy.AllowAttrs("bgcolor").Matching(cssColorValue).OnElements("table", "thead", "tbody", "tfoot", "tr", "td", "th")
+	policy.AllowAttrs("width", "height").Matching(bluemonday.NumberOrPercent).OnElements("img", "table", "td", "th")
+	for _, property := range layoutStyleProperties {
+		handler := css.GetDefaultHandler(property)
+		policy.AllowStyles(property).MatchingHandler(func(value string) bool {
+			// bluemonday lowercases the value and expands CSS unicode escapes before
+			// the handler runs, so a literal check catches url\28 as well as url(.
+			// The shorthand handlers for border and background accept url() by way of
+			// their image sub-handler; rejecting it here keeps the image blocker whole.
+			if strings.Contains(value, "url(") {
+				return false
+			}
+			return handler(value)
+		}).Globally()
+	}
+}
+
+// cssColorValue bounds bgcolor to a colour. bluemonday has no exported matcher for
+// it, and Paragraph — the closest one — would also admit arbitrary prose.
+var cssColorValue = regexp.MustCompile(`(?i)^(#[0-9a-f]{3,8}|[a-z]+|rgba?\([0-9%,.\s]+\)|hsla?\([0-9%,.\s]+\))$`)
 
 // inlineRasterImage matches the data URI payloads an embedded image legitimately
 // uses. Raster only and base64 only: SVG is a document format that can carry script,
