@@ -191,10 +191,13 @@ const authBackoff = 15 * time.Minute
 
 // rateLimitBackoff is the retry delay after the provider throttled the account
 // (e.g. QQ's "NO System busy!", 163's "Too many connections"). The 1s→5m
-// network-error ladder tightens the throttle instead of clearing it, so a
-// rate-limited failure waits the full periodic sync interval before trying
-// again — long enough for the provider's window to roll over.
-const rateLimitBackoff = 5 * time.Minute
+// network-error ladder tightens the throttle instead of clearing it, and on
+// per-account throttle windows 5 min is not enough for the window to roll
+// over; 15 min matches auth_error and gives the provider's window time to
+// reset. The probe path also exits the inner loop on rate-limit so a single
+// rejection is not followed by another 5-second STATUS hitting the same
+// closed window.
+const rateLimitBackoff = 15 * time.Minute
 
 // otpFreshness bounds how old a message may be for its verification code to ride
 // on a realtime event. A first sync imports 30 days of mail and the body prefetch
@@ -363,6 +366,14 @@ func (s *Supervisor) commandLoop(ctx context.Context, rt *runtime) {
 				rt.unlock()
 				if probeErr == nil {
 					s.enqueueBodyCandidates(ctx, rt.account.ID)
+				} else if isRateLimited(probeErr) {
+					// A probe that hits the throttle must not be followed by
+					// another one 5 seconds later: each STATUS in the throttle
+					// window extends the provider's lockout. Drop out of the
+					// inner loop so the connect path applies rateLimitBackoff
+					// instead of running the probe ticker through the window.
+					slog.Debug("mail inbox probe rate-limited, backing off", "account_id", rt.account.ID, "error", probeErr)
+					connected = false
 				} else {
 					// A missing or misclassified inbox must not tear down the
 					// connection; client.Closed() covers real transport loss.
