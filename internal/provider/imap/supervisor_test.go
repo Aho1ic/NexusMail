@@ -57,6 +57,43 @@ func TestIsAuthFailure(t *testing.T) {
 	}
 }
 
+// TestIsRateLimited pins the throttling classification. The 1s→5m network
+// ladder makes the throttle worse against QQ/163; without this classification
+// a single "System busy" reply would keep triggering fast reconnects that the
+// provider reads as further abuse.
+func TestIsRateLimited(t *testing.T) {
+	throttled := []error{
+		&goimap.Error{Code: goimap.ResponseCodeUnavailable, Text: "try later"},
+		errors.New("imap: NO System busy!"),
+		errors.New("imap: BYE Too many concurrent connections"),
+		errors.New("Too many simultaneous connections"),
+		errors.New("Rate limit exceeded for mailbox"),
+		errors.New("Quota exceeded"),
+		errors.New("please try again later"),
+		fmt.Errorf("sync INBOX: %w", errors.New("system busy, retry later")),
+	}
+	for _, err := range throttled {
+		if !isRateLimited(err) {
+			t.Errorf("isRateLimited(%v) = false, want true", err)
+		}
+	}
+
+	notThrottled := []error{
+		nil,
+		errors.New("dial tcp 1.2.3.4:993: i/o timeout"),
+		errors.New("connection reset by peer"),
+		errors.New("imap: SERVERBUG internal error"),
+		errors.New("EOF"),
+		&goimap.Error{Code: goimap.ResponseCodeAuthenticationFailed, Text: "no"},
+		&goimap.Error{Code: goimap.ResponseCodeInUse, Text: "mailbox busy"},
+		context.Canceled,
+	}
+	for _, err := range notThrottled {
+		if isRateLimited(err) {
+			t.Errorf("isRateLimited(%v) = true, want false", err)
+		}
+	}
+}
 // TestRecordBodyAttemptCountsOnlyRealFailures underpins the prefetch cap. The
 // candidate query cannot exclude the error state without a schema change, so a body
 // that cannot be fetched was re-queued on every 5-second probe forever, permanently

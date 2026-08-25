@@ -189,6 +189,13 @@ const maxBodyAttempts = 3
 // accounts get locked out, and no amount of retrying will fix it.
 const authBackoff = 15 * time.Minute
 
+// rateLimitBackoff is the retry delay after the provider throttled the account
+// (e.g. QQ's "NO System busy!", 163's "Too many connections"). The 1s→5m
+// network-error ladder tightens the throttle instead of clearing it, so a
+// rate-limited failure waits the full periodic sync interval before trying
+// again — long enough for the provider's window to roll over.
+const rateLimitBackoff = 5 * time.Minute
+
 // otpFreshness bounds how old a message may be for its verification code to ride
 // on a realtime event. A first sync imports 30 days of mail and the body prefetch
 // walks the whole backlog, both of which look like arrivals to the event stream;
@@ -274,10 +281,15 @@ func (s *Supervisor) commandLoop(ctx context.Context, rt *runtime) {
 		if err != nil {
 			// Credentials the server already refused will be refused again, so the
 			// account is parked in auth_error with a long delay instead of being
-			// hammered on the connection ladder.
+			// hammered on the connection ladder. A throttled connect likewise
+			// needs the full rateLimitBackoff: reconnecting every second keeps
+			// the throttle engaged.
 			status, delay := "backoff", backoff
-			if isAuthFailure(err) {
+			switch {
+			case isAuthFailure(err):
 				status, delay = "auth_error", authBackoff
+			case isRateLimited(err):
+				status, delay = "backoff", rateLimitBackoff
 			}
 			s.setError(ctx, rt.account.ID, status, err)
 			if !waitBackoff(ctx, delay) {
@@ -309,10 +321,16 @@ func (s *Supervisor) commandLoop(ctx context.Context, rt *runtime) {
 			// later IMAP command now returns ResponseCodeAuthenticationFailed.
 			// Without this re-check the error flows into the 1s-5m ladder and
 			// hammers the provider, bypassing the auth_error park that exists
-			// on the connect path.
+			// on the connect path. A "System busy" / "Too many connections"
+			// from the provider is the same shape of mistake: the 1s ladder
+			// keeps the throttle engaged, so it gets the dedicated
+			// rateLimitBackoff instead.
 			syncStatus, syncDelay := "backoff", backoff
-			if isAuthFailure(syncErr) {
+			switch {
+			case isAuthFailure(syncErr):
 				syncStatus, syncDelay = "auth_error", authBackoff
+			case isRateLimited(syncErr):
+				syncStatus, syncDelay = "backoff", rateLimitBackoff
 			}
 			// A sync that keeps failing used to reconnect with no delay at all,
 			// because the ladder was reset on connect and only the connect path
@@ -1041,6 +1059,38 @@ func isAuthFailure(err error) bool {
 		"invalid password", "login denied", "authentication failed", "auth failed",
 		"password error", "refresh oauth token",
 	} {
+		if strings.Contains(text, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+// isRateLimited reports whether the provider is throttling the account. These
+// errors are retryable but on a longer schedule than the network-error ladder:
+// a 1-second reconnect against QQ/163 just keeps the throttle engaged, so the
+// caller pairs this with rateLimitBackoff instead of the 1s→5m ladder.
+func isRateLimited(err error) bool {
+	if err == nil {
+		return false
+	}
+	var status *goimap.Error
+	if errors.As(err, &status) {
+		// ResponseCodeUnavailable is what the RFC calls "try later"; some
+		// providers also surface rate limits as a tagged BYE with this code.
+		if status.Code == goimap.ResponseCodeUnavailable {
+			return true
+		}
+	}
+	text := strings.ToLower(err.Error())
+	// QQ: "NO System busy!" (no quoted keywords), 163: "BYE Too many
+	// concurrent connections", Outlook: "Too many simultaneous connections",
+	// Gmail: "Quota exceeded".
+	markers := []string{
+		"system busy", "too many", "rate limit", "rate exceeded",
+		"quota exceeded", "try later", "try again later",
+	}
+	for _, marker := range markers {
 		if strings.Contains(text, marker) {
 			return true
 		}
