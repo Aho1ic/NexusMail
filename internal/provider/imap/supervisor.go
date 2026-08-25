@@ -26,8 +26,7 @@ import (
 	"nexusmail/internal/provider"
 	providerauth "nexusmail/internal/provider/auth"
 	accountservice "nexusmail/internal/service/account"
-
-	"math"
+	"nexusmail/internal/version"
 
 	goimap "github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapclient"
@@ -437,18 +436,40 @@ func (s *Supervisor) idleLoop(ctx context.Context, rt *runtime) {
 				}
 			}
 		}}, idleStallWindow)
-		if err != nil {
-			if !waitBackoff(ctx, backoff) {
-				return
+		// retry closes the connection and waits before the next attempt. Every
+		// post-connect failure below has to route through it: reaching the
+		// greeting proves the socket works, not that the account can be idled,
+		// and a bare `continue` here reconnected as fast as TLS handshakes
+		// complete — with a full LOGIN each time. That traffic shape is what a
+		// per-account throttle exists to punish, so a provider that
+		// authenticates and then rejects SELECT (QQ's "System busy") was kept
+		// permanently throttled by this loop, which also blocked the command
+		// loop's own recovery no matter how long it backed off.
+		retry := func(client *imapclient.Client, cause error) bool {
+			if client != nil {
+				_ = client.Close()
+			}
+			delay := retryDelay(cause, backoff)
+			if cause != nil {
+				slog.Debug("mail idle connection retrying", "account_id", rt.account.ID, "delay", delay, "error", cause)
+			}
+			if !waitBackoff(ctx, delay) {
+				return false
 			}
 			backoff = min(backoff*2, 5*time.Minute)
+			return true
+		}
+		if err != nil {
+			if !retry(nil, err) {
+				return
+			}
 			continue
 		}
-		backoff = time.Second
 		inbox, err := s.repo.GetMailboxByRole(ctx, rt.account.ID, "inbox")
 		if err != nil {
 			// The command loop has not recorded mailboxes yet. This is a local
-			// read, so retry quickly instead of idling for seconds.
+			// read that costs the provider nothing, so it keeps the quick retry
+			// and leaves the ladder alone.
 			_ = client.Close()
 			select {
 			case <-ctx.Done():
@@ -458,7 +479,9 @@ func (s *Supervisor) idleLoop(ctx context.Context, rt *runtime) {
 			continue
 		}
 		if _, err := client.Select(inbox.RemoteName, nil).Wait(); err != nil {
-			_ = client.Close()
+			if !retry(client, err) {
+				return
+			}
 			continue
 		}
 		if !client.Caps().Has(goimap.CapIdle) {
@@ -470,9 +493,15 @@ func (s *Supervisor) idleLoop(ctx context.Context, rt *runtime) {
 		}
 		idle, err := client.Idle()
 		if err != nil {
-			_ = client.Close()
+			if !retry(client, err) {
+				return
+			}
 			continue
 		}
+		// The ladder resets only once the connection is actually idling. Doing
+		// it right after connect meant a loop that failed at SELECT every time
+		// always retried at the 1-second floor and never climbed.
+		backoff = time.Second
 		refresh := time.NewTimer(time.Duration(20+rand.IntN(6)) * time.Minute)
 		active := true
 		for active {
@@ -672,6 +701,23 @@ func (s *Supervisor) connect(ctx context.Context, account domain.Account, handle
 		_ = client.Close()
 		return nil, err
 	}
+	// RFC 2971 ID, sent post-authentication because that is where the servers
+	// that care about it look for it. The Chinese providers advertise ID in the
+	// greeting itself and treat an anonymous client as a worse citizen than an
+	// identified one when deciding what to throttle; QQ and 163 both document
+	// that third-party clients are expected to identify themselves. It is one
+	// round trip on connect, so a provider that ignores ID loses nothing, and a
+	// failure is deliberately non-fatal: ID is an optional courtesy and no
+	// account should be unreachable because it was refused.
+	if client.Caps().Has(goimap.CapID) {
+		if _, idErr := client.ID(&goimap.IDData{
+			Name:    "NexusMail",
+			Version: version.Value,
+			Vendor:  "NexusMail",
+		}).Wait(); idErr != nil {
+			slog.Debug("imap ID rejected", "account_id", account.ID, "error", idErr)
+		}
+	}
 	guard.window.Store(int64(stall))
 	return client, nil
 }
@@ -797,6 +843,39 @@ func (s *Supervisor) syncRole(ctx context.Context, client *imapclient.Client, ac
 	return s.syncMailbox(ctx, client, mailbox, skipReconcile)
 }
 
+// incrementalUIDRange returns the UID range to search for mail newer than the
+// stored cursor, and whether a search is worth sending at all.
+//
+// The upper bound comes from the UIDNEXT that SELECT just reported, which is the
+// only bound that is both finite and true. The two alternatives are both known
+// to break:
+//
+//   - the 0="*" sentinel produces "3355:*", and a server that resolves "*" to a
+//     UID below the start normalises the reversed range per RFC 3501 — so an
+//     up-to-date mailbox re-fetched its newest message on every 5-second probe.
+//   - math.MaxUint32 produces "3355:4294967295", which QQ refuses with
+//     "NO System busy!" on UID SEARCH while accepting SELECT on the same
+//     connection. That reply is classified as a throttle, so the account parked
+//     in backoff and stopped syncing entirely while looking merely rate-limited.
+//
+// When the cursor already covers UIDNEXT-1 there is nothing to ask about, and
+// skipping the round trip is what keeps the 5-second probe cheap. A server that
+// omits UIDNEXT leaves only the sentinel, which is still better than a bound
+// that a provider rejects outright.
+func incrementalUIDRange(lastUID uint32, uidNext goimap.UID) (goimap.UIDSet, bool) {
+	var set goimap.UIDSet
+	start := goimap.UID(lastUID) + 1
+	if uidNext == 0 {
+		set.AddRange(start, 0)
+		return set, true
+	}
+	if uidNext <= start {
+		return set, false
+	}
+	set.AddRange(start, uidNext-1)
+	return set, true
+}
+
 // syncMailbox ingests new UIDs and, unless skipReconcile is set, repairs
 // flag/expunge drift. The 5s inbox probe passes skipReconcile=true: the safety
 // net's only job is to surface new mail quickly, and reconciliation on a large
@@ -814,7 +893,11 @@ func (s *Supervisor) syncMailbox(ctx context.Context, client *imapclient.Client,
 	condStore := client.Caps().Has(goimap.CapCondStore)
 	selected, err := client.Select(mailbox.RemoteName, &goimap.SelectOptions{ReadOnly: true, CondStore: condStore}).Wait()
 	if err != nil {
-		return err
+		// Naming the command matters when a provider rejects only some of them:
+		// a bare "sync INBOX: NO System busy!" cannot be told apart from a
+		// failing search or fetch, which is the difference between "the account
+		// is throttled" and "this one command is refused".
+		return fmt.Errorf("select: %w", err)
 	}
 	if mailbox.UIDValidity != 0 && mailbox.UIDValidity != selected.UIDValidity {
 		if err := s.repo.ResetMailbox(ctx, mailbox.ID, selected.UIDValidity); err != nil {
@@ -824,25 +907,22 @@ func (s *Supervisor) syncMailbox(ctx context.Context, client *imapclient.Client,
 	}
 	mailbox.UIDValidity = selected.UIDValidity
 	criteria := &goimap.SearchCriteria{}
+	var uids []goimap.UID
 	if mailbox.LastUID == 0 {
 		criteria.Since = time.Now().AddDate(0, 0, -30)
-	} else {
-		// Use an explicit upper bound (math.MaxUint32) instead of the 0="*"
-		// sentinel. imapmemserver resolves "*" to uidNext-1, then swaps
-		// start/stop when start > stop, which turned "2:*" into "1:2" when
-		// uidNext was 2 and re-fetched UID 1 every probe. Real servers are
-		// less aggressive about swapping, but capping the range explicitly
-		// makes the behaviour identical everywhere and removes one assumption
-		// from a 5-second hot path.
-		var set goimap.UIDSet
-		set.AddRange(goimap.UID(mailbox.LastUID+1), math.MaxUint32)
+		search, err := client.UIDSearch(criteria, nil).Wait()
+		if err != nil {
+			return fmt.Errorf("uid search: %w", err)
+		}
+		uids = search.AllUIDs()
+	} else if set, search := incrementalUIDRange(mailbox.LastUID, selected.UIDNext); search {
 		criteria.UID = []goimap.UIDSet{set}
+		result, err := client.UIDSearch(criteria, nil).Wait()
+		if err != nil {
+			return fmt.Errorf("uid search: %w", err)
+		}
+		uids = result.AllUIDs()
 	}
-	search, err := client.UIDSearch(criteria, nil).Wait()
-	if err != nil {
-		return err
-	}
-	uids := search.AllUIDs()
 	lastUID := mailbox.LastUID
 	// pending collects a chunk of built messages so the flush at the end of the
 	// chunk can write them under one writeMu + one transaction. Without this
@@ -856,7 +936,7 @@ func (s *Supervisor) syncMailbox(ctx context.Context, client *imapclient.Client,
 		}
 		messages, err := client.Fetch(goimap.UIDSetNum(uids[start:end]...), fetchOptions).Collect()
 		if err != nil {
-			return err
+			return fmt.Errorf("fetch envelopes: %w", err)
 		}
 		for _, fetched := range messages {
 			if mailbox.Role == "drafts" {
@@ -1425,8 +1505,41 @@ func (s *Supervisor) setError(ctx context.Context, id int64, status string, err 
 	slog.Error("mail account sync failed", "account_id", id, "status", status, "error", err.Error())
 	s.events.Publish(ports.Event{Type: "ACCOUNT_STATUS", Data: map[string]any{"account_id": id, "status": status, "error": err.Error()}})
 }
+
+// backoffDelay jitters a retry delay. Half of the delay is a hard floor and the
+// rest is random: full jitter over [0, delay] spread the load nicely but made
+// the long windows meaningless, because a 15-minute rateLimitBackoff drawing 8
+// seconds reconnects inside the throttle window it was waiting out and re-arms
+// it. Every such draw resets the provider's clock, which is how an account
+// stayed amber for hours despite a ladder that on paper backs off to minutes.
+// Equal jitter keeps enough spread to avoid synchronising every account on one
+// instant after a shared outage while making the floor worth its name.
+func backoffDelay(delay time.Duration) time.Duration {
+	if delay <= 0 {
+		return 0
+	}
+	floor := delay / 2
+	span := delay - floor
+	// Never return 0 for a positive delay: a zero-length timer is a spin.
+	return max(floor+time.Duration(rand.Int64N(int64(span)+1)), 1)
+}
+
+// retryDelay maps a failure to how long the caller must leave the provider
+// alone. Credentials the server already refused and a throttle it has already
+// engaged both need a window far longer than the network ladder, and picking
+// the ladder for either is what turns one rejection into a sustained hammering.
+func retryDelay(err error, ladder time.Duration) time.Duration {
+	switch {
+	case isAuthFailure(err):
+		return authBackoff
+	case isRateLimited(err):
+		return rateLimitBackoff
+	}
+	return ladder
+}
+
 func waitBackoff(ctx context.Context, delay time.Duration) bool {
-	timer := time.NewTimer(time.Duration(rand.Int64N(int64(delay) + 1)))
+	timer := time.NewTimer(backoffDelay(delay))
 	defer timer.Stop()
 	select {
 	case <-ctx.Done():
