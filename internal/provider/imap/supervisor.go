@@ -1396,12 +1396,23 @@ func (s *Supervisor) closeCommand(rt *runtime, client *imapclient.Client) {
 	_ = client.Close()
 }
 func (s *Supervisor) setError(ctx context.Context, id int64, status string, err error) {
-	value := err.Error()
-	if updateErr := s.repo.UpdateAccountStatus(ctx, id, status, &value); updateErr != nil {
+	// A rate-limit error is self-healing: the loop waits rateLimitBackoff and
+	// retries on its own. Storing the raw "imap: NO System busy!" string in
+	// the account row would replay the same message to the user every time
+	// the loop retries, which is exactly the noise we are trying to avoid.
+	// The amber "backoff" dot already signals "trying, just slowly", so we
+	// clear last_error instead. The full error still goes to slog and the
+	// realtime event for operators and tools that need it.
+	var stored *string
+	if !isRateLimited(err) {
+		text := err.Error()
+		stored = &text
+	}
+	if updateErr := s.repo.UpdateAccountStatus(ctx, id, status, stored); updateErr != nil {
 		slog.Error("mail account status update failed", "account_id", id, "status", status, "error", updateErr)
 	}
-	slog.Error("mail account sync failed", "account_id", id, "status", status, "error", value)
-	s.events.Publish(ports.Event{Type: "ACCOUNT_STATUS", Data: map[string]any{"account_id": id, "status": status, "error": value}})
+	slog.Error("mail account sync failed", "account_id", id, "status", status, "error", err.Error())
+	s.events.Publish(ports.Event{Type: "ACCOUNT_STATUS", Data: map[string]any{"account_id": id, "status": status, "error": err.Error()}})
 }
 func waitBackoff(ctx context.Context, delay time.Duration) bool {
 	timer := time.NewTimer(time.Duration(rand.Int64N(int64(delay) + 1)))
