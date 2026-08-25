@@ -133,9 +133,10 @@ function MailboxApp({ onLogout }: { onLogout: () => void }) {
   useEffect(() => { loadMessages() }, [loadMessages])
 
   const refresh = useCallback(() => { loadAccounts(); loadMailboxes(selectedAccount); loadMessages() }, [loadAccounts, loadMailboxes, loadMessages, selectedAccount])
-  // Realtime arrivals refresh without the spinner so incoming mail does not
-  // make the list flicker.
-  const refreshQuietly = useCallback(() => { loadAccounts(); loadMessages(false, undefined, true) }, [loadAccounts, loadMessages])
+  // Realtime arrivals only need the message list — account list and mailbox
+  // structure do not change on NEW_EMAIL / MESSAGE_UPDATED, so calling them
+  // here only adds an extra REST round-trip to the hot path.
+  const refreshQuietly = useCallback(() => { loadMessages(false, undefined, true) }, [loadMessages])
 
   // Keyed by message and code, not by message alone: the arrival pass only sees
   // the subject, so a later body pass may carry a better code that should still

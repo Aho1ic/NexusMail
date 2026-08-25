@@ -393,3 +393,112 @@ func TestAddressesFromEnvelopeAreReadable(t *testing.T) {
 		}
 	}
 }
+
+// TestProbeInboxThreeBranches pins the three observable outcomes of the 5s
+// inbox probe. The cheap STATUS path has to take all three routes: the
+// unchanged branch (most ticks), the moved branch that calls
+// syncMailbox(skipReconcile=true), and a STATUS error that propagates to the
+// caller. Without this, a regression that makes probeInbox always return nil
+// after movement would not be caught by TestIdleInboxProbeStaysCheap.
+//
+// The supervisor is stopped before the moved-branch assertion so the
+// commandLoop does not race the manual probe for the same UIDs and trip a
+// UNIQUE constraint; the assertion is about the branch the probe took, not
+// about a real-time race.
+func TestProbeInboxThreeBranches(t *testing.T) {
+	h := newHarness(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := h.supervisor.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	waitConnected(t, h)
+	h.supervisor.Stop()
+
+	rt, err := h.supervisor.runtime(h.account.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := h.connect(t, ctx)
+	t.Cleanup(func() { _ = client.Close() })
+
+	// 1) Unchanged branch: STATUS matches local UIDNext/UIDValidity,
+	//    probeInbox must return nil and NOT call syncMailbox.
+	before := h.events.count("NEW_EMAIL")
+	if err := h.supervisor.probeInbox(ctx, rt, client); err != nil {
+		t.Fatalf("unchanged probe returned %v, want nil", err)
+	}
+	if h.events.count("NEW_EMAIL") != before {
+		t.Errorf("unchanged probe triggered a sync, want no event")
+	}
+
+	// 2) Moved branch: deliver a message, run the probe, expect one
+	//    NEW_EMAIL because the moved branch calls syncMailbox.
+	h.deliver(t, "probe-moved")
+	if err := h.supervisor.probeInbox(ctx, rt, client); err != nil {
+		t.Fatalf("moved probe returned %v, want nil", err)
+	}
+	_, _ = h.events.await(t, "NEW_EMAIL", 30*time.Second)
+
+	// 3) STATUS error branch: close the client so the next Status() call
+	//    fails. The function should return the error to the caller so the
+	//    command loop can take the backoff path.
+	_ = client.Close()
+	if err := h.supervisor.probeInbox(ctx, rt, client); err == nil {
+		t.Errorf("STATUS error branch returned nil, want a transport error")
+	}
+}
+
+// TestRuntimeLockTwoLevelPreemption covers the two-level priority lock
+// directly. CLAUDE.md flags it as a footgun; until now the only coverage was
+// the end-to-end TestBodyPrefetchYieldsToNewMail, which uses a 3s wall-clock
+// budget that can be racy in CI. The test asserts:
+//   - lockBackground blocks while the foreground lock is held
+//   - lockBackground returns false when its context is cancelled
+//   - urgent is balanced (start and end match)
+func TestRuntimeLockTwoLevelPreemption(t *testing.T) {
+	rt := &runtime{}
+	if !rt.lockBackground(context.Background()) {
+		t.Fatal("fresh runtime should accept lockBackground")
+	}
+	rt.unlock()
+
+	rt.lock()
+	holder := make(chan struct{})
+	acquired := make(chan struct{})
+	go func() {
+		close(holder)
+		// While the foreground lock is held, lockBackground must spin and
+		// not return. We measure by giving it a tight context.
+		short, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+		defer cancel()
+		if rt.lockBackground(short) {
+			close(acquired)
+		}
+	}()
+	<-holder
+	select {
+	case <-acquired:
+		t.Fatal("lockBackground acquired the lock while foreground was held")
+	case <-time.After(80 * time.Millisecond):
+		// expected
+	}
+	rt.unlock()
+	// After release, lockBackground should acquire within a reasonable
+	// window. The test would hang here if the spin loop never observes the
+	// unlock.
+	if !rt.lockBackground(context.Background()) {
+		t.Fatal("lockBackground did not acquire after unlock")
+	}
+	rt.unlock()
+
+	// Cancellation: a context that is already done must make lockBackground
+	// return false rather than block.
+	rt.lock()
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if rt.lockBackground(cancelled) {
+		t.Fatal("lockBackground acquired with a cancelled context")
+	}
+	rt.unlock()
+}

@@ -61,6 +61,7 @@ func (s *Store) ReconcileMailboxFlags(ctx context.Context, mailboxID int64, stat
 	}
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
+	s.invalidateUnreadCache()
 	changed := 0
 	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		now := time.Now().UnixMilli()
@@ -76,9 +77,10 @@ func (s *Store) ReconcileMailboxFlags(ctx context.Context, mailboxID int64, stat
 				UID       uint32 `gorm:"column:uid"`
 				IsRead    bool   `gorm:"column:is_read"`
 				IsStarred bool   `gorm:"column:is_starred"`
+				FlagsJSON string `gorm:"column:flags_json"`
 			}
 			var rows []row
-			if err := tx.Raw(`SELECT mm.message_id, mm.uid, m.is_read, m.is_starred
+			if err := tx.Raw(`SELECT mm.message_id, mm.uid, m.is_read, m.is_starred, mm.flags_json
                 FROM mailbox_messages mm JOIN messages m ON m.id = mm.message_id
                 WHERE mm.mailbox_id = ? AND mm.uid IN ?`, mailboxID, uids).Scan(&rows).Error; err != nil {
 				return err
@@ -93,8 +95,15 @@ func (s *Store) ReconcileMailboxFlags(ctx context.Context, mailboxID int64, stat
 					continue
 				}
 				flagsJSON, _ := json.Marshal(state.Flags)
-				if err := tx.Exec("UPDATE mailbox_messages SET flags_json = ? WHERE mailbox_id = ? AND uid = ?", string(flagsJSON), mailboxID, state.UID).Error; err != nil {
-					return err
+				// Diff-write: a 5-minute tick on a 2000-UID mailbox used to
+				// issue 2000 single-row UPDATEs to mailbox_messages even when
+				// nothing changed. Skipping the no-op case is one free
+				// comparison in memory because the SELECT already returned
+				// the row.
+				if current.FlagsJSON != string(flagsJSON) {
+					if err := tx.Exec("UPDATE mailbox_messages SET flags_json = ? WHERE mailbox_id = ? AND uid = ?", string(flagsJSON), mailboxID, state.UID).Error; err != nil {
+						return err
+					}
 				}
 				if current.IsRead == state.IsRead && current.IsStarred == state.IsStarred {
 					continue
@@ -302,6 +311,36 @@ func (s *Store) SetMessageBodyState(ctx context.Context, id int64, state string)
 		Updates(map[string]any{"body_state": state, "updated_at": time.Now().UnixMilli()}).Error
 }
 
+// BatchSetMessageBodyState flips a list of messages to the same body_state in
+// a single writeMu section and a single transaction. The hot path is the
+// enqueueBodyCandidates loop on the 5s inbox probe: a backlog of 100 body
+// candidates used to pay for 100 single-row UPDATEs and 100 fsyncs; the
+// batch collapses it to one.
+//
+// Rows that are already 'ready' are skipped, matching the per-row guard.
+// The caller treats a non-nil error as a no-op for the whole batch — it is
+// not safe to retry half-applied state because the body queue may already
+// hold the IDs.
+func (s *Store) BatchSetMessageBodyState(ctx context.Context, ids []int64, state string) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	now := time.Now().UnixMilli()
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		for start := 0; start < len(ids); start += sqliteParameterChunk {
+			end := min(start+sqliteParameterChunk, len(ids))
+			if err := tx.Model(&domain.Message{}).
+				Where("id IN ? AND body_state != 'ready'", ids[start:end]).
+				Updates(map[string]any{"body_state": state, "updated_at": now}).Error; err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
 func (s *Store) UpsertAttachment(ctx context.Context, attachment *domain.Attachment) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
@@ -313,6 +352,34 @@ func (s *Store) UpsertAttachment(ctx context.Context, attachment *domain.Attachm
 		attachment.MessageID, attachment.PartID, attachment.Filename, attachment.ContentType, attachment.Disposition,
 		attachment.ContentID, attachment.SizeBytes, attachment.FetchState, attachment.BlobID, attachment.LastError,
 		attachment.CreatedAt, attachment.UpdatedAt).Error
+}
+
+// BatchUpsertAttachments upserts a batch of attachments under a single
+// writeMu. The errors UpsertAttachment would surface are intentionally
+// swallowed (the supervisor loop ignores the return value), so this version
+// reports the first error and bails rather than silently losing rows mid-batch.
+func (s *Store) BatchUpsertAttachments(ctx context.Context, attachments []domain.Attachment) error {
+	if len(attachments) == 0 {
+		return nil
+	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		for i := range attachments {
+			att := attachments[i]
+			if err := tx.Exec(`INSERT INTO attachments
+                (message_id, part_id, filename, content_type, disposition, content_id, size_bytes, fetch_state, blob_id, last_error, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(message_id, part_id) DO UPDATE SET filename=excluded.filename, content_type=excluded.content_type,
+                disposition=excluded.disposition, content_id=excluded.content_id, size_bytes=excluded.size_bytes, updated_at=excluded.updated_at`,
+				att.MessageID, att.PartID, att.Filename, att.ContentType, att.Disposition,
+				att.ContentID, att.SizeBytes, att.FetchState, att.BlobID, att.LastError,
+				att.CreatedAt, att.UpdatedAt).Error; err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 }
 
 func (s *Store) GetAttachment(ctx context.Context, messageID, attachmentID int64) (domain.Attachment, error) {

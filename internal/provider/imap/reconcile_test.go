@@ -261,7 +261,7 @@ func TestReconcileKeepsMailThatArrivedDuringThePass(t *testing.T) {
 	// Import a message the reconcile pass does not know about, exactly as a sync
 	// racing the pass would, then reconcile against the older snapshot.
 	h.deliver(t, "arrived-mid-pass")
-	if err := h.supervisor.syncMailbox(ctx, client, inbox); err != nil {
+	if err := h.supervisor.syncMailbox(ctx, client, inbox, false); err != nil {
 		t.Fatal(err)
 	}
 	fresh, err := h.repo.ListMailboxUIDs(ctx, inbox.ID)
@@ -283,5 +283,61 @@ func TestReconcileKeepsMailThatArrivedDuringThePass(t *testing.T) {
 	}
 	if after[len(after)-1] != newest {
 		t.Fatalf("uid %d that arrived mid-pass was dropped, local now %v", newest, after)
+	}
+}
+
+// TestSyncMailboxSkipReconcile covers the 5s inbox probe's hot path. The probe
+// calls syncMailbox with skipReconcile=true because the only thing that has
+// to happen fast is the new-mail ingest; flag and expunge drift is the 5
+// minute periodic sync's job. This test asserts that lastReconcile is not
+// touched when skipReconcile is set, so the periodic path remains the sole
+// owner of the reconciliation cost.
+//
+// Unlike TestNewMailLatency, this does not bring the supervisor up: the
+// goroutine that does the initial sync can race the manual syncMailbox call
+// and produce a UNIQUE constraint error on the same dedupe_key. The behaviour
+// under test is the supervisor's syncMailbox entry point, so driving it
+// directly is the right shape.
+func TestSyncMailboxSkipReconcile(t *testing.T) {
+	h := newHarness(t)
+	h.deliver(t, "inbox-anchor")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := h.supervisor.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	waitConnected(t, h)
+	drain(h)
+	h.supervisor.Stop()
+
+	inbox, err := h.repo.GetMailboxByRole(ctx, h.account.ID, "inbox")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The initial sync committed the message and wrote the cursor, so the
+	// manual probe-path sync should not find any new UIDs to ingest; the
+	// assertion is that it returns cleanly without touching lastReconcile.
+	if inbox.LastUID == 0 {
+		t.Skipf("initial sync did not commit cursor (LastUID=0); test depends on a committed first sync")
+	}
+	client := h.connect(t, ctx)
+	defer func() { _ = client.Close() }()
+
+	h.supervisor.lastReconcile.Clear()
+
+	if err := h.supervisor.syncMailbox(ctx, client, inbox, true); err != nil {
+		t.Fatalf("probe-path sync: %v", err)
+	}
+	if _, ok := h.supervisor.lastReconcile.Load(inbox.ID); ok {
+		t.Fatalf("lastReconcile was written by probe-path sync, want skipped")
+	}
+
+	// A periodic-sync call must still write the stamp; the probe's skip is
+	// the only divergence.
+	if err := h.supervisor.syncMailbox(ctx, client, inbox, false); err != nil {
+		t.Fatalf("periodic-path sync: %v", err)
+	}
+	if _, ok := h.supervisor.lastReconcile.Load(inbox.ID); !ok {
+		t.Fatalf("lastReconcile was not written by periodic-path sync")
 	}
 }

@@ -29,6 +29,18 @@ type MessagePage struct {
 
 // RemoteFlagState is one message as the provider currently sees it, used to
 // reconcile local rows against the server rather than only appending new mail.
+// MessageInput is the batch ingest shape the supervisor passes to a syncMailbox
+// pass. The message is fully constructed by the caller; the repository only
+// decides insert vs update based on (account_id, dedupe_key), persists the
+// mailbox mapping, and returns the row id it ended up using.
+type MessageInput struct {
+	Message      *domain.Message
+	MailboxID    int64
+	UID          uint32
+	Flags        []string
+	InternalDate time.Time
+}
+
 type RemoteFlagState struct {
 	UID       uint32
 	IsRead    bool
@@ -62,6 +74,14 @@ type Repository interface {
 	UpdateMailboxCursor(context.Context, int64, uint32, uint32, *uint32, *uint64) error
 	ResetMailbox(context.Context, int64, uint32) error
 	CreateOrUpdateMessage(context.Context, *domain.Message, int64, uint32, []string, time.Time) (bool, error)
+	// BatchCreateOrUpdateMessages ingests a batch of fetched messages under a
+	// single writeMu and a single transaction. The result slices are parallel
+	// to items: resultIDs[i] is the row id used for items[i], and
+	// created[i] reports whether the dedupe_key was new.
+	BatchCreateOrUpdateMessages(context.Context, []MessageInput) ([]int64, []bool, error)
+	// BatchUpsertAttachments writes a batch of attachments in a single
+	// transaction. Conflicts on (message_id, part_id) update the existing row.
+	BatchUpsertAttachments(context.Context, []domain.Attachment) error
 	ReconcileMailboxFlags(context.Context, int64, []RemoteFlagState) (int, error)
 	// ListMailboxUIDs returns the UIDs stored locally for one mailbox, ascending.
 	// Reconciliation is driven from this list so its cost scales with what the app
@@ -72,6 +92,7 @@ type Repository interface {
 	MessageLocations(context.Context, []int64) ([]MessageLocation, error)
 	MoveMessageLocation(context.Context, int64, int64, int64, *uint32) error
 	SetMessageBodyState(context.Context, int64, string) error
+	BatchSetMessageBodyState(context.Context, []int64, string) error
 	UpdateMessageBody(context.Context, int64, string, string, string, *int64) error
 	UpsertAttachment(context.Context, *domain.Attachment) error
 	GetAttachment(context.Context, int64, int64) (domain.Attachment, error)

@@ -157,6 +157,57 @@ func TestAuthenticateRejectsUnknownSessionToken(t *testing.T) {
 	}
 }
 
+// TestAuthenticateAPIKeyShortCircuitsSession pins the precedence rules
+// CLAUDE.md requires: a present X-API-Key is the only thing the cookie and
+// CSRF/Origin paths ever see, and a wrong X-API-Key must not fall through to
+// the cookie channel.
+func TestAuthenticateAPIKeyShortCircuitsSession(t *testing.T) {
+	server := newTestServer(t)
+	router := probeRouter(server)
+	token, _ := newSession(t, server)
+
+	// Both valid: API key wins, and CSRF is intentionally skipped.
+	both := httptest.NewRequest(http.MethodPost, "/probe", nil)
+	both.Header.Set("X-API-Key", testAPIKey)
+	both.AddCookie(&http.Cookie{Name: sessionservice.CookieName, Value: token})
+	// No X-CSRF-Token and no Origin: would fail the cookie path, but the
+	// request is API-key authenticated.
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, both)
+	if response.Code != http.StatusOK {
+		t.Fatalf("valid API key + valid session returned %d, want 200 (API key wins, CSRF skipped)", response.Code)
+	}
+	if got := response.Body.String(); got != "api_key" {
+		t.Fatalf("auth_method = %q, want api_key", got)
+	}
+
+	// Wrong API key with a valid session must be 401: the cookie channel is
+	// not consulted when the X-API-Key header is present.
+	wrong := httptest.NewRequest(http.MethodGet, "/probe", nil)
+	wrong.Header.Set("X-API-Key", strings.Repeat("z", len(testAPIKey)))
+	wrong.AddCookie(&http.Cookie{Name: sessionservice.CookieName, Value: token})
+	response = httptest.NewRecorder()
+	router.ServeHTTP(response, wrong)
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("wrong API key + valid session returned %d, want 401 (no fallthrough)", response.Code)
+	}
+
+	// An empty X-API-Key header is the same as no header: the cookie path
+	// must be tried. Use a wrong API key with CSRF enforced but no header set.
+	empty := httptest.NewRequest(http.MethodPost, "/probe", nil)
+	empty.Header.Set("X-API-Key", "")
+	empty.AddCookie(&http.Cookie{Name: sessionservice.CookieName, Value: token})
+	empty.Header.Set("X-CSRF-Token", "anything")
+	response = httptest.NewRecorder()
+	router.ServeHTTP(response, empty)
+	// Cookie path then fails on missing CSRF (because the request was POST),
+	// not on a fake key; that proves the empty header was treated as absent
+	// rather than as a wrong key.
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("empty X-API-Key returned %d, want 401 (cookie path tried)", response.Code)
+	}
+}
+
 // TestLoginRateLimit bounds guessing on the one endpoint that takes the API key as
 // a body parameter.
 func TestLoginRateLimit(t *testing.T) {

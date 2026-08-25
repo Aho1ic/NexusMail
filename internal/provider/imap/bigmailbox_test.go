@@ -90,12 +90,12 @@ func TestSyncAllHoldsCommandLock(t *testing.T) {
 	h.supervisor.lastReconcile.Clear()
 	rt.lock()
 	warm := time.Now()
-	if err := h.supervisor.syncAll(ctx, rt, client); err != nil {
-		t.Fatalf("warm syncAll: %v", err)
+	if err := h.supervisor.syncAllMailboxes(ctx, rt, client); err != nil {
+		t.Fatalf("warm syncAllMailboxes: %v", err)
 	}
 	warmDuration := time.Since(warm)
 	rt.unlock()
-	t.Logf("warm syncAll held the command lock for %s", warmDuration)
+	t.Logf("warm syncAllMailboxes held the command lock for %s", warmDuration)
 
 	// Now the number that matters: mail arriving while the ticker sync runs.
 	h.supervisor.lastReconcile.Clear()
@@ -104,11 +104,11 @@ func TestSyncAllHoldsCommandLock(t *testing.T) {
 	go func() {
 		rt.lock()
 		start := time.Now()
-		_ = h.supervisor.syncAll(ctx, rt, client)
+		_ = h.supervisor.syncAllMailboxes(ctx, rt, client)
 		rt.unlock()
 		done <- time.Since(start)
 	}()
-	time.Sleep(50 * time.Millisecond) // let syncAll take the lock first
+	time.Sleep(50 * time.Millisecond) // let syncAllMailboxes take the lock first
 	arrival := time.Now()
 	h.deliver(t, "arrives-during-full-sync")
 	_, _ = h.events.await(t, "NEW_EMAIL", 5*time.Minute)
@@ -213,7 +213,7 @@ func TestPeriodicSyncSkipsQuietAndEveryMessageMailboxes(t *testing.T) {
 	lines = nil
 	mu.Unlock()
 	rt.lock()
-	syncErr := h.supervisor.syncAll(ctx, rt, client)
+	syncErr := h.supervisor.syncAllMailboxes(ctx, rt, client)
 	rt.unlock()
 	if syncErr != nil {
 		t.Fatal(syncErr)

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/mail"
 	"sync"
 	"time"
@@ -146,7 +147,14 @@ func (w *Worker) deliver(ctx context.Context, id int64) {
 		if errors.As(err, &deliveryErr) {
 			if deliveryErr.Unknown {
 				text := deliveryErr.Error()
-				_ = w.repo.SetDraftDelivery(ctx, id, "unknown", draft.AttemptCount, nil, &deliveryErr.Code, &text, nil)
+				// unknown means DATA was sent and the connection dropped before
+				// we got an ack; delivery may have happened. Treat the manual
+				// retry as a clean restart: reset attempt_count so a fresh
+				// automatic retry ladder can run instead of falling into
+				// failed on the first temporary blip after recovery.
+				if writeErr := w.repo.SetDraftDelivery(ctx, id, "unknown", 0, nil, &deliveryErr.Code, &text, nil); writeErr != nil {
+					slog.Error("set draft to unknown", "draft_id", id, "error", writeErr)
+				}
 				w.publish(id, "unknown")
 				return
 			}
@@ -177,19 +185,36 @@ func (w *Worker) compose(ctx context.Context, account domain.Account, draft doma
 	for _, attachment := range attachments {
 		blob, err := w.repo.GetBlob(ctx, attachment.BlobID)
 		if err != nil {
-			return nil, nil, closers, err
+			w.closeAll(closers)
+			return nil, nil, nil, err
 		}
 		reader, err := w.blobs.Open(ctx, blob)
 		if err != nil {
-			return nil, nil, closers, err
+			w.closeAll(closers)
+			return nil, nil, nil, err
 		}
 		closers = append(closers, reader)
 		outgoingAttachments = append(outgoingAttachments, mailbuilder.OutgoingAttachment{Filename: attachment.Filename, ContentType: attachment.ContentType, Data: reader})
 	}
 	from := mail.Address{Name: account.DisplayName, Address: account.Email}
 	payload, err := mailbuilder.Compose(mailbuilder.Outgoing{MessageID: draft.RFCMessageID, From: from, To: to, CC: cc, BCC: bcc, Subject: draft.Subject, BodyText: draft.BodyText, Attachments: outgoingAttachments})
+	// mailbuilder.Compose fully drains each attachment Data reader into the
+	// in-memory payload, so the blob FDs are no longer needed by the time
+	// Compose returns. Closing them here rather than deferring to the caller
+	// (which would hold the FDs across SMTP.Send and complete) keeps one
+	// attachment's lifetime to its actual use, not to the whole send.
+	w.closeAll(closers)
 	recipients := addressValues(append(append(append([]mail.Address{}, to...), cc...), bcc...))
-	return payload, recipients, closers, err
+	return payload, recipients, nil, err
+}
+
+// closeAll closes a list of closers and silently swallows the per-FD error
+// because the only failure mode here is "blob already gone", which is benign
+// and would only mask the original error if it were surfaced.
+func (w *Worker) closeAll(closers []io.Closer) {
+	for _, closer := range closers {
+		_ = closer.Close()
+	}
 }
 
 func (w *Worker) complete(ctx context.Context, account domain.Account, draft domain.Draft, payload []byte) {
@@ -206,13 +231,26 @@ func (w *Worker) complete(ctx context.Context, account domain.Account, draft dom
 		w.fail(ctx, draft, err, true, 0)
 		return
 	}
-	_ = w.repo.SetDraftDelivery(ctx, draft.ID, "sent", draft.AttemptCount, nil, nil, nil, &now)
+	if err := w.repo.SetDraftDelivery(ctx, draft.ID, "sent", draft.AttemptCount, nil, nil, nil, &now); err != nil {
+		// SMTP delivery already succeeded; surfacing the local-state drift is
+		// better than silently leaving the outbox in a "queued" state that
+		// would cause the user to send the message twice on retry.
+		slog.Error("set draft to sent", "draft_id", draft.ID, "error", err)
+	}
 	if w.remoteDraft != nil {
-		_ = w.remoteDraft.DeleteRemoteDraft(ctx, draft.ID)
+		if err := w.remoteDraft.DeleteRemoteDraft(ctx, draft.ID); err != nil {
+			// Same rationale: the SMTP send already happened. The remote
+			// Drafts folder will keep a copy until the user deletes it from
+			// another client; that is preferable to re-queuing and sending
+			// the message twice.
+			slog.Error("delete remote draft", "draft_id", draft.ID, "error", err)
+		}
 		if preset, err := provider.Get(account.Provider); err == nil && !preset.ServerSavesSent {
 			if appendErr := w.remoteDraft.AppendSent(ctx, account.ID, payload); appendErr != nil {
 				text := "message sent, but remote Sent coordination failed: " + appendErr.Error()
-				_ = w.repo.SetDraftDelivery(ctx, draft.ID, "sent", draft.AttemptCount, nil, nil, &text, &now)
+				if err := w.repo.SetDraftDelivery(ctx, draft.ID, "sent", draft.AttemptCount, nil, nil, &text, &now); err != nil {
+					slog.Error("annotate sent draft", "draft_id", draft.ID, "error", err)
+				}
 			}
 		}
 	}
@@ -233,7 +271,14 @@ func (w *Worker) fail(ctx context.Context, draft domain.Draft, err error, tempor
 	if code != 0 {
 		codePtr = &code
 	}
-	_ = w.repo.SetDraftDelivery(ctx, draft.ID, status, draft.AttemptCount, next, codePtr, &text, nil)
+	// A failed write here strands the draft in 'sending' until the next
+	// RecoverSendingDrafts startup, which would mark it 'unknown' and lose
+	// the retry schedule we just computed. Logging is the minimum; the DB
+	// error is rare (WAL contention) and the user-visible consequence is a
+	// stuck retry.
+	if err := w.repo.SetDraftDelivery(ctx, draft.ID, status, draft.AttemptCount, next, codePtr, &text, nil); err != nil {
+		slog.Error("set draft delivery", "draft_id", draft.ID, "status", status, "error", err)
+	}
 	w.publish(draft.ID, status)
 }
 

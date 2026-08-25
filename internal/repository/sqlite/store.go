@@ -7,8 +7,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -37,6 +40,10 @@ type Store struct {
 	db      *gorm.DB
 	sqlDB   *sql.DB
 	writeMu sync.Mutex
+	// unreadCache memoises unreadTotal with a short TTL so the realtime
+	// 80ms-coalesced feed refresh in App.tsx does not re-issue the
+	// COUNT(DISTINCT) join on every tick.
+	unreadCache sync.Map
 }
 
 func Open(path string) (*Store, error) {
@@ -84,36 +91,106 @@ func (s *Store) configure(ctx context.Context) error {
 }
 
 func (s *Store) migrate(ctx context.Context) error {
-	var count int
-	if err := s.sqlDB.QueryRowContext(ctx, "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='schema_migrations'").Scan(&count); err != nil {
-		return fmt.Errorf("inspect migrations: %w", err)
+	if err := s.ensureMigrationsTable(ctx); err != nil {
+		return err
 	}
-	if count > 0 {
-		var applied int
-		if err := s.sqlDB.QueryRowContext(ctx, "SELECT count(*) FROM schema_migrations WHERE version=1").Scan(&applied); err != nil {
-			return fmt.Errorf("read migration version: %w", err)
-		}
-		if applied > 0 {
-			return nil
-		}
-	}
-	script, err := migrations.FS.ReadFile("000001_init.up.sql")
+	files, err := migrations.FS.ReadDir(".")
 	if err != nil {
-		return fmt.Errorf("read migration: %w", err)
+		return fmt.Errorf("list migrations: %w", err)
+	}
+	versions := map[int]string{}
+	for _, file := range files {
+		name := file.Name()
+		if !strings.HasSuffix(name, ".up.sql") {
+			continue
+		}
+		version, ok := parseMigrationName(name)
+		if !ok {
+			continue
+		}
+		versions[version] = name
+	}
+	if len(versions) == 0 {
+		return errors.New("no up migrations found")
+	}
+	keys := make([]int, 0, len(versions))
+	for k := range versions {
+		keys = append(keys, k)
+	}
+	sort.Ints(keys)
+	for _, version := range keys {
+		applied, err := s.migrationApplied(ctx, version)
+		if err != nil {
+			return err
+		}
+		if applied {
+			continue
+		}
+		if err := s.applyMigration(ctx, version, versions[version]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// ensureMigrationsTable creates the bookkeeping table if it does not yet exist.
+// It uses CREATE TABLE IF NOT EXISTS rather than a hardcoded check so the
+// runner does not need its own bootstrap branch in the version loop.
+func (s *Store) ensureMigrationsTable(ctx context.Context) error {
+	_, err := s.sqlDB.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS schema_migrations (
+        version INTEGER PRIMARY KEY,
+        applied_at INTEGER NOT NULL
+    )`)
+	if err != nil {
+		return fmt.Errorf("create schema_migrations: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) migrationApplied(ctx context.Context, version int) (bool, error) {
+	var count int
+	if err := s.sqlDB.QueryRowContext(ctx, "SELECT count(*) FROM schema_migrations WHERE version=?", version).Scan(&count); err != nil {
+		return false, fmt.Errorf("read migration version: %w", err)
+	}
+	return count > 0, nil
+}
+
+func (s *Store) applyMigration(ctx context.Context, version int, name string) error {
+	script, err := migrations.FS.ReadFile(name)
+	if err != nil {
+		return fmt.Errorf("read migration %s: %w", name, err)
 	}
 	tx, err := s.sqlDB.BeginTx(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("begin migration: %w", err)
+		return fmt.Errorf("begin migration %s: %w", name, err)
 	}
 	if _, err = tx.ExecContext(ctx, string(script)); err != nil {
 		_ = tx.Rollback()
-		return fmt.Errorf("apply migration (build with -tags sqlite_fts5): %w", err)
+		return fmt.Errorf("apply migration %s (build with -tags sqlite_fts5): %w", name, err)
 	}
-	if _, err = tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES(1, ?)", time.Now().UnixMilli()); err != nil {
+	if _, err = tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at) VALUES(?, ?)", version, time.Now().UnixMilli()); err != nil {
 		_ = tx.Rollback()
-		return fmt.Errorf("record migration: %w", err)
+		return fmt.Errorf("record migration %s: %w", name, err)
 	}
 	return tx.Commit()
+}
+
+// parseMigrationName extracts the leading integer version from a migration
+// filename such as "000002_fts5_unicode61.up.sql". The prefix is the only
+// ordering signal; everything after the underscore is a free-form label.
+func parseMigrationName(name string) (int, bool) {
+	idx := strings.IndexByte(name, '_')
+	if idx <= 0 {
+		return 0, false
+	}
+	version, err := strconv.Atoi(name[:idx])
+	if err != nil {
+		return 0, false
+	}
+	if version <= 0 {
+		return 0, false
+	}
+	return version, true
 }
 
 func (s *Store) Ping(ctx context.Context) error { return s.sqlDB.PingContext(ctx) }
@@ -209,6 +286,108 @@ func (s *Store) CreateOrUpdateMessage(ctx context.Context, message *domain.Messa
 	return created, err
 }
 
+// BatchCreateOrUpdateMessages collapses N single-row ingest calls into a
+// single writeMu section and a single transaction. The hot path is the
+// 5-second inbox probe and the 5-minute periodic sync: a syncMailbox pass
+// that lands 100 new messages used to pay for 100 commits (and 100 fsyncs
+// in WAL mode). One commit is one fsync.
+//
+// Behaviour matches CreateOrUpdateMessage row-for-row: each (account_id,
+// dedupe_key) either inserts a new message or updates the existing one's
+// subject/sender/recipients/flags. The mailbox_messages row is upserted
+// either way. FTS5 triggers fire per row as before, but the trigger work
+// stays inside the same transaction and is committed once.
+//
+// The result slices are parallel to items: resultIDs[i] is the row id
+// stored for items[i], and created[i] reports whether that item was
+// inserted (true) or only updated (false). The caller uses created to
+// decide whether to publish NEW_EMAIL; the supervisor also reads
+// resultIDs[i] to construct attachments in the same pass.
+func (s *Store) BatchCreateOrUpdateMessages(ctx context.Context, items []ports.MessageInput) ([]int64, []bool, error) {
+	ids := make([]int64, len(items))
+	created := make([]bool, len(items))
+	if len(items) == 0 {
+		return ids, created, nil
+	}
+	// The dedupe SELECT scopes by items[0].AccountID, so the batch must be
+	// single-account. Today every caller passes a per-mailbox batch, which
+	// is single-account by construction. The assertion turns a future caller
+	// regression into a loud failure rather than a silent cross-account
+	// deduplication that would let messages from account B take over a row
+	// owned by account A.
+	for _, item := range items {
+		if item.Message.AccountID != items[0].Message.AccountID {
+			return nil, nil, errors.New("BatchCreateOrUpdateMessages: all items must share the same account_id")
+		}
+	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		// One SELECT IN (...) instead of N First() lookups. GORM's IN (?)
+		// does not flatten [][]byte, so the placeholders are expanded by
+		// hand. SQLite's parameter cap (500) comfortably fits a chunk.
+		keys := make([][]byte, len(items))
+		for i, item := range items {
+			keys[i] = item.Message.DedupeKey
+		}
+		placeholders := make([]byte, 0, len(keys)*2)
+		args := make([]any, 0, len(keys)+1)
+		args = append(args, items[0].Message.AccountID)
+		for i, k := range keys {
+			if i > 0 {
+				placeholders = append(placeholders, ',')
+			}
+			placeholders = append(placeholders, '?')
+			args = append(args, k)
+		}
+		type keyRow struct {
+			ID        int64
+			DedupeKey []byte
+		}
+		var existingRows []keyRow
+		query := "SELECT id, dedupe_key FROM messages WHERE account_id = ? AND dedupe_key IN (" + string(placeholders) + ")"
+		if err := tx.Raw(query, args...).Scan(&existingRows).Error; err != nil {
+			return err
+		}
+		if len(existingRows) > 0 {
+			slog.Debug("batch dedupe lookup", "account_id", items[0].Message.AccountID, "hits", len(existingRows), "batch", len(items))
+		}
+		byKey := make(map[string]int64, len(existingRows))
+		for _, row := range existingRows {
+			byKey[string(row.DedupeKey)] = row.ID
+		}
+		for i, item := range items {
+			if existingID, ok := byKey[string(item.Message.DedupeKey)]; ok {
+				ids[i] = existingID
+				item.Message.ID = existingID
+				if err := tx.Model(&domain.Message{}).Where("id = ?", existingID).Updates(map[string]any{
+					"subject": item.Message.Subject, "sender": item.Message.Sender, "recipients": item.Message.Recipients,
+					"from_json": item.Message.FromJSON, "to_json": item.Message.ToJSON, "cc_json": item.Message.CCJSON,
+					"is_read": item.Message.IsRead, "is_starred": item.Message.IsStarred, "updated_at": item.Message.UpdatedAt,
+				}).Error; err != nil {
+					return err
+				}
+			} else {
+				if err := tx.Create(item.Message).Error; err != nil {
+					return err
+				}
+				ids[i] = item.Message.ID
+				created[i] = true
+				byKey[string(item.Message.DedupeKey)] = item.Message.ID
+			}
+			flagsJSON, _ := json.Marshal(item.Flags)
+			if err := tx.Exec(`INSERT INTO mailbox_messages(mailbox_id, message_id, uid, flags_json, internal_date)
+                VALUES (?, ?, ?, ?, ?) ON CONFLICT(mailbox_id, uid) DO UPDATE SET
+                message_id=excluded.message_id, flags_json=excluded.flags_json, internal_date=excluded.internal_date`,
+				item.MailboxID, ids[i], item.UID, string(flagsJSON), item.InternalDate.UnixMilli()).Error; err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	return ids, created, err
+}
+
 type cursorValue struct {
 	ReceivedAt int64 `json:"r"`
 	ID         int64 `json:"i"`
@@ -225,6 +404,61 @@ const feedColumns = `messages.id, messages.account_id, messages.direction, messa
 	messages.bcc_json, messages.reply_to_json, messages.snippet, messages.body_state, messages.size_bytes,
 	messages.sent_at, messages.received_at, messages.is_read, messages.is_starred, messages.has_attachments,
 	messages.created_at, messages.updated_at`
+
+// unreadCacheTTL bounds how long an unreadTotal value can be reused. The
+// realtime 80ms-coalesced refresh in App.tsx fires many times per minute;
+// the underlying COUNT(DISTINCT) re-joins the same set on every call. A
+// short TTL turns the burst into one query per window without losing the
+// "the badge updates" feel. Writes that change is_read (UpdateMessage /
+// UpdateMessages) invalidate the entry so a manual mark-read reflects
+// immediately.
+const unreadCacheTTL = 2 * time.Second
+
+type unreadCacheKey struct {
+	AccountID *int64
+	MailboxID *int64
+	Folder    string
+	Query     string
+	IsRead    *bool
+}
+
+type unreadCacheEntry struct {
+	count     int
+	expiresAt time.Time
+}
+
+func (s *Store) cachedUnreadTotal(ctx context.Context, filter ports.MessageFilter) (int, bool, error) {
+	key := unreadCacheKey{AccountID: filter.AccountID, MailboxID: filter.MailboxID, Folder: filter.Folder, Query: filter.Query, IsRead: filter.IsRead}
+	if value, ok := s.unreadCache.Load(key); ok {
+		entry := value.(unreadCacheEntry)
+		if time.Now().Before(entry.expiresAt) {
+			return entry.count, true, nil
+		}
+	}
+	count, err := s.unreadTotal(ctx, filter)
+	if err != nil {
+		return 0, false, err
+	}
+	s.unreadCache.Store(key, unreadCacheEntry{count: count, expiresAt: time.Now().Add(unreadCacheTTL)})
+	return count, false, nil
+}
+
+// invalidateUnreadCache drops every cache entry that could be affected by
+// the given write. Writes that change is_read or insert/delete messages
+// call this; the only filter that survives is one with a query (FTS scope
+// stays the same) or a folder, both of which still need to be re-counted
+// because the underlying set just changed.
+//
+// The brute-force "drop everything" policy is correct but slightly more
+// work than necessary: a per-account or per-mailbox key would be a future
+// improvement once the cache size becomes observable. The current 2s TTL
+// already bounds the staleness window.
+func (s *Store) invalidateUnreadCache() {
+	s.unreadCache.Range(func(key, _ any) bool {
+		s.unreadCache.Delete(key)
+		return true
+	})
+}
 
 func (s *Store) ListMessages(ctx context.Context, filter ports.MessageFilter) (ports.MessagePage, error) {
 	limit := filter.Limit
@@ -259,7 +493,7 @@ func (s *Store) ListMessages(ctx context.Context, filter ports.MessageFilter) (p
 		page.Items = items[:limit]
 		page.NextCursor = encodeCursor(cursorValue{ReceivedAt: last.ReceivedAt, ID: last.ID})
 	}
-	total, err := s.unreadTotal(ctx, filter)
+	total, _, err := s.cachedUnreadTotal(ctx, filter)
 	if err != nil {
 		return ports.MessagePage{}, err
 	}
@@ -284,10 +518,29 @@ func (s *Store) unreadTotal(ctx context.Context, filter ports.MessageFilter) (in
 // and any other query that filters on message text.
 func applyMessageSearch(query *gorm.DB, value string) *gorm.DB {
 	if utf8.RuneCountInString(value) >= 3 {
-		return query.Joins("JOIN message_fts ON message_fts.rowid = messages.id").Where("message_fts MATCH ?", quoteFTS(value))
+		// Append * so single-word queries hit the FTS5 prefix index, matching
+		// "Nexus" against "NexusMail". Phrase queries keep their closing quote
+		// before the wildcard.
+		return query.Joins("JOIN message_fts ON message_fts.rowid = messages.id").Where("message_fts MATCH ?", ftsPrefix(value))
 	}
 	like := "%" + escapeLike(value) + "%"
 	return query.Where("(messages.subject LIKE ? ESCAPE '\\' OR messages.sender LIKE ? ESCAPE '\\' OR messages.recipients LIKE ? ESCAPE '\\' OR messages.body_text LIKE ? ESCAPE '\\')", like, like, like, like)
+}
+
+// ftsPrefix wraps value as a phrase then appends * so a single token becomes a
+// prefix query. Quotes are kept so phrases with whitespace stay phrases.
+func ftsPrefix(value string) string {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return `""`
+	}
+	// If the value already contains an FTS5 operator (quoted phrase, AND/OR,
+	// NEAR, column filter), pass it through unchanged. Only the bare-word
+	// case needs the wildcard.
+	if strings.ContainsAny(trimmed, `"():*`) || strings.Contains(trimmed, " AND ") || strings.Contains(trimmed, " OR ") || strings.Contains(trimmed, " NOT ") {
+		return quoteFTS(trimmed)
+	}
+	return quoteFTS(trimmed) + "*"
 }
 
 // applyMessageScope adds the account, mailbox and folder predicates shared by the
@@ -345,6 +598,7 @@ func (s *Store) UpdateMessages(ctx context.Context, ids []int64, patch ports.Mes
 	}
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
+	s.invalidateUnreadCache()
 	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		for start := 0; start < len(ids); start += sqliteParameterChunk {
 			end := min(start+sqliteParameterChunk, len(ids))
@@ -369,6 +623,7 @@ func (s *Store) GetMessage(ctx context.Context, id int64) (domain.Message, []dom
 func (s *Store) UpdateMessage(ctx context.Context, id int64, patch ports.MessagePatch) (domain.Message, error) {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
+	s.invalidateUnreadCache()
 	updates := map[string]any{"updated_at": time.Now().UnixMilli()}
 	if patch.IsRead != nil {
 		updates["is_read"] = *patch.IsRead

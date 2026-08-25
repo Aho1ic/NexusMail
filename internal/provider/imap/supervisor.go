@@ -13,6 +13,7 @@ import (
 	"mime"
 	"net"
 	"net/mail"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -25,6 +26,8 @@ import (
 	"nexusmail/internal/provider"
 	providerauth "nexusmail/internal/provider/auth"
 	accountservice "nexusmail/internal/service/account"
+
+	"math"
 
 	goimap "github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapclient"
@@ -98,6 +101,13 @@ type Supervisor struct {
 	// lastReconcile tracks when each mailbox last had its flags and deletions
 	// checked against the provider.
 	lastReconcile sync.Map
+	// lastSyncReq throttles RequestMailbox so a passive reader hitting the
+	// feed in a tight loop (or the realtime 80ms-coalesced refresh in App.tsx)
+	// does not push a fresh syncReq every tick. The entry is set whenever a
+	// request is enqueued, regardless of whether the chan accepted it; a missed
+	// drop still counts because the supervisor would have processed the
+	// previous one.
+	lastSyncReq sync.Map
 	// dial overrides transport establishment in tests; nil uses TLS to the account host.
 	dial func(context.Context, domain.Account) (net.Conn, error)
 	// commandStall overrides commandStallWindow so a test can drive the recovery
@@ -210,6 +220,16 @@ func (s *Supervisor) Start(ctx context.Context) error {
 		s.wg.Add(1)
 		go func() {
 			defer s.wg.Done()
+			// bodyWorker has no recover of its own: a panic in MIME parsing or
+			// the FTS5 update trigger would terminate the whole process and
+			// lose the 2 IMAP loops, the send worker, and the other 3 body
+			// workers. Recover here so one bad message cannot take the server
+			// down.
+			defer func() {
+				if r := recover(); r != nil {
+					slog.Error("body worker panicked", "panic", r, "stack", string(debug.Stack()))
+				}
+			}()
 			s.bodyWorker(workerCtx)
 		}()
 	}
@@ -270,16 +290,36 @@ func (s *Supervisor) commandLoop(ctx context.Context, rt *runtime) {
 		}
 		rt.client.Store(client)
 		_ = s.repo.UpdateAccountStatus(ctx, rt.account.ID, "syncing", nil)
+		// Refresh the catalog without holding the command lock so the LIST
+		// round-trip and mailbox upserts do not block the new-mail path.
+		if listErr := s.refreshMailboxCatalog(ctx, rt, client); listErr != nil {
+			s.setError(ctx, rt.account.ID, "backoff", listErr)
+			s.closeCommand(rt, client)
+			if !waitBackoff(ctx, backoff) {
+				return
+			}
+			backoff = min(backoff*2, 5*time.Minute)
+			continue
+		}
 		rt.lock()
-		syncErr := s.syncAll(ctx, rt, client)
+		syncErr := s.syncAllMailboxes(ctx, rt, client)
 		rt.unlock()
 		if syncErr != nil {
+			// OAuth tokens can expire mid-session: the connect succeeded but a
+			// later IMAP command now returns ResponseCodeAuthenticationFailed.
+			// Without this re-check the error flows into the 1s-5m ladder and
+			// hammers the provider, bypassing the auth_error park that exists
+			// on the connect path.
+			syncStatus, syncDelay := "backoff", backoff
+			if isAuthFailure(syncErr) {
+				syncStatus, syncDelay = "auth_error", authBackoff
+			}
 			// A sync that keeps failing used to reconnect with no delay at all,
 			// because the ladder was reset on connect and only the connect path
 			// waited. That is a tight reconnect loop against the provider.
-			s.setError(ctx, rt.account.ID, "backoff", syncErr)
+			s.setError(ctx, rt.account.ID, syncStatus, syncErr)
 			s.closeCommand(rt, client)
-			if !waitBackoff(ctx, backoff) {
+			if !waitBackoff(ctx, syncDelay) {
 				return
 			}
 			backoff = min(backoff*2, 5*time.Minute)
@@ -314,13 +354,13 @@ func (s *Supervisor) commandLoop(ctx context.Context, rt *runtime) {
 				rt.lock()
 				var err error
 				if mailboxID == 0 {
-					err = s.syncRole(ctx, client, rt.account.ID, "inbox")
+					err = s.syncRole(ctx, client, rt.account.ID, "inbox", false)
 				} else {
 					mailbox, mailboxErr := s.repo.GetMailbox(ctx, mailboxID)
 					if mailboxErr != nil {
 						err = mailboxErr
 					} else if mailbox.AccountID == rt.account.ID {
-						err = s.syncMailbox(ctx, client, mailbox)
+						err = s.syncMailbox(ctx, client, mailbox, false)
 					}
 				}
 				rt.unlock()
@@ -331,8 +371,14 @@ func (s *Supervisor) commandLoop(ctx context.Context, rt *runtime) {
 					connected = false
 				}
 			case <-ticker.C:
+				// Refresh the catalog without holding the command lock so a
+				// slow LIST cannot stall the new-mail probe for the whole
+				// 5-minute interval.
+				if listErr := s.refreshMailboxCatalog(ctx, rt, client); listErr != nil {
+					slog.Debug("mailbox catalog refresh failed", "account_id", rt.account.ID, "error", listErr)
+				}
 				rt.lock()
-				err := s.syncAll(ctx, rt, client)
+				err := s.syncAllMailboxes(ctx, rt, client)
 				rt.unlock()
 				if err == nil {
 					s.enqueueBodyCandidates(ctx, rt.account.ID)
@@ -443,7 +489,9 @@ func (s *Supervisor) probeInbox(ctx context.Context, rt *runtime, client *imapcl
 	if unchanged {
 		return nil
 	}
-	return s.syncMailbox(ctx, client, mailbox)
+	// skipReconcile=true: the probe's only job is to surface new mail fast. The
+	// 5-minute periodic sync reconciles flag changes and remote expunges.
+	return s.syncMailbox(ctx, client, mailbox, true)
 }
 
 // pollWithoutIdle drives sync signals for servers lacking IDLE. It returns
@@ -599,8 +647,12 @@ func (s *Supervisor) connect(ctx context.Context, account domain.Account, handle
 	return client, nil
 }
 
-func (s *Supervisor) syncAll(ctx context.Context, rt *runtime, client *imapclient.Client) error {
-	defer observe("sync_all", rt.account.ID)()
+// refreshMailboxCatalog lists the provider's mailboxes and upserts the
+// classification. It runs without holding the command connection: the LIST
+// call is a one-shot round trip, and the database writes are independent of
+// any other IMAP state. The caller is expected to invoke this before
+// syncAllMailboxes so the latter sees a complete catalog.
+func (s *Supervisor) refreshMailboxCatalog(ctx context.Context, rt *runtime, client *imapclient.Client) error {
 	items, err := client.List("", "*", nil).Collect()
 	if err != nil {
 		return err
@@ -622,6 +674,15 @@ func (s *Supervisor) syncAll(ctx context.Context, rt *runtime, client *imapclien
 			return err
 		}
 	}
+	return nil
+}
+
+// syncAllMailboxes iterates the catalog and runs syncMailbox on each non-lazy
+// mailbox, draining queued sync requests between them. The caller must hold
+// the command lock; each syncMailbox re-selects its own mailbox, so this is
+// only safe between mailboxes, never inside one.
+func (s *Supervisor) syncAllMailboxes(ctx context.Context, rt *runtime, client *imapclient.Client) error {
+	defer observe("sync_all", rt.account.ID)()
 	mailboxes, err := s.repo.ListMailboxes(ctx, rt.account.ID)
 	if err != nil {
 		return err
@@ -638,7 +699,7 @@ func (s *Supervisor) syncAll(ctx context.Context, rt *runtime, client *imapclien
 		if mailbox.Role != "inbox" && s.mailboxQuiet(client, mailbox) {
 			continue
 		}
-		if err := s.syncMailbox(ctx, client, mailbox); err != nil {
+		if err := s.syncMailbox(ctx, client, mailbox, false); err != nil {
 			return fmt.Errorf("sync %s: %w", mailbox.RemoteName, err)
 		}
 		// A full sync can span minutes on large accounts. Serve queued inbox
@@ -678,7 +739,7 @@ func (s *Supervisor) drainPending(ctx context.Context, rt *runtime, client *imap
 		select {
 		case mailboxID := <-rt.syncReq:
 			if mailboxID == 0 {
-				if err := s.syncRole(ctx, client, rt.account.ID, "inbox"); err != nil {
+				if err := s.syncRole(ctx, client, rt.account.ID, "inbox", false); err != nil {
 					return err
 				}
 				continue
@@ -690,7 +751,7 @@ func (s *Supervisor) drainPending(ctx context.Context, rt *runtime, client *imap
 			if mailbox.AccountID != rt.account.ID {
 				continue
 			}
-			if err := s.syncMailbox(ctx, client, mailbox); err != nil {
+			if err := s.syncMailbox(ctx, client, mailbox, false); err != nil {
 				return err
 			}
 		default:
@@ -699,15 +760,22 @@ func (s *Supervisor) drainPending(ctx context.Context, rt *runtime, client *imap
 	}
 }
 
-func (s *Supervisor) syncRole(ctx context.Context, client *imapclient.Client, accountID int64, role string) error {
+func (s *Supervisor) syncRole(ctx context.Context, client *imapclient.Client, accountID int64, role string, skipReconcile bool) error {
 	mailbox, err := s.repo.GetMailboxByRole(ctx, accountID, role)
 	if err != nil {
 		return err
 	}
-	return s.syncMailbox(ctx, client, mailbox)
+	return s.syncMailbox(ctx, client, mailbox, skipReconcile)
 }
 
-func (s *Supervisor) syncMailbox(ctx context.Context, client *imapclient.Client, mailbox domain.Mailbox) error {
+// syncMailbox ingests new UIDs and, unless skipReconcile is set, repairs
+// flag/expunge drift. The 5s inbox probe passes skipReconcile=true: the safety
+// net's only job is to surface new mail quickly, and reconciliation on a large
+// inbox holds the command connection for the time the probe is supposed to
+// save. Drift is still caught by the 5-minute periodic sync, so the worst case
+// is a 5-minute delay on flag changes or remote expunges — the same as before
+// the safety net existed at all.
+func (s *Supervisor) syncMailbox(ctx context.Context, client *imapclient.Client, mailbox domain.Mailbox, skipReconcile bool) error {
 	defer observe("sync_mailbox", mailbox.AccountID, "mailbox", mailbox.RemoteName, "role", mailbox.Role)()
 	// CONDSTORE is requested so SELECT reports HIGHESTMODSEQ and the cursor can
 	// record it. Nothing reads it back yet — reconciliation cannot narrow on it
@@ -730,8 +798,15 @@ func (s *Supervisor) syncMailbox(ctx context.Context, client *imapclient.Client,
 	if mailbox.LastUID == 0 {
 		criteria.Since = time.Now().AddDate(0, 0, -30)
 	} else {
+		// Use an explicit upper bound (math.MaxUint32) instead of the 0="*"
+		// sentinel. imapmemserver resolves "*" to uidNext-1, then swaps
+		// start/stop when start > stop, which turned "2:*" into "1:2" when
+		// uidNext was 2 and re-fetched UID 1 every probe. Real servers are
+		// less aggressive about swapping, but capping the range explicitly
+		// makes the behaviour identical everywhere and removes one assumption
+		// from a 5-second hot path.
 		var set goimap.UIDSet
-		set.AddRange(goimap.UID(mailbox.LastUID+1), 0)
+		set.AddRange(goimap.UID(mailbox.LastUID+1), math.MaxUint32)
 		criteria.UID = []goimap.UIDSet{set}
 	}
 	search, err := client.UIDSearch(criteria, nil).Wait()
@@ -740,6 +815,10 @@ func (s *Supervisor) syncMailbox(ctx context.Context, client *imapclient.Client,
 	}
 	uids := search.AllUIDs()
 	lastUID := mailbox.LastUID
+	// pending collects a chunk of built messages so the flush at the end of the
+	// chunk can write them under one writeMu + one transaction. Without this
+	// batching, a 100-message syncMailbox pass would pay 100 commits.
+	var pending []pendingMessage
 	for start := 0; start < len(uids); start += 100 {
 		end := min(start+100, len(uids))
 		fetchOptions := &goimap.FetchOptions{
@@ -782,36 +861,36 @@ func (s *Supervisor) syncMailbox(ctx context.Context, client *imapclient.Client,
 				}
 				continue
 			}
-			created, messageID, err := s.storeFetched(ctx, mailbox, fetched)
+			// Build a MessageInput and its attachments in memory, then commit the
+			// whole chunk to the store at once. The previous shape paid one
+			// writeMu and one commit per message; a 100-message sync paid 100
+			// commits, and WAL fsync is the dominant cost on the new-mail path.
+			input, attachments, err := s.buildFetchedMessage(mailbox, fetched)
 			if err != nil {
 				return err
 			}
-			if created {
-				data := map[string]any{"message_id": messageID, "account_id": mailbox.AccountID, "mailbox_id": mailbox.ID}
-				// The body is still empty at this point, so only the subject can be
-				// scanned. It catches the common "【服务】验证码 123456" shape without
-				// waiting for the prefetch; fetchBody re-runs detection on the full
-				// text and replaces this notification.
-				if fetched.Envelope != nil && withinOTPWindow(fetched.InternalDate) {
-					if code, ok := mailparser.DetectOTP(fetched.Envelope.Subject, "", ""); ok {
-						data["otp_code"] = code
-						data["otp_subject"] = fetched.Envelope.Subject
-					}
-				}
-				s.events.Publish(ports.Event{Type: "NEW_EMAIL", Data: data})
-			}
+			pending = append(pending, pendingMessage{input: input, attachments: attachments, fetched: fetched, uid: uint32(fetched.UID)})
 			if uint32(fetched.UID) > lastUID {
 				lastUID = uint32(fetched.UID)
 			}
 		}
+		if len(pending) > 0 {
+			if err := s.flushPending(ctx, mailbox, pending); err != nil {
+				return err
+			}
+			pending = pending[:0]
+		}
 	}
 	// Appending new UIDs is only half of sync: flags set elsewhere and messages
-	// deleted elsewhere are invisible to the pass above.
-	if err := s.reconcileMailbox(ctx, client, mailbox, selected); err != nil {
-		// Reconciliation is a repair pass, not the ingest path. Failing the mailbox
-		// here would also discard the new mail just stored and stop the cursor from
-		// advancing, so the error is recorded and the sync still commits.
-		slog.Warn("mailbox reconcile failed", "account_id", mailbox.AccountID, "mailbox_id", mailbox.ID, "error", err)
+	// deleted elsewhere are invisible to the pass above. Skip this on the 5s
+	// inbox probe — see the skipReconcile comment on syncMailbox.
+	if !skipReconcile {
+		if err := s.reconcileMailbox(ctx, client, mailbox, selected); err != nil {
+			// Reconciliation is a repair pass, not the ingest path. Failing the mailbox
+			// here would also discard the new mail just stored and stop the cursor from
+			// advancing, so the error is recorded and the sync still commits.
+			slog.Warn("mailbox reconcile failed", "account_id", mailbox.AccountID, "mailbox_id", mailbox.ID, "error", err)
+		}
 	}
 	uidNext := uint32(selected.UIDNext)
 	highest := selected.HighestModSeq
@@ -844,11 +923,10 @@ func (s *Supervisor) reconcileMailbox(ctx context.Context, client *imapclient.Cl
 			return nil
 		}
 	}
-	// UIDVALIDITY changed means ResetMailbox already cleared the mapping, so there
-	// is nothing local left to reconcile against.
-	if mailbox.UIDValidity != 0 && mailbox.UIDValidity != selected.UIDValidity {
-		return nil
-	}
+	// A UIDVALIDITY change is handled inside syncMailbox (ResetMailbox + the
+	// local mailbox.UIDValidity update on the same value-typed struct that
+	// flows into this call), so by the time we reach here the validity has
+	// already been equalised and there is nothing for an extra check to do.
 	stored, err := s.repo.ListMailboxUIDs(ctx, mailbox.ID)
 	if err != nil {
 		return fmt.Errorf("list local uids: %w", err)
@@ -1070,9 +1148,22 @@ func formatAddress(name, address string) string {
 	return name + " <" + address + ">"
 }
 
-func (s *Supervisor) storeFetched(ctx context.Context, mailbox domain.Mailbox, fetched *imapclient.FetchMessageBuffer) (bool, int64, error) {
+// pendingMessage is one row ready to be flushed by the supervisor at the end
+// of a UID chunk. input is the message + mailbox mapping; attachments are
+// kept here so the batch can persist them with the same writeMu section.
+type pendingMessage struct {
+	input       ports.MessageInput
+	attachments []domain.Attachment
+	fetched     *imapclient.FetchMessageBuffer
+	uid         uint32
+}
+
+// buildFetchedMessage turns an IMAP FetchMessageBuffer into the shape the
+// repository ingests. It does no I/O: the supervisor collects a chunk and
+// flushes it under one transaction.
+func (s *Supervisor) buildFetchedMessage(mailbox domain.Mailbox, fetched *imapclient.FetchMessageBuffer) (ports.MessageInput, []domain.Attachment, error) {
 	if fetched.Envelope == nil {
-		return false, 0, nil
+		return ports.MessageInput{}, nil, errors.New("fetched message has no envelope")
 	}
 	envelope := fetched.Envelope
 	rfcID := strings.TrimSpace(envelope.MessageID)
@@ -1109,10 +1200,7 @@ func (s *Supervisor) storeFetched(ctx context.Context, mailbox domain.Mailbox, f
 	for i, flag := range fetched.Flags {
 		flagValues[i] = string(flag)
 	}
-	created, err := s.repo.CreateOrUpdateMessage(ctx, &message, mailbox.ID, uint32(fetched.UID), flagValues, fetched.InternalDate)
-	if err != nil {
-		return false, 0, err
-	}
+	var attachments []domain.Attachment
 	if fetched.BodyStructure != nil {
 		fetched.BodyStructure.Walk(func(path []int, part goimap.BodyStructure) bool {
 			single, ok := part.(*goimap.BodyStructureSinglePart)
@@ -1132,16 +1220,71 @@ func (s *Supervisor) storeFetched(ctx context.Context, mailbox domain.Mailbox, f
 			for i, value := range path {
 				partValues[i] = strconv.Itoa(value)
 			}
-			att := domain.Attachment{MessageID: message.ID, PartID: strings.Join(partValues, "."), Filename: filename, ContentType: single.MediaType(), Disposition: dispositionValue, SizeBytes: int64(single.Size), FetchState: "metadata", CreatedAt: now, UpdatedAt: now}
+			att := domain.Attachment{PartID: strings.Join(partValues, "."), Filename: filename, ContentType: single.MediaType(), Disposition: dispositionValue, SizeBytes: int64(single.Size), FetchState: "metadata", CreatedAt: now, UpdatedAt: now}
 			if single.ID != "" {
 				value := single.ID
 				att.ContentID = &value
 			}
-			_ = s.repo.UpsertAttachment(ctx, &att)
+			attachments = append(attachments, att)
 			return true
 		})
 	}
-	return created, message.ID, nil
+	return ports.MessageInput{
+		Message:      &message,
+		MailboxID:    mailbox.ID,
+		UID:          uint32(fetched.UID),
+		Flags:        flagValues,
+		InternalDate: fetched.InternalDate,
+	}, attachments, nil
+}
+
+// flushPending commits a chunk of built messages under a single writeMu and
+// publishes a NEW_EMAIL event for each newly created row. Attachments are
+// written in the same single-transaction section; MessageID on each
+// attachment is patched to the id the repository assigned.
+func (s *Supervisor) flushPending(ctx context.Context, mailbox domain.Mailbox, pending []pendingMessage) error {
+	inputs := make([]ports.MessageInput, len(pending))
+	for i, item := range pending {
+		inputs[i] = item.input
+	}
+	ids, created, err := s.repo.BatchCreateOrUpdateMessages(ctx, inputs)
+	if err != nil {
+		return err
+	}
+	// Patch attachment rows with the now-known message ids, then batch upsert.
+	var attachments []domain.Attachment
+	for i, item := range pending {
+		if len(item.attachments) == 0 {
+			continue
+		}
+		for j := range item.attachments {
+			item.attachments[j].MessageID = ids[i]
+		}
+		attachments = append(attachments, item.attachments...)
+	}
+	if len(attachments) > 0 {
+		if err := s.repo.BatchUpsertAttachments(ctx, attachments); err != nil {
+			return err
+		}
+	}
+	for i, item := range pending {
+		if !created[i] {
+			continue
+		}
+		data := map[string]any{"message_id": ids[i], "account_id": mailbox.AccountID, "mailbox_id": mailbox.ID}
+		// The body is still empty at this point, so only the subject can be
+		// scanned. It catches the common "【服务】验证码 123456" shape without
+		// waiting for the prefetch; fetchBody re-runs detection on the full
+		// text and replaces this notification.
+		if item.fetched.Envelope != nil && withinOTPWindow(item.fetched.InternalDate) {
+			if code, ok := mailparser.DetectOTP(item.fetched.Envelope.Subject, "", ""); ok {
+				data["otp_code"] = code
+				data["otp_subject"] = item.fetched.Envelope.Subject
+			}
+		}
+		s.events.Publish(ports.Event{Type: "NEW_EMAIL", Data: data})
+	}
+	return nil
 }
 
 func addresses(input []goimap.Address) []string {
@@ -1168,6 +1311,14 @@ func (s *Supervisor) requestSync(rt *runtime) {
 	}
 }
 
+// requestSyncCooldown is the minimum interval between two RequestMailbox
+// signals for the same mailbox. The 5s probe and the IDLE loop are the
+// authoritative source of new-mail detection; this channel only exists to
+// express "the user just opened this folder, prefer not to wait the next
+// probe tick", and a passive reader must not be able to amplify into
+// sustained IMAP traffic.
+const requestSyncCooldown = 5 * time.Second
+
 func (s *Supervisor) RequestMailbox(ctx context.Context, mailboxID int64) error {
 	mailbox, err := s.repo.GetMailbox(ctx, mailboxID)
 	if err != nil {
@@ -1177,6 +1328,13 @@ func (s *Supervisor) RequestMailbox(ctx context.Context, mailboxID int64) error 
 	if err != nil {
 		return err
 	}
+	now := time.Now()
+	if prev, ok := s.lastSyncReq.Load(mailboxID); ok {
+		if now.Sub(prev.(time.Time)) < requestSyncCooldown {
+			return nil
+		}
+	}
+	s.lastSyncReq.Store(mailboxID, now)
 	select {
 	case rt.syncReq <- mailboxID:
 	default:
@@ -1310,10 +1468,13 @@ func (s *Supervisor) enqueueBodyCandidates(ctx context.Context, accountID int64)
 	if err != nil {
 		return
 	}
+	// Pre-filter: the candidate query cannot exclude 'error' or already-seen
+	// rows without a schema change, and the bodyAttempts cap is enforced here
+	// so a body that has already failed maxBodyAttempts times is not retried
+	// for the life of the process. Only the survivors are flipped to 'queued'
+	// in one batch write instead of N single-row UPDATEs.
+	candidates := make([]int64, 0, len(ids))
 	for _, id := range ids {
-		// The candidate query cannot exclude 'error' without a schema change, so
-		// the cap is enforced here: a body that has already failed maxBodyAttempts
-		// times is not retried again for the life of the process.
 		if value, ok := s.bodyAttempts.Load(id); ok {
 			if attempts, valid := value.(int); valid && attempts >= maxBodyAttempts {
 				continue
@@ -1322,10 +1483,18 @@ func (s *Supervisor) enqueueBodyCandidates(ctx context.Context, accountID int64)
 		if _, loaded := s.bodySeen.LoadOrStore(id, struct{}{}); loaded {
 			continue
 		}
-		if err := s.repo.SetMessageBodyState(ctx, id, "queued"); err != nil {
+		candidates = append(candidates, id)
+	}
+	if len(candidates) == 0 {
+		return
+	}
+	if err := s.repo.BatchSetMessageBodyState(ctx, candidates, "queued"); err != nil {
+		for _, id := range candidates {
 			s.bodySeen.Delete(id)
-			continue
 		}
+		return
+	}
+	for _, id := range candidates {
 		select {
 		case s.bodyQueue <- id:
 		case <-ctx.Done():
@@ -1361,11 +1530,15 @@ func (s *Supervisor) bodyWorker(ctx context.Context) {
 					data["otp_subject"] = otp.Subject
 				}
 				s.events.Publish(ports.Event{Type: "MESSAGE_UPDATED", Data: data})
-			}
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(200 * time.Millisecond):
+			} else if !errors.Is(err, context.Canceled) {
+				// Step aside briefly on failure so a flaky provider does not eat
+				// every body slot in a tight loop. maxBodyAttempts already caps the
+				// total attempts per message, this just spreads them out.
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(time.Second):
+				}
 			}
 		}
 	}
@@ -1563,19 +1736,16 @@ func (s *Supervisor) SetSeenBulk(ctx context.Context, messageIDs []int64) ([]int
 	return done, errors.Join(failures...)
 }
 
-// setSeenAccount holds one account's command lock for the whole account and no
-// longer. The 5s inbox probe and the IDLE-driven sync contend for the same lock,
-// so the UID list is chunked and the lock is released before the next account.
+// setSeenAccount holds one account's command lock for the duration of one
+// mailbox at a time, not for the whole account. The 5s inbox probe and the
+// IDLE-driven sync contend for the same lock, so a slow mailbox (large chunk,
+// network latency) cannot block the new-mail path for the rest of the
+// account. The lock is released and re-taken per mailbox; the IMAP connection
+// itself is shared and stays put.
 func (s *Supervisor) setSeenAccount(ctx context.Context, accountID int64, byMailbox map[int64][]ports.MessageLocation) ([]int64, error) {
 	rt, err := s.runtime(accountID)
 	if err != nil {
 		return nil, err
-	}
-	rt.lock()
-	defer rt.unlock()
-	client := rt.client.Load()
-	if client == nil {
-		return nil, errors.New("account is offline")
 	}
 	done := make([]int64, 0)
 	var failures []error
@@ -1583,8 +1753,15 @@ func (s *Supervisor) setSeenAccount(ctx context.Context, accountID int64, byMail
 		if ctx.Err() != nil {
 			return done, ctx.Err()
 		}
+		rt.lock()
+		client := rt.client.Load()
+		if client == nil {
+			rt.unlock()
+			return nil, errors.New("account is offline")
+		}
 		if _, err := client.Select(group[0].Mailbox.RemoteName, nil).Wait(); err != nil {
 			failures = append(failures, fmt.Errorf("select %q: %w", group[0].Mailbox.RemoteName, err))
+			rt.unlock()
 			continue
 		}
 		for start := 0; start < len(group); start += bulkFlagChunk {
@@ -1603,6 +1780,7 @@ func (s *Supervisor) setSeenAccount(ctx context.Context, accountID int64, byMail
 				done = append(done, location.MessageID)
 			}
 		}
+		rt.unlock()
 	}
 	return done, errors.Join(failures...)
 }

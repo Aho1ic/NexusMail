@@ -61,6 +61,21 @@ func (r *recorder) await(t *testing.T, kind string, timeout time.Duration) (port
 	}
 }
 
+// count returns the number of events of the given kind published so far.
+// Tests that need a stable before/after snapshot use this to assert "no new
+// event happened" without draining the signal channel.
+func (r *recorder) count(kind string) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	n := 0
+	for _, event := range r.events {
+		if event.Type == kind {
+			n++
+		}
+	}
+	return n
+}
+
 type literal struct{ *strings.Reader }
 
 func (l literal) Size() int64 { return l.Reader.Size() }

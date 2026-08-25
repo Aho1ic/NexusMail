@@ -498,3 +498,62 @@ func seedAccountMailbox(t *testing.T, store *Store) (domain.Account, domain.Mail
 	}
 	return account, mailboxes[0]
 }
+
+// TestFTSDeleteTriggerShrinksIndex pins the AFTER DELETE trigger on
+// message_fts. The CLAUDE.md warning is that bypassing the trigger paths
+// (writing to messages through anything other than the repo) silently
+// desyncs the index. The repo-driven path is DeleteMailboxUIDs, which
+// removes the mailbox_messages row and then drops any message that is left
+// with no mapping. After the delete the FTS index must no longer match the
+// dropped subject, otherwise the feed would still show the row.
+func TestFTSDeleteTriggerShrinksIndex(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+	account, mailbox := seedAccountMailbox(t, store)
+
+	for index, subject := range []string{"fts-delete-anchor", "fts-delete-other"} {
+		now := time.Now().UnixMilli() + int64(index)
+		digest := sha256.Sum256([]byte(subject))
+		message := domain.Message{
+			AccountID: account.ID, Direction: "incoming", DedupeKey: digest[:], Subject: subject,
+			Sender: "s@x", Recipients: "r@x", FromJSON: "[]", ToJSON: "[]", CCJSON: "[]", BCCJSON: "[]", ReplyToJSON: "[]", ReferencesJSON: "[]",
+			BodyState: "metadata", ReceivedAt: now, CreatedAt: now, UpdatedAt: now,
+		}
+		created, err := store.CreateOrUpdateMessage(ctx, &message, mailbox.ID, uint32(index+1), nil, time.UnixMilli(now))
+		if err != nil || !created {
+			t.Fatalf("seed %d: created=%v err=%v", index, created, err)
+		}
+	}
+
+	// Baseline: searching for the anchor subject must hit the row.
+	page, err := store.ListMessages(ctx, ports.MessageFilter{Query: "fts-delete-anchor", Limit: 10})
+	if err != nil || len(page.Items) != 1 {
+		t.Fatalf("baseline FTS = %#v err=%v", page, err)
+	}
+	anchorID := page.Items[0].ID
+
+	// Drop the only mailbox_messages row for the anchor, then DeleteMailboxUIDs
+	// cascades and removes the message. The DELETE trigger on messages must
+	// shrink the FTS index; if it does not, this query will still return the
+	// row that the user can no longer open.
+	stored, err := store.ListMailboxUIDs(ctx, mailbox.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.DeleteMailboxUIDs(ctx, mailbox.ID, []uint32{stored[0]}); err != nil {
+		t.Fatal(err)
+	}
+	page, err = store.ListMessages(ctx, ports.MessageFilter{Query: "fts-delete-anchor", Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Items) != 0 {
+		t.Errorf("FTS index still matches the deleted subject: %d rows", len(page.Items))
+	}
+	// The non-deleted message must still be searchable.
+	page, err = store.ListMessages(ctx, ports.MessageFilter{Query: "fts-delete-other", Limit: 10})
+	if err != nil || len(page.Items) != 1 {
+		t.Errorf("FTS index over-shrank: %#v err=%v", page, err)
+	}
+	_ = anchorID
+}

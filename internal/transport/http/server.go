@@ -318,6 +318,14 @@ func (s *Server) getMessage(c *gin.Context) {
 	if message.BodyState != "ready" {
 		done := make(chan error, 1)
 		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					// gin.Recovery only covers the request goroutine, not this
+					// background fetch. A panic in MIME parsing or in the FTS5
+					// trigger path here would crash the whole process.
+					done <- fmt.Errorf("body fetch panicked: %v", r)
+				}
+			}()
 			ctx, cancel := context.WithTimeout(s.appCtx, 30*time.Second)
 			defer cancel()
 			done <- s.sync.FetchBody(ctx, id)
@@ -582,7 +590,12 @@ func securityHeaders() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		c.Header("X-Content-Type-Options", "nosniff")
 		c.Header("Referrer-Policy", "no-referrer")
-		c.Header("Content-Security-Policy", "default-src 'self'; connect-src 'self' ws: wss:; img-src 'self' data: http: https:; style-src 'self' 'unsafe-inline'; script-src 'self'; frame-src 'self'")
+		c.Header("X-Frame-Options", "DENY")
+		// frame-ancestors 'none' is the modern equivalent of X-Frame-Options DENY
+		// and is the only directive that actually stops the SPA from being iframed
+		// by a hostile site; without it the cookie+CSRF auth model would let
+		// clickjacking drive state-changing endpoints.
+		c.Header("Content-Security-Policy", "default-src 'self'; connect-src 'self' ws: wss:; img-src 'self' data: http: https:; style-src 'self' 'unsafe-inline'; script-src 'self'; frame-src 'self'; frame-ancestors 'none'")
 		c.Next()
 	}
 }

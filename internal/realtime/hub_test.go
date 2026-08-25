@@ -91,6 +91,55 @@ func TestHubDeliversAfterIdlePeriod(t *testing.T) {
 	}
 }
 
+// TestHubEvictsSlowConsumer covers the eviction branch in Publish. The realtime
+// path is publish-then-fan-out, so a single stuck consumer cannot be allowed to
+// stall the producer for everyone else. When c.send is full, Publish trips the
+// default branch and calls c.stop(); without that branch, a stuck reader would
+// back up the channel forever and freeze every subsequent Publish.
+func TestHubEvictsSlowConsumer(t *testing.T) {
+	hub := New()
+	slow := &client{send: make(chan []byte, 64), done: make(chan struct{})}
+	hub.mu.Lock()
+	hub.clients[slow] = struct{}{}
+	hub.mu.Unlock()
+	t.Cleanup(func() {
+		hub.mu.Lock()
+		delete(hub.clients, slow)
+		hub.mu.Unlock()
+	})
+
+	// Fill the slow client's buffer to capacity. With nobody draining it, the
+	// 64th publish leaves the buffer exactly full and the client is still
+	// alive — every event so far took the buffered branch.
+	for i := 0; i < cap(slow.send); i++ {
+		hub.Publish(ports.Event{Type: "NEW_EMAIL", Data: map[string]any{"i": i}})
+	}
+	if isClientDone(slow) {
+		t.Fatal("slow client was evicted before its buffer was full")
+	}
+
+	// The next publish cannot enqueue: the buffer is full, so the default
+	// branch in Publish fires c.stop() and signals the client to wind down.
+	// Map cleanup is owned by the Serve loop's deferred delete; this test
+	// exercises the eviction signal Publish is responsible for, so a still-
+	// alive Serve loop in production untracks the client on its way out.
+	hub.Publish(ports.Event{Type: "NEW_EMAIL", Data: map[string]any{"i": cap(slow.send)}})
+	select {
+	case <-slow.done:
+	case <-time.After(time.Second):
+		t.Fatal("slow client was not evicted after its buffer filled")
+	}
+}
+
+func isClientDone(c *client) bool {
+	select {
+	case <-c.done:
+		return true
+	default:
+		return false
+	}
+}
+
 func waitForClients(t *testing.T, hub *Hub, count int) {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)

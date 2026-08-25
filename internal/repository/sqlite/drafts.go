@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"nexusmail/internal/domain"
@@ -185,10 +186,24 @@ func (s *Store) CreateBlob(ctx context.Context, blob *domain.BlobObject) error {
 func (s *Store) GetBlob(ctx context.Context, id int64) (domain.BlobObject, error) {
 	var blob domain.BlobObject
 	err := s.db.WithContext(ctx).First(&blob, id).Error
-	if err == nil {
-		_ = s.db.WithContext(ctx).Model(&blob).Update("last_accessed_at", time.Now().UnixMilli()).Error
+	if err != nil {
+		return blob, err
 	}
-	return blob, err
+	// Hold writeMu for the LRU bookkeeping: every other write path does, and
+	// the row is the input to the eviction decision. Without the lock, a
+	// concurrent delete or upsert of the same blob can race the read and the
+	// WAL+8 connection pool can return SQLITE_BUSY. The lookup itself does
+	// not need the lock, but the touch does.
+	s.writeMu.Lock()
+	touchErr := s.db.WithContext(ctx).Model(&blob).Update("last_accessed_at", time.Now().UnixMilli()).Error
+	s.writeMu.Unlock()
+	if touchErr != nil {
+		// The read succeeded; surfacing a write-only error would force callers
+		// to retry a fetch that already has the data they need. Log and return
+		// the blob as-is: the next read will re-touch the row.
+		slog.Warn("touch blob last_accessed_at", "blob_id", id, "error", touchErr)
+	}
+	return blob, nil
 }
 
 func (s *Store) DeleteBlob(ctx context.Context, id int64) error {
