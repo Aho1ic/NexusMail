@@ -84,11 +84,19 @@ func (l literal) Size() int64 { return l.Reader.Size() }
 // assert the polling safety net does not hammer the provider.
 var searchCount atomic.Int64
 
+// loginCount tracks authentications, which is how tests observe a connection
+// being rebuilt: a refresh or a recovery is only real if it logs in again.
+var loginCount atomic.Int64
+
 type countingConn struct{ net.Conn }
 
 func (c countingConn) Write(payload []byte) (int, error) {
-	if bytes.Contains(bytes.ToUpper(payload), []byte("UID SEARCH")) {
+	upper := bytes.ToUpper(payload)
+	if bytes.Contains(upper, []byte("UID SEARCH")) {
 		searchCount.Add(1)
+	}
+	if bytes.Contains(upper, []byte("LOGIN ")) || bytes.Contains(upper, []byte("AUTHENTICATE ")) {
+		loginCount.Add(1)
 	}
 	return c.Conn.Write(payload)
 }

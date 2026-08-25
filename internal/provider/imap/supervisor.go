@@ -115,6 +115,12 @@ type Supervisor struct {
 	// dropIdleNotifications simulates providers that advertise IDLE but never
 	// deliver EXISTS, so tests can exercise the polling safety net.
 	dropIdleNotifications bool
+	// commandRefresh overrides commandRefreshInterval so a test can drive the
+	// scheduled rebuild without waiting out the production interval.
+	commandRefresh time.Duration
+	// failProbe makes probeInbox fail without disturbing the socket, so a test can
+	// exercise the dead-but-open connection that client.Closed() never reports.
+	failProbe atomic.Bool
 }
 
 const maxInlineDraftImportBytes = 1 << 20
@@ -182,6 +188,45 @@ func observe(phase string, accountID int64, attrs ...any) func() {
 // remotely, or the provider refuses the part — was retried every 5 seconds for
 // the life of the process, taking the command connection each time.
 const maxBodyAttempts = 3
+
+// commandRefreshInterval bounds how long one command connection is trusted.
+// It exists because a stale connection is silent rather than broken: QQ stopped
+// reporting new mail on a long-lived connection through both STATUS and SELECT,
+// so every detection path agreed there was nothing to fetch and mail waited tens
+// of minutes for something to replace the connection. Ten minutes bounds that
+// worst case at roughly one periodic sync while costing one extra LOGIN per
+// account per ten minutes — negligible next to the 720 STATUS probes an hour the
+// same connection already sends.
+//
+// It is deliberately not provider-specific: a connection that has been up for
+// ten minutes is not more valuable than a fresh one on any provider, and the
+// providers that need this are exactly the ones least likely to document it.
+const commandRefreshInterval = 10 * time.Minute
+
+// commandRefreshJitter spreads the rebuild so accounts do not reconnect in
+// lockstep after a restart.
+const commandRefreshJitter = 2 * time.Minute
+
+// commandRefreshOrDefault returns the interval before the command connection is
+// rebuilt, jittered. Tests override the base to drive the path in seconds.
+func (s *Supervisor) commandRefreshOrDefault() time.Duration {
+	base := commandRefreshInterval
+	jitter := int64(commandRefreshJitter)
+	if s.commandRefresh > 0 {
+		base = s.commandRefresh
+		// Keep the override dominant: a fixed 2-minute spread would swamp a
+		// 2-second test interval and the rebuild would never be observed.
+		jitter = int64(base) / 4
+	}
+	return base + time.Duration(rand.Int64N(jitter+1))
+}
+
+// maxProbeFailures is how many consecutive inbox probes may fail before the
+// command connection is torn down and rebuilt. Three at realtimePollInterval is
+// ~15 seconds of evidence, which is long enough not to react to one transient
+// error and short enough that new mail is not waiting for the 5-minute periodic
+// sync to notice the connection is dead.
+const maxProbeFailures = 3
 
 // authBackoff is the retry delay after the provider rejected the credentials.
 // Reconnecting every second with a password the server already refused is how
@@ -354,6 +399,23 @@ func (s *Supervisor) commandLoop(ctx context.Context, rt *runtime) {
 		// The command connection owns sync and is always alive, so the safety
 		// net lives here rather than inside the IDLE state.
 		probe := time.NewTicker(realtimePollInterval)
+		// Rebuild the command connection periodically. A long-lived connection to
+		// QQ stops reflecting new mail: neither the 5-second STATUS probe nor the
+		// 5-minute SELECT sees it, so mail sat unnoticed for tens of minutes and
+		// then arrived in one batch the moment the connection was replaced —
+		// measured on this account as four messages spanning 41 minutes of
+		// arrivals all stored in the same second, and a 42-minute delay that
+		// resolved 6 seconds after an unrelated reconnect. The IDLE connection
+		// already refreshes on its own timer for the same reason; the command
+		// connection had no equivalent and could stay stale indefinitely.
+		refresh := time.NewTimer(s.commandRefreshOrDefault())
+		// probeFailures counts consecutive probe errors on this connection. A
+		// probe is one STATUS on a connection that just authenticated, so
+		// repeated failures mean the connection is no longer usable even when
+		// go-imap has not noticed it closed — a socket the host's sleep or a NAT
+		// dropped without an RST fails instantly and forever, and the old code
+		// only logged that at Debug and waited for client.Closed().
+		probeFailures := 0
 		connected := true
 		for connected {
 			select {
@@ -364,6 +426,7 @@ func (s *Supervisor) commandLoop(ctx context.Context, rt *runtime) {
 				probeErr := s.probeInbox(ctx, rt, client)
 				rt.unlock()
 				if probeErr == nil {
+					probeFailures = 0
 					s.enqueueBodyCandidates(ctx, rt.account.ID)
 				} else if isRateLimited(probeErr) {
 					// A probe that hits the throttle must not be followed by
@@ -374,9 +437,18 @@ func (s *Supervisor) commandLoop(ctx context.Context, rt *runtime) {
 					slog.Debug("mail inbox probe rate-limited, backing off", "account_id", rt.account.ID, "error", probeErr)
 					connected = false
 				} else {
-					// A missing or misclassified inbox must not tear down the
-					// connection; client.Closed() covers real transport loss.
-					slog.Debug("mail inbox probe failed", "account_id", rt.account.ID, "error", probeErr)
+					// A single failure must not tear down the connection: a
+					// missing or misclassified inbox is a local problem that
+					// reconnecting cannot fix. Sustained failure is different —
+					// it is the signature of a connection that is dead without
+					// being closed, and the only way out is a reconnect.
+					probeFailures++
+					slog.Debug("mail inbox probe failed", "account_id", rt.account.ID, "failures", probeFailures, "error", probeErr)
+					if probeFailures >= maxProbeFailures {
+						slog.Warn("mail inbox probe failing repeatedly, reconnecting",
+							"account_id", rt.account.ID, "failures", probeFailures, "error", probeErr)
+						connected = false
+					}
 				}
 			case mailboxID := <-rt.syncReq:
 				rt.lock()
@@ -414,12 +486,23 @@ func (s *Supervisor) commandLoop(ctx context.Context, rt *runtime) {
 				if err != nil {
 					connected = false
 				}
+			case <-refresh.C:
+				// A scheduled rebuild, not a failure: leave the ladder and the
+				// account status alone so this never looks like an outage.
+				slog.Debug("refreshing command connection", "account_id", rt.account.ID)
+				connected = false
 			case <-client.Closed():
 				connected = false
 			}
 		}
 		ticker.Stop()
 		probe.Stop()
+		if !refresh.Stop() {
+			select {
+			case <-refresh.C:
+			default:
+			}
+		}
 		s.closeCommand(rt, client)
 	}
 }
@@ -538,6 +621,11 @@ func (s *Supervisor) probeInbox(ctx context.Context, rt *runtime, client *imapcl
 	if err != nil {
 		return err
 	}
+	if s.failProbe.Load() {
+		// Test hook: fail the probe while leaving the socket healthy, which is
+		// what a NAT-dropped or sleep-severed connection looks like to this loop.
+		return errors.New("probe failed by test hook")
+	}
 	status, err := client.Status(mailbox.RemoteName, &goimap.StatusOptions{UIDNext: true, UIDValidity: true}).Wait()
 	if err != nil {
 		return err
@@ -547,6 +635,16 @@ func (s *Supervisor) probeInbox(ctx context.Context, rt *runtime, client *imapcl
 	if unchanged {
 		return nil
 	}
+	// The moment the provider first admitted the mailbox moved. Without this the
+	// only timestamps available are the message's InternalDate and the row's
+	// created_at, which cannot distinguish "the provider told us late" from "we
+	// asked late" — the two have opposite fixes.
+	stored := uint32(0)
+	if mailbox.UIDNext != nil {
+		stored = *mailbox.UIDNext
+	}
+	slog.Debug("mail inbox probe saw movement", "account_id", rt.account.ID,
+		"status_uidnext", uint32(status.UIDNext), "stored_uidnext", stored)
 	// skipReconcile=true: the probe's only job is to surface new mail fast. The
 	// 5-minute periodic sync reconciles flag changes and remote expunges.
 	return s.syncMailbox(ctx, client, mailbox, true)
