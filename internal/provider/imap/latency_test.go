@@ -124,9 +124,28 @@ func (h *harness) deliver(t *testing.T, subject string) {
 	}
 }
 
-func newHarness(t *testing.T) *harness {
+// harnessOption tunes the fake provider a harness stands up. It exists so a test
+// can model a provider that lacks an extension: QQ advertises neither MOVE nor
+// UIDPLUS on some connections, and the code paths that only run without them are
+// otherwise unreachable in tests.
+type harnessOption func(*harnessConfig)
+
+type harnessConfig struct{ caps goimap.CapSet }
+
+// withoutMoveAndUIDPlus advertises bare IMAP4rev1. IMAP4rev2 implies both MOVE and
+// UIDPLUS, so dropping it is what forces the COPY + \Deleted + EXPUNGE path.
+func withoutMoveAndUIDPlus() harnessOption {
+	return func(cfg *harnessConfig) { cfg.caps = goimap.CapSet{goimap.CapIMAP4rev1: {}} }
+}
+
+func newHarness(t *testing.T, options ...harnessOption) *harness {
 	t.Helper()
 	const username, password = "mail@example.com", "test-password"
+
+	cfg := harnessConfig{caps: goimap.CapSet{goimap.CapIMAP4rev1: {}, goimap.CapIMAP4rev2: {}}}
+	for _, option := range options {
+		option(&cfg)
+	}
 
 	memServer := imapmemserver.New()
 	user := imapmemserver.NewUser(username, password)
@@ -139,7 +158,7 @@ func newHarness(t *testing.T) *harness {
 			return memServer.NewSession(), nil, nil
 		},
 		InsecureAuth: true,
-		Caps:         goimap.CapSet{goimap.CapIMAP4rev1: {}, goimap.CapIMAP4rev2: {}},
+		Caps:         cfg.caps,
 	})
 	listener, err := net.Listen("tcp", "localhost:0")
 	if err != nil {

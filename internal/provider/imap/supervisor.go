@@ -351,7 +351,7 @@ func (s *Supervisor) commandLoop(ctx context.Context, rt *runtime) {
 		_ = s.repo.UpdateAccountStatus(ctx, rt.account.ID, "syncing", nil)
 		// Refresh the catalog without holding the command lock so the LIST
 		// round-trip and mailbox upserts do not block the new-mail path.
-		if listErr := s.refreshMailboxCatalog(ctx, rt, client); listErr != nil {
+		if _, listErr := s.refreshMailboxCatalog(ctx, rt, client); listErr != nil {
 			s.setError(ctx, rt.account.ID, "backoff", listErr)
 			s.closeCommand(rt, client)
 			if !waitBackoff(ctx, backoff) {
@@ -474,7 +474,7 @@ func (s *Supervisor) commandLoop(ctx context.Context, rt *runtime) {
 				// Refresh the catalog without holding the command lock so a
 				// slow LIST cannot stall the new-mail probe for the whole
 				// 5-minute interval.
-				if listErr := s.refreshMailboxCatalog(ctx, rt, client); listErr != nil {
+				if _, listErr := s.refreshMailboxCatalog(ctx, rt, client); listErr != nil {
 					slog.Debug("mailbox catalog refresh failed", "account_id", rt.account.ID, "error", listErr)
 				}
 				rt.lock()
@@ -821,14 +821,20 @@ func (s *Supervisor) connect(ctx context.Context, account domain.Account, handle
 }
 
 // refreshMailboxCatalog lists the provider's mailboxes and upserts the
-// classification. It runs without holding the command connection: the LIST
-// call is a one-shot round trip, and the database writes are independent of
-// any other IMAP state. The caller is expected to invoke this before
-// syncAllMailboxes so the latter sees a complete catalog.
-func (s *Supervisor) refreshMailboxCatalog(ctx context.Context, rt *runtime, client *imapclient.Client) error {
+// classification. The LIST call is a one-shot round trip and the database writes
+// are independent of any other IMAP state, so the sync callers deliberately run
+// it *without* the command lock, keeping it off the new-mail path; it is also
+// safe to call while holding the lock, which ensureArchiveMailbox does because it
+// must not race another writer between LIST and CREATE. The sync path is expected
+// to invoke it before syncAllMailboxes so the latter sees a complete catalog.
+//
+// It returns the LIST entries, because the mailbox attributes are not persisted
+// and a caller that needs them — ensureArchiveMailbox looks for \Noselect
+// containers — would otherwise have to LIST a second time.
+func (s *Supervisor) refreshMailboxCatalog(ctx context.Context, rt *runtime, client *imapclient.Client) ([]*goimap.ListData, error) {
 	items, err := client.List("", "*", nil).Collect()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	now := time.Now().UnixMilli()
 	for _, item := range items {
@@ -844,10 +850,10 @@ func (s *Supervisor) refreshMailboxCatalog(ctx context.Context, rt *runtime, cli
 		}
 		mailbox := domain.Mailbox{AccountID: rt.account.ID, RemoteName: item.Mailbox, DisplayName: item.Mailbox, Delimiter: delimiter, Role: role, SyncMode: mode, CreatedAt: now, UpdatedAt: now}
 		if err := s.repo.UpsertMailbox(ctx, &mailbox); err != nil {
-			return err
+			return nil, err
 		}
 	}
-	return nil
+	return items, nil
 }
 
 // syncAllMailboxes iterates the catalog and runs syncMailbox on each non-lazy
@@ -1937,13 +1943,6 @@ func (s *Supervisor) Archive(ctx context.Context, messageID int64) error {
 	if err != nil {
 		return err
 	}
-	destination, err := s.repo.GetMailboxByRole(ctx, location.Account.ID, "archive")
-	if err != nil {
-		return errors.New("archive mailbox is unavailable")
-	}
-	if destination.ID == location.Mailbox.ID {
-		return nil
-	}
 	rt, err := s.runtime(location.Account.ID)
 	if err != nil {
 		return err
@@ -1953,6 +1952,13 @@ func (s *Supervisor) Archive(ctx context.Context, messageID int64) error {
 	client := rt.client.Load()
 	if client == nil {
 		return errors.New("account is offline")
+	}
+	destination, err := s.ensureArchiveMailbox(ctx, rt, client)
+	if err != nil {
+		return err
+	}
+	if destination.ID == location.Mailbox.ID {
+		return nil
 	}
 	if _, err := client.Select(location.Mailbox.RemoteName, nil).Wait(); err != nil {
 		return err
@@ -1965,6 +1971,15 @@ func (s *Supervisor) Archive(ctx context.Context, messageID int64) error {
 		}
 		return s.repo.MoveMessageLocation(ctx, messageID, location.Mailbox.ID, destination.ID, firstDestinationUID(data.DestUIDs))
 	}
+	// COPY + \Deleted + expunge is the fallback. The expunge is not optional: the
+	// local row is dropped from the source mailbox either way, so a message left
+	// behind on the server is one the user archived here and still sees in the
+	// provider's own web client. QQ advertises neither MOVE nor UIDPLUS on some
+	// connections, which is exactly the path that has to remove it.
+	expungeSafe, err := noPendingDeletes(client)
+	if err != nil {
+		return err
+	}
 	copyData, err := client.Copy(uidSet, destination.RemoteName).Wait()
 	if err != nil {
 		return err
@@ -1972,16 +1987,154 @@ func (s *Supervisor) Archive(ctx context.Context, messageID int64) error {
 	if _, err = client.Store(uidSet, &goimap.StoreFlags{Op: goimap.StoreFlagsAdd, Silent: true, Flags: []goimap.Flag{goimap.FlagDeleted}}, nil).Collect(); err != nil {
 		return err
 	}
-	if client.Caps().Has(goimap.CapUIDPlus) {
+	switch {
+	case client.Caps().Has(goimap.CapUIDPlus):
 		if _, err = client.UIDExpunge(uidSet).Collect(); err != nil {
 			return err
 		}
+	case expungeSafe:
+		// Plain EXPUNGE removes every \Deleted message in the mailbox, so it is only
+		// safe when this message is the only one carrying the flag. Another client's
+		// pending deletes must not be finalised as a side effect of archiving.
+		if _, err = client.Expunge().Collect(); err != nil {
+			return err
+		}
+	default:
+		slog.Warn("archive left message on server: mailbox has other \\Deleted messages and provider lacks UIDPLUS",
+			"account_id", location.Account.ID, "mailbox", location.Mailbox.RemoteName, "uid", location.UID)
 	}
 	var destinationUID *uint32
 	if copyData != nil {
 		destinationUID = firstDestinationUID(copyData.DestUIDs)
 	}
 	return s.repo.MoveMessageLocation(ctx, messageID, location.Mailbox.ID, destination.ID, destinationUID)
+}
+
+// noPendingDeletes reports whether the selected mailbox currently holds no
+// message flagged \Deleted, which is the precondition for a plain EXPUNGE being
+// equivalent to expunging one UID.
+//
+// It is deliberately conservative: only a search that came back and was empty
+// answers true. An error, or a response whose set cannot be read as UIDs, answers
+// false, because losing another client's pending deletes is worse than leaving one
+// archived message on the server.
+func noPendingDeletes(client *imapclient.Client) (bool, error) {
+	data, err := client.UIDSearch(&goimap.SearchCriteria{Flag: []goimap.Flag{goimap.FlagDeleted}}, nil).Wait()
+	if err != nil {
+		return false, err
+	}
+	if data.All == nil {
+		return true, nil
+	}
+	set, ok := data.All.(goimap.UIDSet)
+	if !ok {
+		return false, nil
+	}
+	// A dynamic set ("*") is a server bug that AllUIDs would panic on; treat it as
+	// unknown rather than empty.
+	uids, ok := set.Nums()
+	if !ok {
+		return false, nil
+	}
+	return len(uids) == 0, nil
+}
+
+// archiveCandidateNames are the mailbox names tried when creating an archive
+// folder, in order. Each must classify as the archive role via
+// provider.ClassifyMailbox, otherwise the folder would be created and then not
+// found. The plain root-level name comes first because that is where a provider
+// which allows it puts a real sibling of INBOX.
+var archiveCandidateNames = []string{"Archive", "Archives"}
+
+// ensureArchiveMailbox returns the account's archive mailbox, creating one on the
+// provider when none exists.
+//
+// QQ and 163 ship no archive folder and advertise no \Archive special-use
+// attribute, so the role was simply absent and every archive attempt failed with
+// "archive mailbox is unavailable". Creating the folder is what makes the action
+// mean something on those providers, and it is done once: the second call finds
+// the role and returns immediately.
+//
+// The caller must hold the command lock — this issues CREATE and LIST on the
+// command connection.
+func (s *Supervisor) ensureArchiveMailbox(ctx context.Context, rt *runtime, client *imapclient.Client) (domain.Mailbox, error) {
+	if mailbox, err := s.repo.GetMailboxByRole(ctx, rt.account.ID, "archive"); err == nil {
+		return mailbox, nil
+	}
+	// The catalog may predate a folder created in another client. Re-list before
+	// concluding the account has no archive at all.
+	items, err := s.refreshMailboxCatalog(ctx, rt, client)
+	if err != nil {
+		return domain.Mailbox{}, err
+	}
+	if mailbox, err := s.repo.GetMailboxByRole(ctx, rt.account.ID, "archive"); err == nil {
+		return mailbox, nil
+	}
+	var createErrs []error
+	for _, name := range archiveCandidateNames {
+		for _, candidate := range archivePaths(name, items) {
+			if err := client.Create(candidate, archiveCreateOptions(client)).Wait(); err != nil {
+				createErrs = append(createErrs, fmt.Errorf("create %q: %w", candidate, err))
+				continue
+			}
+			slog.Info("created archive mailbox", "account_id", rt.account.ID, "mailbox", candidate)
+			// Trust LIST, not the name that was requested: a provider is free to
+			// place the folder somewhere else, and the stored remote name has to be
+			// the one SELECT and COPY will accept.
+			if _, err := s.refreshMailboxCatalog(ctx, rt, client); err != nil {
+				return domain.Mailbox{}, err
+			}
+			if mailbox, err := s.repo.GetMailboxByRole(ctx, rt.account.ID, "archive"); err == nil {
+				return mailbox, nil
+			}
+			return domain.Mailbox{}, fmt.Errorf("created archive mailbox %q but it did not classify as archive", candidate)
+		}
+	}
+	if len(createErrs) > 0 {
+		return domain.Mailbox{}, fmt.Errorf("archive mailbox is unavailable: %w", errors.Join(createErrs...))
+	}
+	return domain.Mailbox{}, errors.New("archive mailbox is unavailable")
+}
+
+// archiveCreateOptions asks for the \Archive special-use attribute when the
+// provider supports CREATE-SPECIAL-USE, so a server that understands roles
+// records this folder as the archive for every other client too. QQ and 163 do
+// not advertise it and get a plain CREATE.
+func archiveCreateOptions(client *imapclient.Client) *goimap.CreateOptions {
+	if !client.Caps().Has(goimap.Cap("CREATE-SPECIAL-USE")) {
+		return nil
+	}
+	return &goimap.CreateOptions{SpecialUse: []goimap.MailboxAttr{goimap.MailboxAttrArchive}}
+}
+
+// archivePaths returns where to try creating an archive folder called name: at
+// the root first, then under each \Noselect container the provider exposes.
+//
+// QQ accepts both, but a provider that only allows user folders beneath a
+// container ("其他文件夹" on QQ, "[Gmail]" on Gmail) rejects the root-level CREATE,
+// and the nested path is the one that works there. \Noselect is the server's own
+// statement that a folder holds only children, which is why the attribute is used
+// rather than guessing from the stored role — a top-level folder the user created
+// for their own mail must never become the archive's parent.
+func archivePaths(name string, items []*goimap.ListData) []string {
+	paths := []string{name}
+	for _, item := range items {
+		if item.Delim == 0 {
+			continue
+		}
+		noselect := false
+		for _, attr := range item.Attrs {
+			if attr == goimap.MailboxAttrNoSelect {
+				noselect = true
+				break
+			}
+		}
+		if !noselect {
+			continue
+		}
+		paths = append(paths, item.Mailbox+string(item.Delim)+name)
+	}
+	return paths
 }
 
 // SetSeenBulk adds \Seen to many messages, grouped so each account's command
