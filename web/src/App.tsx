@@ -108,7 +108,11 @@ function MailboxApp({ onLogout }: { onLogout: () => void }) {
   }, [viewParams])
 
   useEffect(() => { loadAccounts() }, [loadAccounts])
-  useEffect(() => { loadMailboxes(selectedAccount); setSelectedMailbox(null) }, [selectedAccount, loadMailboxes])
+  // Only the folder list is loaded here. Clearing the selected mailbox belongs to
+  // the two handlers that change the account, which do it in the same render — an
+  // effect would clear it one render late and spend a feed request on a mailbox the
+  // new account cannot see.
+  useEffect(() => { loadMailboxes(selectedAccount) }, [selectedAccount, loadMailboxes])
   useEffect(() => { const timer = window.setTimeout(() => setDebouncedQuery(query.trim()), 250); return () => clearTimeout(timer) }, [query])
   useEffect(() => { loadMessages() }, [loadMessages])
 
@@ -177,7 +181,10 @@ function MailboxApp({ onLogout }: { onLogout: () => void }) {
 
   useKeyboard(preferences.keyboardShortcuts, messages, selected, openMessage, () => compose(), () => mutateMessage({ archive: true }))
 
-  async function logout() { try { await api.logout() } finally { onLogout() } }
+  // The local session ends either way. Swallowing the failure rather than letting
+  // `finally` re-throw keeps a rejected DELETE from escaping the click handler as
+  // an unhandled rejection, which is all the caller would ever see of it.
+  async function logout() { try { await api.logout() } catch { /* the session is over locally regardless */ } finally { onLogout() } }
   const accountMap = useMemo(() => new Map(accounts.map(account => [account.id, account])), [accounts])
   // The server counts the whole view; the loaded page only holds 40 rows, so
   // counting locally reported "0 unread" on any view whose unread mail sits past

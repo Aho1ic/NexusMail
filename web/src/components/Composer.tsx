@@ -79,7 +79,7 @@ export function Composer({ accounts, replyTo, initialDraft, onClose, onSent }: P
     } catch (err) { setStatus(messageOf(err)) }
   }
   return <div className="modal-backdrop"><div className="flex h-[min(92vh,760px)] w-[min(94vw,760px)] flex-col overflow-hidden rounded-[1.7rem] bg-white shadow-2xl">
-    <header className="flex items-center justify-between border-b border-black/5 px-5 py-4"><div><h2 className="font-serif text-2xl">新邮件</h2><p className="text-[10px] text-black/35">{status}</p></div><button onClick={onClose} className="icon-button"><X size={19} /></button></header>
+    <header className="flex items-center justify-between border-b border-black/5 px-5 py-4"><div><h2 className="font-serif text-2xl">新邮件</h2><p className="text-[10px] text-black/35">{status}</p></div><button onClick={onClose} aria-label="关闭" className="icon-button"><X size={19} /></button></header>
     <div className="flex-1 overflow-y-auto p-5">
       <select value={accountID} disabled={Boolean(draft)} onChange={event => setAccountID(Number(event.target.value))} className="input mb-2 disabled:opacity-60">{accounts.map(account => <option key={account.id} value={account.id}>{account.display_name || account.email}</option>)}</select>
       <ComposerField label="收件人" value={to} onChange={setTo} placeholder="name@example.com，多个地址用逗号分隔" />
@@ -87,7 +87,7 @@ export function Composer({ accounts, replyTo, initialDraft, onClose, onSent }: P
       <ComposerField label="主题" value={subject} onChange={setSubject} />
       <textarea value={body} onChange={event => setBody(event.target.value)} className="mt-3 min-h-[320px] w-full resize-none rounded-2xl border border-black/5 bg-paper/50 p-4 text-sm leading-6 outline-none focus:ring-2 focus:ring-pine/20" placeholder="写点什么…" />
     </div>
-    <footer className="flex items-center justify-between border-t border-black/5 px-5 py-4"><label className="icon-button cursor-pointer"><Paperclip size={18} /><input type="file" className="hidden" onChange={event => attach(event.target.files?.[0])} /></label><button disabled={busy || !accountID || !to.trim()} onClick={send} className="button-primary">{busy ? <LoaderCircle className="animate-spin" size={17} /> : <Send size={17} />}发送</button></footer>
+    <footer className="flex items-center justify-between border-t border-black/5 px-5 py-4"><label className="icon-button cursor-pointer"><Paperclip size={18} /><input type="file" aria-label="添加附件" className="hidden" onChange={event => attach(event.target.files?.[0])} /></label><button disabled={busy || !accountID || !to.trim()} onClick={send} className="button-primary">{busy ? <LoaderCircle className="animate-spin" size={17} /> : <Send size={17} />}发送</button></footer>
   </div></div>
 }
 
