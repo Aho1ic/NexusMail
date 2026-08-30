@@ -92,7 +92,39 @@ func sameOrigin(request *http.Request, publicURL string) bool {
 		return false
 	}
 	actual, err := url.Parse(origin)
-	return err == nil && subtle.ConstantTimeCompare([]byte(strings.ToLower(actual.Host)), []byte(strings.ToLower(expected.Host))) == 1 && actual.Scheme == expected.Scheme
+	if err != nil || !isOriginURL(actual) || !isOriginURL(expected) {
+		return false
+	}
+	return strings.EqualFold(actual.Scheme, expected.Scheme) &&
+		subtle.ConstantTimeCompare([]byte(strings.ToLower(actual.Hostname())), []byte(strings.ToLower(expected.Hostname()))) == 1 &&
+		effectiveOriginPort(actual) == effectiveOriginPort(expected)
+}
+
+// isOriginURL admits only the scheme, host and optional port that an Origin header
+// is allowed to contain. url.Parse is deliberately permissive — it accepts a path,
+// query and userinfo — but those are not origins and accepting them broadens the
+// CSRF trust boundary beyond the browser's serialization rules.
+func isOriginURL(value *url.URL) bool {
+	return value != nil && value.Scheme != "" && value.Hostname() != "" && value.User == nil &&
+		value.Path == "" && value.RawPath == "" && value.RawQuery == "" && value.Fragment == ""
+}
+
+// effectiveOriginPort makes https://mail.example and https://mail.example:443 the
+// same origin. Browsers omit a default port when serializing Origin, while operators
+// commonly include it in PublicURL; comparing URL.Host directly rejected every
+// cookie-authenticated mutation in that otherwise valid deployment.
+func effectiveOriginPort(value *url.URL) string {
+	if port := value.Port(); port != "" {
+		return port
+	}
+	switch value.Scheme {
+	case "http":
+		return "80"
+	case "https":
+		return "443"
+	default:
+		return ""
+	}
 }
 
 const (

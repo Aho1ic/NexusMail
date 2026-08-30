@@ -400,6 +400,18 @@ func TestSameOrigin(t *testing.T) {
 		{"http://LocalHost:13737", "http://localhost:13737", true},
 		{"http://localhost:13737", "https://localhost:13737", false},
 		{"http://localhost", "http://localhost:13737", false},
+		// Origin serialisation omits default ports, while PublicURL is commonly
+		// configured with one. They still name exactly the same origin.
+		{"https://mail.example", "https://mail.example:443", true},
+		{"https://mail.example:443", "https://mail.example", true},
+		{"http://mail.example", "http://mail.example:80", true},
+		{"http://mail.example:443", "http://mail.example", false},
+		{"HTTPS://MAIL.EXAMPLE", "https://mail.example:443", true},
+		// url.Parse accepts all of these, but none can be an Origin header: accepting
+		// one would make our CSRF boundary looser than the browser's own model.
+		{"https://mail.example/path", "https://mail.example", false},
+		{"https://mail.example?next=https://attacker.example", "https://mail.example", false},
+		{"https://user@mail.example", "https://mail.example", false},
 		{"http://attacker.example", "http://localhost:13737", false},
 		{"not a url at all", "http://localhost:13737", false},
 	}
