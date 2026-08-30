@@ -99,7 +99,8 @@ cd web && npx playwright test e2e/mailbox.spec.ts
 
 - `authenticate()` 是双通道：`X-API-Key` 命中即短路放行（外部客户端，不校验 CSRF）；否则走 HttpOnly cookie session，非幂等方法额外要求 `X-CSRF-Token` 与同源检查。
 - 邮箱角色与同步档位由 `provider.ClassifyMailbox` 决定（`realtime`/`periodic`/`lazy`），先看 IMAP special-use attribute，再回退到名称匹配（含中文名）。新增服务商差异应收敛到 `internal/provider` 的 preset 与该函数。
-- 前端是单文件应用：`web/src/App.tsx`（≈435 行）承载全部 UI，无 router、无状态库；`lib/api.ts` 是极薄请求封装，`types.ts` 手写对齐 OpenAPI。新增 UI 优先扩展现有结构，不要顺手引入组件框架。
+- 前端无 router、无状态库：`web/src/App.tsx`（≈220 行）只负责装配与"当前视图"这一份状态，UI 拆到 `components/`（9 个），跨视图行为拆到 `hooks/`（`useRealtime` 持有唯一 socket，`useKeyboard` 绑定单键快捷键），纯函数拆到 `lib/`（`api.ts` 极薄请求封装、`format.ts`、`messagehtml.ts`、`notifications.ts`、`preferences.ts`），`types.ts` 手写对齐 OpenAPI。新增 UI 优先扩展现有结构，不要顺手引入组件框架。
+- 前端"当前视图"只有一个定义：`App.tsx` 的 `viewParams()`。feed 列表与 mark-all-read 共用它，因此 `account_id`/`mailbox_id`/`query` 不会与屏幕上显示的邮件脱节。切账户与回 All Inboxes 时清 `selectedMailbox` 的责任在两个 handler 里（同一次 render 内完成），不要挪到 effect：effect 晚一个 render，会先按旧 mailbox 多发一次 feed 请求。
 - `internal/transport/http/static/dist` 由 `make web-build` 从 `web/dist` 复制并 `go:embed`，是生成产物，禁止手工编辑。
 
 ## 版本与发布
