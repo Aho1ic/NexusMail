@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"nexusmail/internal/domain"
+	"nexusmail/internal/ports"
 
 	"gorm.io/gorm"
 )
@@ -245,7 +246,11 @@ func (s *Store) DeleteDraftAttachment(ctx context.Context, draftID, attachmentID
 		return result.Error
 	}
 	if result.RowsAffected != 1 {
-		return gorm.ErrRecordNotFound
+		// Classified, so the transport answers 404. A bare gorm.ErrRecordNotFound
+		// is unclassified and would be reported as a redacted 500, telling the
+		// client its request failed for an unknown reason rather than that the
+		// attachment does not exist — or does not belong to this draft.
+		return ports.NotFoundf("%w", gorm.ErrRecordNotFound)
 	}
 	return nil
 }

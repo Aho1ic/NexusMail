@@ -20,12 +20,20 @@ import (
 func (s *Server) listMessages(c *gin.Context) {
 	filter := ports.MessageFilter{Folder: c.Query("folder"), Query: strings.TrimSpace(c.Query("query")), Cursor: c.Query("cursor")}
 	filter.Limit, _ = strconv.Atoi(c.Query("limit"))
-	if value, ok := optionalInt64(c, "account_id"); ok {
-		filter.AccountID = value
+	accountID, ok := optionalInt64(c, "account_id")
+	if !ok {
+		return
 	}
-	if value, ok := optionalInt64(c, "mailbox_id"); ok {
-		filter.MailboxID = value
-		_ = s.sync.RequestMailbox(c.Request.Context(), *value)
+	filter.AccountID = accountID
+	mailboxID, ok := optionalInt64(c, "mailbox_id")
+	if !ok {
+		return
+	}
+	if filter.MailboxID = mailboxID; mailboxID != nil {
+		// Opening a folder asks the supervisor to refresh it now instead of waiting
+		// for the next periodic pass. A provider that cannot refresh does not fail
+		// the read: the rows already stored are still worth serving.
+		_ = s.sync.RequestMailbox(c.Request.Context(), *mailboxID)
 	}
 	if raw := c.Query("is_read"); raw != "" {
 		value, err := strconv.ParseBool(raw)
@@ -48,12 +56,15 @@ func (s *Server) listMessages(c *gin.Context) {
 // between the list and the button acting on it.
 func (s *Server) markMessagesRead(c *gin.Context) {
 	filter := ports.MessageFilter{Folder: c.Query("folder"), Query: strings.TrimSpace(c.Query("query"))}
-	if value, ok := optionalInt64(c, "account_id"); ok {
-		filter.AccountID = value
+	accountID, ok := optionalInt64(c, "account_id")
+	if !ok {
+		return
 	}
-	if value, ok := optionalInt64(c, "mailbox_id"); ok {
-		filter.MailboxID = value
+	mailboxID, ok := optionalInt64(c, "mailbox_id")
+	if !ok {
+		return
 	}
+	filter.AccountID, filter.MailboxID = accountID, mailboxID
 	result, err := s.messages.MarkRead(c.Request.Context(), filter)
 	if err != nil {
 		// A partial success still changed state on the provider and locally, so it

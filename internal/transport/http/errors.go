@@ -18,10 +18,21 @@ func idParam(c *gin.Context, name string) (int64, bool) {
 	}
 	return id, true
 }
+
+// optionalInt64 reads a positive integer query parameter. The bool reports
+// whether the request is still valid, not whether the parameter was present — an
+// absent parameter yields (nil, true) and a malformed one yields (nil, false)
+// after the 400 has been written.
+//
+// It used to return false for both cases, which meant a malformed filter wrote
+// its 400 and then let the handler run on: the response body ended up holding the
+// error envelope followed by a second JSON document, and the query still executed
+// with the filter silently dropped, so a client that mistyped account_id received
+// a 400 status stapled to the whole unfiltered feed.
 func optionalInt64(c *gin.Context, key string) (*int64, bool) {
 	raw := c.Query(key)
 	if raw == "" {
-		return nil, false
+		return nil, true
 	}
 	value, err := strconv.ParseInt(raw, 10, 64)
 	if err != nil || value <= 0 {

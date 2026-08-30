@@ -8,13 +8,12 @@ import (
 	"time"
 
 	"nexusmail/internal/config"
+	"nexusmail/internal/domain"
 	"nexusmail/internal/ports"
-	imapprovider "nexusmail/internal/provider/imap"
 	"nexusmail/internal/provider/oauth"
 	accountservice "nexusmail/internal/service/account"
 	draftservice "nexusmail/internal/service/draft"
 	messageservice "nexusmail/internal/service/message"
-	sendservice "nexusmail/internal/service/send"
 	sessionservice "nexusmail/internal/service/session"
 
 	"github.com/coder/websocket"
@@ -23,6 +22,22 @@ import (
 
 type Hub interface {
 	Serve(context.Context, *websocket.Conn)
+}
+
+// Syncer is the slice of the IMAP supervisor the transport drives. Declared here
+// rather than taking *imap.Supervisor so a handler test does not have to stand up
+// something that dials a real mail server.
+type Syncer interface {
+	StartAccount(context.Context, domain.Account)
+	RequestMailbox(context.Context, int64) error
+	FetchBody(context.Context, int64) error
+	FetchAttachment(context.Context, int64, int64) (domain.BlobObject, domain.Attachment, error)
+}
+
+// Sender queues a draft for delivery. Queue only writes the outbox row and wakes
+// the worker, so nothing here reaches SMTP synchronously.
+type Sender interface {
+	Queue(context.Context, int64) error
 }
 
 type Server struct {
@@ -34,8 +49,8 @@ type Server struct {
 	drafts    *draftservice.Service
 	sessions  *sessionservice.Service
 	oauth     *oauth.Manager
-	sync      *imapprovider.Supervisor
-	sender    *sendservice.Worker
+	sync      Syncer
+	sender    Sender
 	hub       Hub
 	appCtx    context.Context
 	router    *gin.Engine
@@ -44,7 +59,7 @@ type Server struct {
 	rateSwept time.Time
 }
 
-func New(cfg config.Config, repo ports.Repository, blobs ports.BlobStore, accounts *accountservice.Service, messages *messageservice.Service, drafts *draftservice.Service, sessions *sessionservice.Service, oauthManager *oauth.Manager, syncer *imapprovider.Supervisor, sender *sendservice.Worker, hub Hub, appCtx context.Context) *Server {
+func New(cfg config.Config, repo ports.Repository, blobs ports.BlobStore, accounts *accountservice.Service, messages *messageservice.Service, drafts *draftservice.Service, sessions *sessionservice.Service, oauthManager *oauth.Manager, syncer Syncer, sender Sender, hub Hub, appCtx context.Context) *Server {
 	s := &Server{cfg: cfg, repo: repo, blobs: blobs, accounts: accounts, messages: messages, drafts: drafts, sessions: sessions, oauth: oauthManager, sync: syncer, sender: sender, hub: hub, appCtx: appCtx, rate: make(map[string][]time.Time)}
 	s.router = s.routes()
 	return s
