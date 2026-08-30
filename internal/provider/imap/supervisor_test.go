@@ -94,6 +94,7 @@ func TestIsRateLimited(t *testing.T) {
 		}
 	}
 }
+
 // TestRecordBodyAttemptCountsOnlyRealFailures underpins the prefetch cap. The
 // candidate query cannot exclude the error state without a schema change, so a body
 // that cannot be fetched was re-queued on every 5-second probe forever, permanently

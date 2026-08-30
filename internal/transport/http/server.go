@@ -691,6 +691,7 @@ func fail(c *gin.Context, status int, code, message string, details any) {
 	requestID, _ := c.Get("request_id")
 	c.JSON(status, gin.H{"error": gin.H{"code": code, "message": message, "request_id": requestID, "details": details}})
 }
+
 // writeError maps a failure to a status from the class its producer declared, via
 // the ports sentinels. It used to sniff substrings — "invalid" or "required" meant
 // 400, "offline" meant 503 — which failed in both directions: only the 500 branch

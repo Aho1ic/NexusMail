@@ -39,20 +39,39 @@ cd web && npx playwright test e2e/mailbox.spec.ts
 
 ### 进程装配
 
-`cmd/server/main.go` 是唯一装配点，顺序即依赖顺序：`sqlite.Open` → `cryptobox` → `storage`(blob) → `realtime.Hub` → `account` → `oauth` → **`imap.Supervisor`** → `message`/`draft` → `session` → `smtp` → `send.Worker` → `transport/http`。Supervisor 被 message、draft、send 三个 service 共享，是事实上的中心组件（1240 行，最大单文件）。
+`cmd/server/main.go` 是唯一装配点，顺序即依赖顺序：`sqlite.Open` → `cryptobox` → `storage`(blob) → `realtime.Hub` → `account` → `oauth` → **`imap.Supervisor`** → `message`/`draft` → `session` → `smtp` → `send.Worker` → `transport/http`。Supervisor 被 message、draft、send 三个 service 共享，是事实上的中心组件。
 
 所有后台 goroutine 都挂在 `signal.NotifyContext` 的 `rootCtx` 上：每账户 2 个循环 + 4 个 body worker（Supervisor）、send worker、15 分钟维护 ticker（清理过期 session + blob LRU 淘汰）。新增后台任务必须接受该 ctx 并有可验证的退出路径。
 
+### Supervisor 的文件分工
+
+`internal/provider/imap` 是单个 package，按职责分文件，改动前先定位到对应文件：
+
+| 文件 | 职责 |
+| --- | --- |
+| `supervisor.go` | `Supervisor` 类型与生命周期（`Start`/`StartAccount`/`Stop`/`runtime`） |
+| `tuning.go` | 全部时间与批量常量，每个都带取值理由；`observe` 慢阶段埋点 |
+| `runtime.go` | 每账户运行态、命令连接的两级锁、`requestSync`/`RequestMailbox` |
+| `conn.go` | 拨号、TLS、认证、`stallGuard` 读写停滞检测 |
+| `loop.go` | `commandLoop` / `idleLoop` / `probeInbox` / `pollWithoutIdle` |
+| `sync.go` | mailbox 目录刷新、按账户与按 mailbox 的增量 UID 同步 |
+| `reconcile.go` | flag 与 expunge 修复（`staleUIDs` 决定哪些 UID 算已删） |
+| `ingest.go` | fetch 结果转行、地址解码与格式化、批量落库 |
+| `body.go` | 正文与附件抓取、后台预取 worker |
+| `actions.go` | 用户操作：flags、archive、批量已读 |
+| `remotedrafts.go` | 远端草稿同步与 Sent APPEND |
+| `errors.go` | 错误分类与退避算术 |
+
 ### 每账户双连接模型
 
-`internal/provider/imap/supervisor.go` 为每个账户起两个 goroutine：
+`loop.go` 为每个账户起两个 goroutine：
 
 - `commandLoop` 独占命令连接，负责所有同步与用户操作；连接失败按 1s→5m 指数退避。它同时持有两个 ticker：`periodicSyncInterval`（5 分钟全量）和 `realtimePollInterval`（5 秒 `probeInbox`）。**5 秒探针刻意放在 commandLoop 而非 IDLE 循环**，因为命令连接始终存活，用于兜住那些声明支持 IDLE 却延迟或丢弃 EXISTS 通知的服务商。
 - `idleLoop` 只监听，收到通知后通过 `rt.syncReq` 发信号，从不自己执行 IMAP 操作。
 
 ### 命令连接的优先级锁（易踩坑）
 
-`runtime` 用 `cmdMu` + `urgent atomic.Int32` 实现两级抢占，不是普通互斥锁：
+`runtime.go` 用 `cmdMu` + `urgent atomic.Int32` 实现两级抢占，不是普通互斥锁：
 
 - `rt.lock()`：前台工作（同步、用户操作）。进入前 `urgent++`，拿到锁后 `urgent--`。
 - `rt.lockBackground(ctx)`：后台正文预取。只在 `urgent == 0` 时获取，并在拿锁后二次确认，否则释放并 25ms 后重试。
