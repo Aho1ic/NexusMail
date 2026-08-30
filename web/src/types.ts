@@ -18,6 +18,9 @@ export type Message = {
 // page carries.
 export type MessagePage = { items: Message[]; next_cursor?: string; unread_total: number }
 export type Attachment = { id: number; message_id: number; filename: string; content_type: string; content_id?: string; size_bytes: number; fetch_state: string }
+// otp_code is derived by the server on read, so it only ever appears on the detail
+// payload and never on a feed row.
+export type MessageDetails = { message: Message; attachments: Attachment[]; otp_code?: string }
 // capped means more unread mail remained than one call may touch; partial means
 // some accounts failed while the reported messages were still applied.
 export type MarkReadResult = { updated: number; capped?: boolean; partial?: boolean }
