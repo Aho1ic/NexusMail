@@ -129,10 +129,7 @@ func (w *Worker) deliver(ctx context.Context, id int64) {
 			return
 		}
 	}
-	message, recipients, closers, err := w.compose(ctx, account, draft, attachments)
-	for _, closer := range closers {
-		defer closer.Close()
-	}
+	message, recipients, err := w.compose(ctx, account, draft, attachments)
 	if err != nil {
 		w.fail(ctx, draft, err, false, 0)
 		return
@@ -167,45 +164,46 @@ func (w *Worker) deliver(ctx context.Context, id int64) {
 	w.complete(ctx, account, draft, message)
 }
 
-func (w *Worker) compose(ctx context.Context, account domain.Account, draft domain.Draft, attachments []domain.DraftAttachment) ([]byte, []string, []io.Closer, error) {
+// compose renders the draft into an RFC 5322 payload and the envelope recipient
+// list. Every attachment file descriptor it opens is also closed before it
+// returns, so the caller inherits nothing to clean up.
+func (w *Worker) compose(ctx context.Context, account domain.Account, draft domain.Draft, attachments []domain.DraftAttachment) ([]byte, []string, error) {
 	to, err := parseAddresses(draft.ToJSON)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, err
 	}
 	cc, err := parseAddresses(draft.CCJSON)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, err
 	}
 	bcc, err := parseAddresses(draft.BCCJSON)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, err
 	}
 	outgoingAttachments := make([]mailbuilder.OutgoingAttachment, 0, len(attachments))
 	closers := make([]io.Closer, 0, len(attachments))
+	defer func() { w.closeAll(closers) }()
 	for _, attachment := range attachments {
 		blob, err := w.repo.GetBlob(ctx, attachment.BlobID)
 		if err != nil {
-			w.closeAll(closers)
-			return nil, nil, nil, err
+			return nil, nil, err
 		}
 		reader, err := w.blobs.Open(ctx, blob)
 		if err != nil {
-			w.closeAll(closers)
-			return nil, nil, nil, err
+			return nil, nil, err
 		}
 		closers = append(closers, reader)
 		outgoingAttachments = append(outgoingAttachments, mailbuilder.OutgoingAttachment{Filename: attachment.Filename, ContentType: attachment.ContentType, Data: reader})
 	}
 	from := mail.Address{Name: account.DisplayName, Address: account.Email}
-	payload, err := mailbuilder.Compose(mailbuilder.Outgoing{MessageID: draft.RFCMessageID, From: from, To: to, CC: cc, BCC: bcc, Subject: draft.Subject, BodyText: draft.BodyText, Attachments: outgoingAttachments})
 	// mailbuilder.Compose fully drains each attachment Data reader into the
-	// in-memory payload, so the blob FDs are no longer needed by the time
-	// Compose returns. Closing them here rather than deferring to the caller
-	// (which would hold the FDs across SMTP.Send and complete) keeps one
-	// attachment's lifetime to its actual use, not to the whole send.
-	w.closeAll(closers)
+	// in-memory payload, so the deferred close above runs while the FDs are
+	// already spent. Keeping the lifetime inside this function rather than handing
+	// closers back to the caller is what keeps an attachment's FD scoped to its
+	// actual use instead of to the whole send, SMTP round-trip included.
+	payload, err := mailbuilder.Compose(mailbuilder.Outgoing{MessageID: draft.RFCMessageID, From: from, To: to, CC: cc, BCC: bcc, Subject: draft.Subject, BodyText: draft.BodyText, Attachments: outgoingAttachments})
 	recipients := addressValues(append(append(append([]mail.Address{}, to...), cc...), bcc...))
-	return payload, recipients, nil, err
+	return payload, recipients, err
 }
 
 // closeAll closes a list of closers and silently swallows the per-FD error

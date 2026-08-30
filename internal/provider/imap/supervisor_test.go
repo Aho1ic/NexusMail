@@ -199,10 +199,14 @@ func seedBodyCandidate(t *testing.T, h *harness) int64 {
 		FromJSON: "[]", ToJSON: "[]", CCJSON: "[]", BCCJSON: "[]", ReplyToJSON: "[]", ReferencesJSON: "[]",
 		BodyState: "error", SizeBytes: 512, ReceivedAt: now, CreatedAt: now, UpdatedAt: now,
 	}
-	created, err := h.repo.CreateOrUpdateMessage(ctx, &message, stored.ID, 1, nil, time.UnixMilli(now))
-	if err != nil || !created {
+	// The batch path is what a real sync uses; there is no single-row variant.
+	ids, created, err := h.repo.BatchCreateOrUpdateMessages(ctx, []ports.MessageInput{{
+		Message: &message, MailboxID: stored.ID, UID: 1, InternalDate: time.UnixMilli(now),
+	}})
+	if err != nil || !created[0] {
 		t.Fatalf("seed message: created=%v err=%v", created, err)
 	}
+	message.ID = ids[0]
 	if err := h.repo.SetMessageBodyState(ctx, message.ID, "error"); err != nil {
 		t.Fatal(err)
 	}

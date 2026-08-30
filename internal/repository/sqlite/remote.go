@@ -369,23 +369,8 @@ func (s *Store) BatchSetMessageBodyState(ctx context.Context, ids []int64, state
 	})
 }
 
-func (s *Store) UpsertAttachment(ctx context.Context, attachment *domain.Attachment) error {
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
-	return s.db.WithContext(ctx).Exec(`INSERT INTO attachments
-        (message_id, part_id, filename, content_type, disposition, content_id, size_bytes, fetch_state, blob_id, last_error, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(message_id, part_id) DO UPDATE SET filename=excluded.filename, content_type=excluded.content_type,
-        disposition=excluded.disposition, content_id=excluded.content_id, size_bytes=excluded.size_bytes, updated_at=excluded.updated_at`,
-		attachment.MessageID, attachment.PartID, attachment.Filename, attachment.ContentType, attachment.Disposition,
-		attachment.ContentID, attachment.SizeBytes, attachment.FetchState, attachment.BlobID, attachment.LastError,
-		attachment.CreatedAt, attachment.UpdatedAt).Error
-}
-
-// BatchUpsertAttachments upserts a batch of attachments under a single
-// writeMu. The errors UpsertAttachment would surface are intentionally
-// swallowed (the supervisor loop ignores the return value), so this version
-// reports the first error and bails rather than silently losing rows mid-batch.
+// BatchUpsertAttachments upserts a batch of attachments under a single writeMu.
+// It reports the first error and bails rather than silently losing rows mid-batch.
 func (s *Store) BatchUpsertAttachments(ctx context.Context, attachments []domain.Attachment) error {
 	if len(attachments) == 0 {
 		return nil

@@ -178,7 +178,7 @@ func bulkSeed(t *testing.T, store *Store, accountID, mailboxID int64, count int)
 			FromJSON: "[]", ToJSON: "[]", CCJSON: "[]", BCCJSON: "[]", ReplyToJSON: "[]", ReferencesJSON: "[]",
 			BodyState: "ready", SizeBytes: 2048, ReceivedAt: now + int64(index), CreatedAt: now, UpdatedAt: now,
 		}
-		created, err := store.CreateOrUpdateMessage(ctx, &message, mailboxID, uint32(index)+1, nil, time.UnixMilli(now))
+		created, err := ingestOne(ctx, store, &message, mailboxID, uint32(index)+1, nil, time.UnixMilli(now))
 		if err != nil || !created {
 			t.Fatalf("seed %d: created=%v err=%v", index, created, err)
 		}

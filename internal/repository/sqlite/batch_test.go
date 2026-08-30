@@ -138,6 +138,81 @@ func TestBatchCreateOrUpdateMessages(t *testing.T) {
 	}
 }
 
+// TestBatchDedupesAcrossCalls covers the case the in-batch collision test cannot
+// reach: a message that already exists from an earlier call.
+//
+// GORM expands a slice bound to a `?` that sits immediately after `(` into one
+// placeholder per element, so the first key of the hand-built `IN (?,?…)` was
+// compared as 32 separate integers and never matched. Every batch therefore
+// missed the existing row for its first item, and the INSERT that followed hit the
+// (account_id, dedupe_key) unique index and rolled the whole batch back — which on
+// a real account means the mailbox stops ingesting. Items 2..N matched, so nothing
+// showed up in a test that only collided inside one batch.
+func TestBatchDedupesAcrossCalls(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+	account, mailbox := seedAccountMailbox(t, store)
+	now := time.Now().UnixMilli()
+
+	// Fresh struct each time: a real second sync builds the message from the
+	// provider's response and has no id from the earlier pass.
+	build := func(subject string) *domain.Message {
+		digest := sha256.Sum256([]byte(subject))
+		return &domain.Message{
+			AccountID: account.ID, Direction: "incoming", DedupeKey: digest[:], Subject: subject,
+			Sender: "Sender <sender@example.com>", Recipients: "receiver@example.com",
+			FromJSON: "[]", ToJSON: "[]", CCJSON: "[]", BCCJSON: "[]", ReplyToJSON: "[]", ReferencesJSON: "[]",
+			BodyState: "metadata", ReceivedAt: now, CreatedAt: now, UpdatedAt: now,
+		}
+	}
+
+	first, created, err := store.BatchCreateOrUpdateMessages(ctx, []ports.MessageInput{
+		{Message: build("across-calls"), MailboxID: mailbox.ID, UID: 1, InternalDate: time.UnixMilli(now)},
+	})
+	if err != nil || !created[0] {
+		t.Fatalf("first ingest: created=%v err=%v", created, err)
+	}
+
+	// A single-item batch is the shape the 5s inbox probe produces, and it is the
+	// one where the broken key was also the only key.
+	second, created, err := store.BatchCreateOrUpdateMessages(ctx, []ports.MessageInput{
+		{Message: build("across-calls"), MailboxID: mailbox.ID, UID: 2, InternalDate: time.UnixMilli(now)},
+	})
+	if err != nil {
+		t.Fatalf("re-ingesting an existing message failed the batch: %v", err)
+	}
+	if created[0] {
+		t.Error("re-ingest reported an insert, want an update of the existing row")
+	}
+	if second[0] != first[0] {
+		t.Errorf("re-ingest used row %d, want the existing row %d", second[0], first[0])
+	}
+
+	// The same holds for the first item of a multi-item batch, which is where the
+	// expansion bug lived.
+	ids, created, err := store.BatchCreateOrUpdateMessages(ctx, []ports.MessageInput{
+		{Message: build("across-calls"), MailboxID: mailbox.ID, UID: 3, InternalDate: time.UnixMilli(now)},
+		{Message: build("brand-new"), MailboxID: mailbox.ID, UID: 4, InternalDate: time.UnixMilli(now)},
+	})
+	if err != nil {
+		t.Fatalf("mixed batch failed: %v", err)
+	}
+	if created[0] || !created[1] {
+		t.Errorf("created = %v, want [false true]", created)
+	}
+	if ids[0] != first[0] {
+		t.Errorf("first item used row %d, want %d", ids[0], first[0])
+	}
+
+	var rows int
+	if err := store.sqlDB.QueryRowContext(ctx, "SELECT count(*) FROM messages WHERE account_id = ?", account.ID).Scan(&rows); err != nil {
+		t.Fatal(err)
+	}
+	if rows != 2 {
+		t.Errorf("messages table = %d rows, want 2", rows)
+	}
+}
+
 func itoa(n int) string {
 	if n == 0 {
 		return "0"

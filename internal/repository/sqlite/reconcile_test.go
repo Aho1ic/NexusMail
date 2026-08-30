@@ -196,7 +196,7 @@ func TestDeleteMailboxUIDsKeepsMessagesInOtherMailboxes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.CreateOrUpdateMessage(ctx, &message, stored.ID, 7, nil, time.UnixMilli(now)); err != nil {
+	if _, err := ingestOne(ctx, store, &message, stored.ID, 7, nil, time.UnixMilli(now)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -328,7 +328,7 @@ func seedMessages(t *testing.T, store *Store, mailboxID int64, count int, subjec
 			FromJSON: "[]", ToJSON: "[]", CCJSON: "[]", BCCJSON: "[]", ReplyToJSON: "[]", ReferencesJSON: "[]",
 			BodyState: "metadata", ReceivedAt: now, CreatedAt: now, UpdatedAt: now,
 		}
-		created, err := store.CreateOrUpdateMessage(ctx, &message, mailboxID, uint32(existing)+uint32(index)+1, nil, time.UnixMilli(now))
+		created, err := ingestOne(ctx, store, &message, mailboxID, uint32(existing)+uint32(index)+1, nil, time.UnixMilli(now))
 		if err != nil || !created {
 			t.Fatalf("seed message %d: created=%v err=%v", index, created, err)
 		}

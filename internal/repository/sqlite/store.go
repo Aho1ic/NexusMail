@@ -3,6 +3,7 @@ package sqlite
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -31,6 +32,13 @@ import (
 // while errors.Is(err, ErrConflict) keeps working for callers that care about
 // this specific cause.
 var ErrConflict = ports.Conflictf("revision conflict")
+
+// blobArg binds a byte slice as one blob parameter. GORM expands a bare slice
+// bound to a `?` that follows `(` into one placeholder per element; implementing
+// driver.Valuer takes the branch that is checked first and keeps the value whole.
+type blobArg []byte
+
+func (b blobArg) Value() (driver.Value, error) { return []byte(b), nil }
 
 // classifyRead translates the driver's "record not found" into the port-level
 // sentinel on its way out of the repository. Without it every caller that wants
@@ -271,50 +279,15 @@ func (s *Store) ListMailboxes(ctx context.Context, accountID int64) ([]domain.Ma
 	return items, err
 }
 
-func (s *Store) CreateOrUpdateMessage(ctx context.Context, message *domain.Message, mailboxID int64, uid uint32, flags []string, internalDate time.Time) (bool, error) {
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
-	created := false
-	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		var existing domain.Message
-		err := tx.Where("account_id = ? AND dedupe_key = ?", message.AccountID, message.DedupeKey).First(&existing).Error
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			if err := tx.Create(message).Error; err != nil {
-				return err
-			}
-			created = true
-		} else if err != nil {
-			return err
-		} else {
-			message.ID = existing.ID
-			if err := tx.Model(&existing).Updates(map[string]any{
-				"subject": message.Subject, "sender": message.Sender, "recipients": message.Recipients,
-				"from_json": message.FromJSON, "to_json": message.ToJSON, "cc_json": message.CCJSON,
-				"is_read": message.IsRead, "is_starred": message.IsStarred, "updated_at": message.UpdatedAt,
-			}).Error; err != nil {
-				return err
-			}
-		}
-		flagsJSON, _ := json.Marshal(flags)
-		return tx.Exec(`INSERT INTO mailbox_messages(mailbox_id, message_id, uid, flags_json, internal_date)
-            VALUES (?, ?, ?, ?, ?) ON CONFLICT(mailbox_id, uid) DO UPDATE SET
-            message_id=excluded.message_id, flags_json=excluded.flags_json, internal_date=excluded.internal_date`,
-			mailboxID, message.ID, uid, string(flagsJSON), internalDate.UnixMilli()).Error
-	})
-	return created, err
-}
-
-// BatchCreateOrUpdateMessages collapses N single-row ingest calls into a
-// single writeMu section and a single transaction. The hot path is the
-// 5-second inbox probe and the 5-minute periodic sync: a syncMailbox pass
-// that lands 100 new messages used to pay for 100 commits (and 100 fsyncs
-// in WAL mode). One commit is one fsync.
+// BatchCreateOrUpdateMessages is the only message ingest path. It keeps N rows
+// inside a single writeMu section and a single transaction: the hot callers are
+// the 5-second inbox probe and the 5-minute periodic sync, and a pass that lands
+// 100 new messages would otherwise pay 100 commits — 100 fsyncs in WAL mode.
 //
-// Behaviour matches CreateOrUpdateMessage row-for-row: each (account_id,
-// dedupe_key) either inserts a new message or updates the existing one's
-// subject/sender/recipients/flags. The mailbox_messages row is upserted
-// either way. FTS5 triggers fire per row as before, but the trigger work
-// stays inside the same transaction and is committed once.
+// Each (account_id, dedupe_key) either inserts a new message or updates the
+// existing one's subject/sender/recipients/flags. The mailbox_messages row is
+// upserted either way. FTS5 triggers fire per row, but the trigger work stays
+// inside the transaction and is committed once.
 //
 // The result slices are parallel to items: resultIDs[i] is the row id
 // stored for items[i], and created[i] reports whether that item was
@@ -341,22 +314,28 @@ func (s *Store) BatchCreateOrUpdateMessages(ctx context.Context, items []ports.M
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		// One SELECT IN (...) instead of N First() lookups. GORM's IN (?)
-		// does not flatten [][]byte, so the placeholders are expanded by
-		// hand. SQLite's parameter cap (500) comfortably fits a chunk.
-		keys := make([][]byte, len(items))
-		for i, item := range items {
-			keys[i] = item.Message.DedupeKey
-		}
-		placeholders := make([]byte, 0, len(keys)*2)
-		args := make([]any, 0, len(keys)+1)
+		// One SELECT IN (...) instead of N First() lookups. GORM's IN (?) does not
+		// flatten [][]byte, so the placeholders are expanded by hand. SQLite's
+		// parameter cap (500) comfortably fits a chunk.
+		//
+		// Each key is wrapped in blobArg, which is a driver.Valuer. Without that,
+		// GORM expands any slice bound to a `?` that sits immediately after `(`
+		// into one placeholder per element — so `IN (?,?)` with two 32-byte keys
+		// became `IN (158,182,32,…,"<binary>")`: the first key was compared as 32
+		// separate integers and never matched. Every batch therefore failed to
+		// dedupe its first item, and if that message already existed the INSERT hit
+		// the (account_id, dedupe_key) unique index and rolled the whole batch back,
+		// stalling the mailbox. A driver.Valuer is checked before the slice branch,
+		// which is what makes each key stay one bound blob.
+		placeholders := make([]byte, 0, len(items)*2)
+		args := make([]any, 0, len(items)+1)
 		args = append(args, items[0].Message.AccountID)
-		for i, k := range keys {
+		for i, item := range items {
 			if i > 0 {
 				placeholders = append(placeholders, ',')
 			}
 			placeholders = append(placeholders, '?')
-			args = append(args, k)
+			args = append(args, blobArg(item.Message.DedupeKey))
 		}
 		type keyRow struct {
 			ID        int64

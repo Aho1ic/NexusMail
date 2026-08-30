@@ -62,7 +62,8 @@ cd web && npx playwright test e2e/mailbox.spec.ts
 ### 持久化
 
 - `internal/repository/sqlite/store.go` 用单个 `writeMu` 串行化**全部写操作**；读路径不加锁。新增写方法必须同样持有它，否则在 WAL + 8 连接池下会出现 `SQLITE_BUSY`。
-- **migration 运行器目前硬编码只支持 version 1**：`migrate()` 只读 `000001_init.up.sql`，且发现 `schema_migrations` 中 `version=1` 已应用就直接返回。新增 `000002_*.up.sql` 会被 `go:embed *.sql` 打包，但**永远不会被执行**。任何 schema 变更都必须同时把该函数改成按版本号顺序遍历应用。
+- migration 运行器按版本号升序遍历 `migrations/*.up.sql`（`parseMigrationName` 取前缀数字），跳过 `schema_migrations` 中已记录的版本。新增 `000002_*.up.sql` 会被 `go:embed` 打包并自动执行，无需改 `migrate()`；文件名前缀必须是可解析的数字，否则会被静默忽略。
+- 消息落库只有批量一条路径 `BatchCreateOrUpdateMessages`（单条写入的 `CreateOrUpdateMessage` 已删除）。它手工展开 `IN (?,?…)`，每个 dedupe key 必须包成 `blobArg`：GORM 会把紧跟 `(` 的 `?` 上绑定的 slice 按元素展开，裸 `[]byte` 会被当成 32 个整数比较，导致每批第一条永远去重失败并撞 unique 索引回滚整批。
 - FTS5：`message_fts` 虚拟表由 3 个 trigger 维护（insert / delete / update of `subject,sender,recipients,body_text`）。绕过这些列直接改正文，或用非 trigger 路径写入，索引会静默失去同步。
 - 分页是 keyset cursor：base64(JSON `{received_at,id}`)，配合 `(received_at DESC, id DESC)` 索引。不要改成 OFFSET。
 

@@ -73,7 +73,6 @@ type Repository interface {
 	GetMailboxByRole(context.Context, int64, string) (domain.Mailbox, error)
 	UpdateMailboxCursor(context.Context, int64, uint32, uint32, *uint32, *uint64) error
 	ResetMailbox(context.Context, int64, uint32) error
-	CreateOrUpdateMessage(context.Context, *domain.Message, int64, uint32, []string, time.Time) (bool, error)
 	// BatchCreateOrUpdateMessages ingests a batch of fetched messages under a
 	// single writeMu and a single transaction. The result slices are parallel
 	// to items: resultIDs[i] is the row id used for items[i], and
@@ -94,7 +93,6 @@ type Repository interface {
 	SetMessageBodyState(context.Context, int64, string) error
 	BatchSetMessageBodyState(context.Context, []int64, string) error
 	UpdateMessageBody(context.Context, int64, string, string, string, *int64) error
-	UpsertAttachment(context.Context, *domain.Attachment) error
 	GetAttachment(context.Context, int64, int64) (domain.Attachment, error)
 	UpdateAttachmentBlob(context.Context, int64, int64) error
 	ListBodyCandidateIDs(context.Context, int64, int64, int) ([]int64, error)

@@ -28,7 +28,7 @@ func TestMigrationFTSAndKeysetPagination(t *testing.T) {
 			Snippet: "", BodyText: "", BodyHTML: "", BodyState: "metadata", ReceivedAt: now,
 			CreatedAt: now, UpdatedAt: now,
 		}
-		created, err := store.CreateOrUpdateMessage(ctx, &message, mailbox.ID, uint32(index+1), nil, time.UnixMilli(now))
+		created, err := ingestOne(ctx, store, &message, mailbox.ID, uint32(index+1), nil, time.UnixMilli(now))
 		if err != nil || !created {
 			t.Fatalf("create message %d: created=%v err=%v", index, created, err)
 		}
@@ -447,11 +447,26 @@ func upsertMessage(t *testing.T, store *Store, accountID, mailboxID int64, uid u
 		FromJSON: "[]", ToJSON: "[]", CCJSON: "[]", BCCJSON: "[]", ReplyToJSON: "[]", ReferencesJSON: "[]",
 		BodyState: "metadata", IsRead: read, ReceivedAt: receivedAt, CreatedAt: receivedAt, UpdatedAt: receivedAt,
 	}
-	created, err := store.CreateOrUpdateMessage(context.Background(), &message, mailboxID, uid, nil, time.UnixMilli(receivedAt))
+	created, err := ingestOne(context.Background(), store, &message, mailboxID, uid, nil, time.UnixMilli(receivedAt))
 	if err != nil {
 		t.Fatalf("upsert message %q: %v", subject, err)
 	}
 	return message.ID, created
+}
+
+// ingestOne stores a single message through the batch ingest path that production
+// uses. It exists so tests can express "one message" without the repository
+// carrying a second, otherwise unused single-row write method that would have to
+// be kept behaviourally identical to the batch one by hand.
+func ingestOne(ctx context.Context, store *Store, message *domain.Message, mailboxID int64, uid uint32, flags []string, internalDate time.Time) (bool, error) {
+	ids, created, err := store.BatchCreateOrUpdateMessages(ctx, []ports.MessageInput{{
+		Message: message, MailboxID: mailboxID, UID: uid, Flags: flags, InternalDate: internalDate,
+	}})
+	if err != nil {
+		return false, err
+	}
+	message.ID = ids[0]
+	return created[0], nil
 }
 
 func equalIDs(got, want []int64) bool {
@@ -519,7 +534,7 @@ func TestFTSDeleteTriggerShrinksIndex(t *testing.T) {
 			Sender: "s@x", Recipients: "r@x", FromJSON: "[]", ToJSON: "[]", CCJSON: "[]", BCCJSON: "[]", ReplyToJSON: "[]", ReferencesJSON: "[]",
 			BodyState: "metadata", ReceivedAt: now, CreatedAt: now, UpdatedAt: now,
 		}
-		created, err := store.CreateOrUpdateMessage(ctx, &message, mailbox.ID, uint32(index+1), nil, time.UnixMilli(now))
+		created, err := ingestOne(ctx, store, &message, mailbox.ID, uint32(index+1), nil, time.UnixMilli(now))
 		if err != nil || !created {
 			t.Fatalf("seed %d: created=%v err=%v", index, created, err)
 		}

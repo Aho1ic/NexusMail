@@ -5,6 +5,7 @@ import (
 	"crypto/subtle"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"log/slog"
 	"mime"
@@ -401,7 +402,7 @@ func (s *Server) downloadAttachment(c *gin.Context) {
 	c.Header("Content-Type", contentType)
 	c.Header("Content-Length", strconv.FormatInt(blob.SizeBytes, 10))
 	c.Header("Content-Disposition", mime.FormatMediaType("attachment", map[string]string{"filename": filepath.Base(attachment.Filename)}))
-	_, _ = ioCopy(c.Writer, reader)
+	_, _ = io.Copy(c.Writer, reader)
 }
 
 func (s *Server) listDrafts(c *gin.Context) {
