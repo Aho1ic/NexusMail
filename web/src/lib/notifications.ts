@@ -87,18 +87,22 @@ export async function copyText(value: string) {
   } catch { /* denied, insecure context, or no clipboard API */ }
   // execCommand is deprecated but remains the only fallback when the async
   // clipboard is unavailable, which is exactly when the user needs one.
+  //
+  // The field is removed in a finally rather than after the copy: on a browser
+  // where execCommand is absent or throws instead of returning false, an
+  // after-the-copy removal never runs and the hidden textarea stays in the
+  // document, one per failed attempt. remove() is a no-op if it was never appended.
+  const field = document.createElement('textarea')
   try {
-    const field = document.createElement('textarea')
     field.value = value
     field.setAttribute('readonly', '')
     field.style.position = 'fixed'
     field.style.opacity = '0'
     document.body.appendChild(field)
     field.select()
-    const copied = document.execCommand('copy')
-    document.body.removeChild(field)
-    return copied
+    return document.execCommand('copy')
   } catch { return false }
+  finally { field.remove() }
 }
 
 // listenForCopyRequests wires the notification button to the clipboard: the

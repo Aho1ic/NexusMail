@@ -71,6 +71,13 @@ describe('keyboard shortcuts', () => {
     const writes = stubAPI()
     render(<App />)
     await screen.findByRole('button', { name: /第一封/ })
+    // findByRole resolves on the DOM mutation at commit time, which can land before
+    // the passive effect that re-registers the key handler over the now-populated
+    // message list. A key fired in that window is handled by the previous closure,
+    // finds an empty list, and is dropped — and nothing re-fires it, so the waitFor
+    // that follows can never pass. This flush closes that window. It only opens
+    // under load, which is why the failure was rare and appeared under coverage.
+    await act(async () => undefined)
     return writes
   }
 

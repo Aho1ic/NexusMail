@@ -12,12 +12,24 @@ import (
 
 const version byte = 1
 
+// randReader is the entropy source for nonces. It is a variable only so a test can
+// make it fail: the alternative to reporting that failure is sealing with a zero
+// nonce, and a repeated nonce in GCM discloses the plaintext, so the branch is worth
+// covering. Production code never assigns it.
+var randReader io.Reader = rand.Reader
+
 type Box struct{ aead cipher.AEAD }
 
 func New(key []byte) (*Box, error) {
 	if len(key) != 32 {
 		return nil, errors.New("cryptobox key must be 32 bytes")
 	}
+	// Neither error below is reachable, and both are kept anyway rather than
+	// discarded with _: aes.NewCipher rejects only key lengths other than 16, 24 or
+	// 32, which the check above has already excluded, and cipher.NewGCM fails only on
+	// a block size other than 16, which AES never has. They are the two statements
+	// this package does not cover, and they would start mattering the moment the
+	// cipher or the key length changes.
 	block, err := aes.NewCipher(key)
 	if err != nil {
 		return nil, fmt.Errorf("create AES cipher: %w", err)
@@ -31,7 +43,7 @@ func New(key []byte) (*Box, error) {
 
 func (b *Box) Seal(plaintext []byte) ([]byte, error) {
 	nonce := make([]byte, b.aead.NonceSize())
-	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
+	if _, err := io.ReadFull(randReader, nonce); err != nil {
 		return nil, fmt.Errorf("generate nonce: %w", err)
 	}
 	header := make([]byte, 3)
