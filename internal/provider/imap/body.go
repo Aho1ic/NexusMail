@@ -256,7 +256,16 @@ func (s *Supervisor) FetchAttachment(ctx context.Context, messageID, attachmentI
 		}
 		return domain.BlobObject{}, attachment, err
 	}
-	blob, err := s.blobs.Put(ctx, bytes.NewReader(items[0].FindBodySection(section)), "cache")
+	body := items[0].FindBodySection(section)
+	if body == nil {
+		// A provider can return the FETCH envelope while omitting a requested MIME
+		// section when the remote message changed after local metadata was ingested.
+		// Do not turn that absence into a cached zero-byte blob: ready would suppress
+		// every later retry and make a transient metadata race look like a real empty
+		// attachment.
+		return domain.BlobObject{}, attachment, ports.NotFoundf("attachment part not found")
+	}
+	blob, err := s.blobs.Put(ctx, bytes.NewReader(body), "cache")
 	if err != nil {
 		return domain.BlobObject{}, attachment, err
 	}
