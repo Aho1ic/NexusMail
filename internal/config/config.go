@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -91,7 +92,40 @@ func Load() (Config, error) {
 	if cfg.BlobCacheBytes < 0 || cfg.MaxOutboundBytes <= 0 {
 		return Config{}, errors.New("cache and outbound size limits must be positive")
 	}
+	if err := validatePublicURL(cfg.PublicURL); err != nil {
+		return Config{}, err
+	}
 	return cfg, nil
+}
+
+// validatePublicURL rejects a public URL that cannot serve the two jobs it has:
+// deciding same-origin for cookie-authenticated mutations, and forming the OAuth
+// redirect URI by concatenation. Both silently misbehave on a malformed value —
+// every state-changing request answers 403, or the provider rejects the redirect —
+// so this is checked at startup instead of surfacing much later as a runtime denial.
+// A path is refused because no route is served under a base path; accepting one
+// would build a redirect URI that does not resolve.
+func validatePublicURL(value string) error {
+	parsed, err := url.Parse(value)
+	if err != nil {
+		return fmt.Errorf("NEXUSMAIL_PUBLIC_URL is not a valid URL: %w", err)
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return errors.New("NEXUSMAIL_PUBLIC_URL must use http or https")
+	}
+	if parsed.Hostname() == "" {
+		return errors.New("NEXUSMAIL_PUBLIC_URL must include a host")
+	}
+	if parsed.User != nil || parsed.Path != "" || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return errors.New("NEXUSMAIL_PUBLIC_URL must be a scheme, host and optional port only")
+	}
+	if port := parsed.Port(); port != "" {
+		number, convErr := strconv.Atoi(port)
+		if convErr != nil || number < 1 || number > 65535 {
+			return errors.New("NEXUSMAIL_PUBLIC_URL has an invalid port")
+		}
+	}
+	return nil
 }
 
 // splitList reads a comma separated setting, dropping blanks so a trailing comma
