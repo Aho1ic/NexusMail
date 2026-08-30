@@ -2,7 +2,6 @@ package message
 
 import (
 	"context"
-	"errors"
 
 	"nexusmail/internal/domain"
 	"nexusmail/internal/ports"
@@ -44,7 +43,10 @@ func (s *Service) Get(ctx context.Context, id int64) (domain.Message, []domain.A
 
 func (s *Service) Patch(ctx context.Context, id int64, patch ports.MessagePatch, archive bool) (domain.Message, error) {
 	if patch.IsRead == nil && patch.IsStarred == nil && !archive {
-		return domain.Message{}, errors.New("empty message patch")
+		// Classified so the transport answers 400 with this text. An unclassified
+		// error would be reported as a redacted 500, telling a client that sent
+		// {} nothing about what was wrong with the request.
+		return domain.Message{}, ports.Invalidf("empty message patch")
 	}
 	if s.remote != nil {
 		if patch.IsRead != nil || patch.IsStarred != nil {

@@ -76,6 +76,9 @@ func run() error {
 		return err
 	}
 	defer syncer.Stop()
+	// Registered after syncer.Stop so it runs before it: defers are LIFO, and a
+	// pending draft push must not fire into a supervisor that has already stopped.
+	defer draftSvc.Close()
 	go sender.Start(rootCtx)
 	go maintenance(rootCtx, repo, blobStore)
 

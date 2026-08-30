@@ -35,12 +35,21 @@ type Store interface {
 	DeleteDraft(context.Context, int64) error
 }
 
+// syncDebounce is how long an edit waits before it is pushed to the provider.
+// Autosave fires every two seconds while the user types, and each push is an IMAP
+// APPEND plus a delete of the previous copy, so the edits are collapsed instead of
+// uploaded one per keystroke.
+const syncDebounce = 5 * time.Second
+
 type Service struct {
 	repo   Store
 	events ports.Publisher
 	remote RemoteSyncer
-	mu     sync.Mutex
-	timers map[int64]*time.Timer
+	// syncDelay is syncDebounce outside tests; it exists so a test can assert the
+	// debounce without waiting for it.
+	syncDelay time.Duration
+	mu        sync.Mutex
+	timers    map[int64]*time.Timer
 }
 
 type RemoteSyncer interface {
@@ -49,7 +58,19 @@ type RemoteSyncer interface {
 }
 
 func New(repo Store, events ports.Publisher, remote RemoteSyncer) *Service {
-	return &Service{repo: repo, events: events, remote: remote, timers: make(map[int64]*time.Timer)}
+	return &Service{repo: repo, events: events, remote: remote, syncDelay: syncDebounce, timers: make(map[int64]*time.Timer)}
+}
+
+// Close stops every pending push. The timers are the one piece of background work
+// in this package, and without this they can fire after the supervisor they call
+// into has already been stopped.
+func (s *Service) Close() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for id, timer := range s.timers {
+		timer.Stop()
+		delete(s.timers, id)
+	}
 }
 
 func (s *Service) Create(ctx context.Context, input Input) (domain.Draft, error) {
@@ -100,6 +121,9 @@ func (s *Service) Get(ctx context.Context, id int64) (domain.Draft, []domain.Dra
 	return s.repo.GetDraft(ctx, id)
 }
 func (s *Service) Delete(ctx context.Context, id int64) error {
+	// Cancel any push still waiting on the debounce. It would fire after the row is
+	// gone, find nothing, and have spent a provider connection to learn that.
+	s.cancel(id)
 	if s.remote != nil {
 		// A draft the provider no longer has is the outcome the caller wanted, so
 		// only a different remote failure blocks the local delete. Matched on the
@@ -117,10 +141,11 @@ func (s *Service) schedule(id int64) {
 		return
 	}
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	if timer := s.timers[id]; timer != nil {
 		timer.Stop()
 	}
-	s.timers[id] = time.AfterFunc(5*time.Second, func() {
+	s.timers[id] = time.AfterFunc(s.syncDelay, func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 		defer cancel()
 		_ = s.remote.SyncDraft(ctx, id)
@@ -128,7 +153,16 @@ func (s *Service) schedule(id int64) {
 		delete(s.timers, id)
 		s.mu.Unlock()
 	})
-	s.mu.Unlock()
+}
+
+// cancel drops a pending push for one draft, if any is still waiting.
+func (s *Service) cancel(id int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if timer := s.timers[id]; timer != nil {
+		timer.Stop()
+		delete(s.timers, id)
+	}
 }
 
 func validateRecipients(groups ...[]string) error {
