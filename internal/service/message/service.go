@@ -14,13 +14,23 @@ type RemoteMutator interface {
 	Archive(context.Context, int64) error
 }
 
+// Store is the slice of persistence this service uses. It is declared here rather
+// than taking ports.Repository so a test can stand up a fake with five methods.
+type Store interface {
+	ListMessages(context.Context, ports.MessageFilter) (ports.MessagePage, error)
+	GetMessage(context.Context, int64) (domain.Message, []domain.Attachment, error)
+	UpdateMessage(context.Context, int64, ports.MessagePatch) (domain.Message, error)
+	UpdateMessages(context.Context, []int64, ports.MessagePatch) error
+	UnreadMessageIDs(context.Context, ports.MessageFilter, int) ([]int64, error)
+}
+
 type Service struct {
-	repo   ports.Repository
+	repo   Store
 	remote RemoteMutator
 	events ports.Publisher
 }
 
-func New(repo ports.Repository, remote RemoteMutator, events ports.Publisher) *Service {
+func New(repo Store, remote RemoteMutator, events ports.Publisher) *Service {
 	return &Service{repo: repo, remote: remote, events: events}
 }
 

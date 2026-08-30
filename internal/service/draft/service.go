@@ -26,8 +26,17 @@ type Input struct {
 	BodyText        string   `json:"body_text"`
 }
 
+// Store is the slice of persistence this service uses.
+type Store interface {
+	CreateDraft(context.Context, *domain.Draft) error
+	ListDrafts(context.Context, string) ([]domain.Draft, error)
+	GetDraft(context.Context, int64) (domain.Draft, []domain.DraftAttachment, error)
+	UpdateDraft(context.Context, *domain.Draft, int64) error
+	DeleteDraft(context.Context, int64) error
+}
+
 type Service struct {
-	repo   ports.Repository
+	repo   Store
 	events ports.Publisher
 	remote RemoteSyncer
 	mu     sync.Mutex
@@ -39,7 +48,7 @@ type RemoteSyncer interface {
 	DeleteRemoteDraft(context.Context, int64) error
 }
 
-func New(repo ports.Repository, events ports.Publisher, remote RemoteSyncer) *Service {
+func New(repo Store, events ports.Publisher, remote RemoteSyncer) *Service {
 	return &Service{repo: repo, events: events, remote: remote, timers: make(map[int64]*time.Timer)}
 }
 

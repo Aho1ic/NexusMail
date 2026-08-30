@@ -8,20 +8,26 @@ import (
 	"encoding/base64"
 	"errors"
 	"time"
-
-	"nexusmail/internal/ports"
 )
 
 const CookieName = "nexusmail_session"
 
+// Store is the slice of persistence this service uses. DeleteExpiredSessions is
+// driven by the maintenance ticker in main.go, not from here.
+type Store interface {
+	CreateSession(context.Context, []byte, []byte, int64, int64) error
+	ValidateSession(context.Context, []byte, int64) ([]byte, bool, error)
+	DeleteSession(context.Context, []byte) error
+}
+
 type Service struct {
-	repo       ports.Repository
+	repo       Store
 	apiKeyHash [32]byte
 	idleTTL    time.Duration
 	maxTTL     time.Duration
 }
 
-func New(repo ports.Repository, apiKey string, idleTTL, maxTTL time.Duration) *Service {
+func New(repo Store, apiKey string, idleTTL, maxTTL time.Duration) *Service {
 	return &Service{repo: repo, apiKeyHash: sha256.Sum256([]byte(apiKey)), idleTTL: idleTTL, maxTTL: maxTTL}
 }
 

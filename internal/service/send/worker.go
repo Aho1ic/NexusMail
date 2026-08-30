@@ -25,8 +25,27 @@ type TokenProvider interface {
 	AccessToken(context.Context, domain.Account, string) (string, error)
 }
 
+// RemoteDraftSyncer is the provider side of a send: the remote draft copy has to
+// be removed once delivery succeeded, and for providers that do not file sent
+// mail themselves the payload has to be appended to Sent.
+type RemoteDraftSyncer interface {
+	DeleteRemoteDraft(context.Context, int64) error
+	AppendSent(context.Context, int64, []byte) error
+}
+
+// Store is the slice of persistence the send path uses: the outbox state machine,
+// the draft and account being sent, the attachment blobs, and the Sent copy.
+type Store interface {
+	ports.OutboxRepo
+	GetDraft(context.Context, int64) (domain.Draft, []domain.DraftAttachment, error)
+	GetAccount(context.Context, int64) (domain.Account, error)
+	GetBlob(context.Context, int64) (domain.BlobObject, error)
+	ListMessages(context.Context, ports.MessageFilter) (ports.MessagePage, error)
+	CreateSentMessage(context.Context, *domain.Message, int64) error
+}
+
 type Worker struct {
-	repo        ports.Repository
+	repo        Store
 	blobs       ports.BlobStore
 	accounts    *accountservice.Service
 	tokens      TokenProvider
@@ -36,16 +55,10 @@ type Worker struct {
 	queue       chan int64
 	queuedMu    sync.Mutex
 	queued      map[int64]struct{}
-	remoteDraft interface {
-		DeleteRemoteDraft(context.Context, int64) error
-		AppendSent(context.Context, int64, []byte) error
-	}
+	remoteDraft RemoteDraftSyncer
 }
 
-func New(repo ports.Repository, blobs ports.BlobStore, accounts *accountservice.Service, tokens TokenProvider, smtp *smtpprovider.Client, events ports.Publisher, maxBytes int64, remoteDraft interface {
-	DeleteRemoteDraft(context.Context, int64) error
-	AppendSent(context.Context, int64, []byte) error
-}) *Worker {
+func New(repo Store, blobs ports.BlobStore, accounts *accountservice.Service, tokens TokenProvider, smtp *smtpprovider.Client, events ports.Publisher, maxBytes int64, remoteDraft RemoteDraftSyncer) *Worker {
 	return &Worker{repo: repo, blobs: blobs, accounts: accounts, tokens: tokens, smtp: smtp, events: events, maxBytes: maxBytes, queue: make(chan int64, 128), queued: make(map[int64]struct{}), remoteDraft: remoteDraft}
 }
 

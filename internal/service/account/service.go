@@ -19,12 +19,18 @@ type Credential struct {
 	RefreshToken string `json:"refresh_token,omitempty"`
 }
 
+// Store is the slice of persistence this service uses.
+type Store interface {
+	CreateAccount(context.Context, *domain.Account) error
+	ListAccounts(context.Context) ([]domain.Account, error)
+}
+
 type Service struct {
-	repo ports.Repository
+	repo Store
 	box  *cryptobox.Box
 }
 
-func New(repo ports.Repository, box *cryptobox.Box) *Service { return &Service{repo: repo, box: box} }
+func New(repo Store, box *cryptobox.Box) *Service { return &Service{repo: repo, box: box} }
 
 func (s *Service) AddPassword(ctx context.Context, providerName, email, displayName, username, password string) (domain.Account, error) {
 	preset, err := provider.Get(providerName)

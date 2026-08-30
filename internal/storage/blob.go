@@ -19,10 +19,10 @@ import (
 type Store struct {
 	root     string
 	maxBytes int64
-	repo     ports.Repository
+	repo     ports.BlobRepo
 }
 
-func New(root string, maxBytes int64, repo ports.Repository) (*Store, error) {
+func New(root string, maxBytes int64, repo ports.BlobRepo) (*Store, error) {
 	if err := os.MkdirAll(root, 0o750); err != nil {
 		return nil, fmt.Errorf("create blob directory: %w", err)
 	}
