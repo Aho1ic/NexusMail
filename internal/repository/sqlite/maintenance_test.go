@@ -27,9 +27,9 @@ func sessionRows(t *testing.T, store *Store, tokenHash []byte) int {
 }
 
 // TestResetMailboxDropsTheMailboxContents covers the UIDVALIDITY-change path, which
-// had no test at all. It is the most destructive method in the repository — it
-// deletes rows rather than updating them — and it runs unattended, when a provider
-// renumbers a mailbox. A mistake here silently loses mail.
+// had no test at all. It is the most destructive unattended path in the repository: it
+// deletes rows rather than updating them when a provider renumbers a mailbox. A
+// mistake here silently loses mail.
 func TestResetMailboxDropsTheMailboxContents(t *testing.T) {
 	store := openTestStore(t)
 	ctx := context.Background()
