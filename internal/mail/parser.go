@@ -1,7 +1,6 @@
 package mail
 
 import (
-	"bytes"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -13,6 +12,7 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	basemessage "github.com/emersion/go-message"
 	messagecharset "github.com/emersion/go-message/charset"
 	message "github.com/emersion/go-message/mail"
 	"github.com/microcosm-cc/bluemonday"
@@ -48,7 +48,15 @@ type Parsed struct {
 
 func Parse(reader io.Reader) (Parsed, error) {
 	entity, err := message.CreateReader(reader)
-	if err != nil {
+	// An unrecognised charset is advisory: go-message still returns a usable entity
+	// whose bodies read as raw bytes. Treating it as fatal threw away the whole
+	// message — headers, attachments and all — over a label we could not decode, so
+	// mail tagged with any charset outside x/text's index simply vanished.
+	//
+	// No nil check on entity: CreateReader returns nil only under exactly this
+	// condition, and the entity it wraps comes from message.New, which always returns
+	// one. So a nil here is unreachable rather than unchecked.
+	if err != nil && !basemessage.IsUnknownCharset(err) {
 		return Parsed{}, fmt.Errorf("create MIME reader: %w", err)
 	}
 	result := Parsed{
@@ -68,7 +76,14 @@ func Parse(reader io.Reader) (Parsed, error) {
 		if errors.Is(err, io.EOF) {
 			break
 		}
-		if err != nil {
+		// Same advisory error, same reasoning as at CreateReader, but here the blast
+		// radius was every part after the bad one: go-message hands back a readable
+		// part alongside the error and keeps iterating, so aborting cost the reader a
+		// legible HTML alternative and the attachment list because one part carried a
+		// charset label we do not know. A nil part is likewise unreachable — NextPart
+		// dereferences it before returning, so it pairs nil only with EOF or a hard
+		// error, and both are handled above.
+		if err != nil && !basemessage.IsUnknownCharset(err) {
 			return result, fmt.Errorf("read MIME part: %w", err)
 		}
 		partIndex++
@@ -90,12 +105,12 @@ func Parse(reader io.Reader) (Parsed, error) {
 		if readErr != nil || len(body) > maxParsedPartBytes {
 			continue
 		}
-		if charsetName := params["charset"]; charsetName != "" && !strings.EqualFold(charsetName, "utf-8") && !strings.EqualFold(charsetName, "us-ascii") {
-			converted, convertErr := io.ReadAll(mustCharsetReader(charsetName, bytes.NewReader(body)))
-			if convertErr == nil {
-				body = converted
-			}
-		}
+		// No charset conversion here on purpose. go-message decodes the body to UTF-8
+		// while reading it, so the bytes above are already converted; running the
+		// declared charset over them a second time reinterpreted UTF-8 as gb2312 and
+		// turned every non-ASCII Chinese body into mojibake — the main path for QQ and
+		// 163 mail. The one case it looked like it was handling, a charset go-message
+		// cannot decode, it could not have fixed either: that decoder is the same one.
 		switch strings.ToLower(contentType) {
 		case "text/plain", "":
 			if result.Text == "" {
@@ -247,14 +262,6 @@ func decodeHeader(input string) string {
 		return input
 	}
 	return decoded
-}
-
-func mustCharsetReader(charsetName string, input io.Reader) io.Reader {
-	reader, err := messagecharset.Reader(charsetName, input)
-	if err != nil {
-		return input
-	}
-	return reader
 }
 
 func parseAddressList(input string) ([]*mail.Address, error) {
