@@ -111,6 +111,17 @@ func backoffDelay(delay time.Duration) time.Duration {
 	return max(floor+time.Duration(rand.Int64N(int64(span)+1)), 1)
 }
 
+// failureStatus is the account status a failure should be recorded under.
+// auth_error is separated out because it is the only one the user has to act on:
+// every other failure here is transient and clears without them. It pairs with
+// retryDelay, and the two are kept apart because idleLoop needs only the delay.
+func failureStatus(err error) string {
+	if isAuthFailure(err) {
+		return "auth_error"
+	}
+	return "backoff"
+}
+
 // retryDelay maps a failure to how long the caller must leave the provider
 // alone. Credentials the server already refused and a throttle it has already
 // engaged both need a window far longer than the network ladder, and picking

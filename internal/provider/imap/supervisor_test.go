@@ -57,6 +57,72 @@ func TestIsAuthFailure(t *testing.T) {
 	}
 }
 
+// TestRetryDelayAndStatusMapping pins what the two classifications above are for.
+// Both loops route every post-connect failure through these, so this is where the
+// invariant lives: a failure that happened *after* the greeting must never come back
+// on the 1s network ladder if it was an auth rejection or a throttle. Reaching the
+// greeting proves the socket works, not that the account can be read, and retrying a
+// refused credential or an engaged throttle every second is what kept a real account
+// locked out for hours.
+//
+// The delay mapping had no test before, and dropping both branches from retryDelay
+// left the whole package green — so the arithmetic is asserted directly here rather
+// than only through the loops that consume it.
+func TestRetryDelayAndStatusMapping(t *testing.T) {
+	// A short ladder value, distinguishable from the two long windows.
+	const ladder = 2 * time.Second
+
+	for _, testCase := range []struct {
+		name   string
+		err    error
+		delay  time.Duration
+		status string
+	}{
+		{"auth failure parks for the auth window", errors.New("imap: AUTHENTICATIONFAILED bad password"), authBackoff, "auth_error"},
+		{"expired credentials park the same way", &goimap.Error{Code: goimap.ResponseCodeExpired, Text: "expired"}, authBackoff, "auth_error"},
+		// A throttle is retryable, so the account stays in backoff rather than
+		// asking the user to fix credentials that are fine.
+		{"a throttle waits out the rate-limit window", errors.New("imap: NO System busy!"), rateLimitBackoff, "backoff"},
+		{"too many connections is a throttle", errors.New("imap: BYE Too many concurrent connections"), rateLimitBackoff, "backoff"},
+		{"try later is a throttle", &goimap.Error{Code: goimap.ResponseCodeUnavailable, Text: "try later"}, rateLimitBackoff, "backoff"},
+		// Ordinary network faults are what the ladder exists for: they clear on
+		// their own and retrying quickly is the right thing to do.
+		{"a network fault keeps the ladder", errors.New("dial tcp: i/o timeout"), ladder, "backoff"},
+		{"EOF keeps the ladder", errors.New("EOF"), ladder, "backoff"},
+		{"a server bug keeps the ladder", errors.New("imap: SERVERBUG internal error"), ladder, "backoff"},
+		{"no error keeps the ladder", nil, ladder, "backoff"},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			if delay := retryDelay(testCase.err, ladder); delay != testCase.delay {
+				t.Errorf("retryDelay = %v, want %v", delay, testCase.delay)
+			}
+			if status := failureStatus(testCase.err); status != testCase.status {
+				t.Errorf("failureStatus = %q, want %q", status, testCase.status)
+			}
+		})
+	}
+
+	// Auth is checked before throttling, so an error that reads as both is treated
+	// as the one a retry cannot fix. Getting this order wrong would park a genuinely
+	// bad credential in backoff, where it retries silently instead of telling the
+	// user to re-authenticate.
+	both := errors.New("imap: NO authentication failed, too many attempts")
+	if delay := retryDelay(both, ladder); delay != authBackoff {
+		t.Errorf("retryDelay on an auth+throttle error = %v, want the auth window %v", delay, authBackoff)
+	}
+	if status := failureStatus(both); status != "auth_error" {
+		t.Errorf("failureStatus on an auth+throttle error = %q, want auth_error", status)
+	}
+
+	// The ladder is passed through rather than clamped, which is what lets the
+	// caller's 1s→5m progression survive this mapping.
+	for _, value := range []time.Duration{0, time.Second, 5 * time.Minute} {
+		if delay := retryDelay(errors.New("EOF"), value); delay != value {
+			t.Errorf("retryDelay passed ladder %v through as %v", value, delay)
+		}
+	}
+}
+
 // TestIsRateLimited pins the throttling classification. The 1s→5m network
 // ladder makes the throttle worse against QQ/163; without this classification
 // a single "System busy" reply would keep triggering fast reconnects that the

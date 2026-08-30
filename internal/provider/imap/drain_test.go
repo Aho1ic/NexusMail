@@ -205,6 +205,47 @@ func TestDrainPendingReportsAnUnknownMailbox(t *testing.T) {
 	}
 }
 
+// The two tests below cover the sync failures. Both matter for the same reason: the
+// caller treats an error from drainPending as a sign the command connection is no
+// longer usable and rebuilds it. Swallowing either would leave the loop running
+// against a dead connection, which is the stall this package has been bitten by
+// before — so the requirement is that the error propagates, not that it is handled.
+//
+// A closed client is what makes the sync fail, because it is the failure the
+// production path actually meets: the connection dropped underneath a queued request.
+
+func TestDrainPendingReportsAFailedInboxSync(t *testing.T) {
+	h := newHarness(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	rt, client := h.drainSetup(t, ctx)
+	client.Close()
+
+	rt.syncReq <- 0
+	if err := h.supervisor.drainPending(ctx, rt, client); err == nil {
+		t.Error("drainPending reported success after the inbox sync failed on a closed connection")
+	}
+}
+
+func TestDrainPendingReportsAFailedMailboxSync(t *testing.T) {
+	h := newHarness(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	rt, client := h.drainSetup(t, ctx)
+	inbox, err := h.repo.GetMailboxByRole(ctx, h.account.ID, "inbox")
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.Close()
+
+	rt.syncReq <- inbox.ID
+	if err := h.supervisor.drainPending(ctx, rt, client); err == nil {
+		t.Error("drainPending reported success after the mailbox sync failed on a closed connection")
+	}
+}
+
 // TestDrainPendingDrainsEveryQueuedRequest pins that the loop keeps going. Returning
 // after one request would leave the rest queued until the next tick, which is the
 // minute-scale delay this queue exists to avoid.

@@ -24,14 +24,9 @@ func (s *Supervisor) commandLoop(ctx context.Context, rt *runtime) {
 			// account is parked in auth_error with a long delay instead of being
 			// hammered on the connection ladder. A throttled connect likewise
 			// needs the full rateLimitBackoff: reconnecting every second keeps
-			// the throttle engaged.
-			status, delay := "backoff", backoff
-			switch {
-			case isAuthFailure(err):
-				status, delay = "auth_error", authBackoff
-			case isRateLimited(err):
-				status, delay = "backoff", rateLimitBackoff
-			}
+			// the throttle engaged. Both live in failureStatus/retryDelay, which
+			// idleLoop shares, so the two loops cannot drift apart on this.
+			status, delay := failureStatus(err), retryDelay(err, backoff)
 			s.setError(ctx, rt.account.ID, status, err)
 			if !waitBackoff(ctx, delay) {
 				return
@@ -66,13 +61,7 @@ func (s *Supervisor) commandLoop(ctx context.Context, rt *runtime) {
 			// from the provider is the same shape of mistake: the 1s ladder
 			// keeps the throttle engaged, so it gets the dedicated
 			// rateLimitBackoff instead.
-			syncStatus, syncDelay := "backoff", backoff
-			switch {
-			case isAuthFailure(syncErr):
-				syncStatus, syncDelay = "auth_error", authBackoff
-			case isRateLimited(syncErr):
-				syncStatus, syncDelay = "backoff", rateLimitBackoff
-			}
+			syncStatus, syncDelay := failureStatus(syncErr), retryDelay(syncErr, backoff)
 			// A sync that keeps failing used to reconnect with no delay at all,
 			// because the ladder was reset on connect and only the connect path
 			// waited. That is a tight reconnect loop against the provider.
@@ -146,16 +135,13 @@ func (s *Supervisor) commandLoop(ctx context.Context, rt *runtime) {
 				}
 			case mailboxID := <-rt.syncReq:
 				rt.lock()
-				var err error
-				if mailboxID == 0 {
-					err = s.syncRole(ctx, client, rt.account.ID, "inbox", false)
-				} else {
-					mailbox, mailboxErr := s.repo.GetMailbox(ctx, mailboxID)
-					if mailboxErr != nil {
-						err = mailboxErr
-					} else if mailbox.AccountID == rt.account.ID {
-						err = s.syncMailbox(ctx, client, mailbox, false)
-					}
+				// servicePending, not a copy of its rules: it resolves the zero
+				// sentinel to the inbox and refuses a mailbox belonging to another
+				// account. Anything else queued behind it is drained in the same lock
+				// acquisition rather than one request per pass through this select.
+				err := s.servicePending(ctx, rt, client, mailboxID)
+				if err == nil {
+					err = s.drainPending(ctx, rt, client)
 				}
 				rt.unlock()
 				if err == nil {

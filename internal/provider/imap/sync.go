@@ -114,26 +114,37 @@ func (s *Supervisor) drainPending(ctx context.Context, rt *runtime, client *imap
 	for {
 		select {
 		case mailboxID := <-rt.syncReq:
-			if mailboxID == 0 {
-				if err := s.syncRole(ctx, client, rt.account.ID, "inbox", false); err != nil {
-					return err
-				}
-				continue
-			}
-			mailbox, err := s.repo.GetMailbox(ctx, mailboxID)
-			if err != nil {
-				return err
-			}
-			if mailbox.AccountID != rt.account.ID {
-				continue
-			}
-			if err := s.syncMailbox(ctx, client, mailbox, false); err != nil {
+			if err := s.servicePending(ctx, rt, client, mailboxID); err != nil {
 				return err
 			}
 		default:
 			return nil
 		}
 	}
+}
+
+// servicePending syncs one queued request. It is separate from drainPending because
+// commandLoop learns the queue is non-empty by receiving from it, and so already
+// holds an id that has to be serviced under the same rules — sharing this is what
+// keeps that from being a second copy of them. The caller must hold the command lock.
+//
+// A mailbox belonging to another account is skipped rather than reported: the queue
+// carries bare ids, so a crossed or stale request is a mistake to ignore, not a
+// failure of this connection. Servicing it would SELECT another account's mailbox on
+// this account's connection. A lookup or sync failure does propagate, because the
+// caller rebuilds the connection on one.
+func (s *Supervisor) servicePending(ctx context.Context, rt *runtime, client *imapclient.Client, mailboxID int64) error {
+	if mailboxID == 0 {
+		return s.syncRole(ctx, client, rt.account.ID, "inbox", false)
+	}
+	mailbox, err := s.repo.GetMailbox(ctx, mailboxID)
+	if err != nil {
+		return err
+	}
+	if mailbox.AccountID != rt.account.ID {
+		return nil
+	}
+	return s.syncMailbox(ctx, client, mailbox, false)
 }
 
 func (s *Supervisor) syncRole(ctx context.Context, client *imapclient.Client, accountID int64, role string, skipReconcile bool) error {

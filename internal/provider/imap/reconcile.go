@@ -149,6 +149,3 @@ func (s *Supervisor) reconcileFlags(ctx context.Context, client *imapclient.Clie
 	}
 	return present, total, nil
 }
-
-// isAuthFailure reports whether the provider rejected the credentials rather than
-// failing for a reason retrying could fix.
