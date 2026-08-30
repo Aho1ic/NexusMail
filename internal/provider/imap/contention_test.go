@@ -27,20 +27,29 @@ import (
 // may finish before the foreground gets it. Anything more means the foreground
 // queued behind the backlog, which is the failure CLAUDE.md warns about.
 
-// readyBodies counts fetched bodies straight from the database. ListMessages
-// clamps to 100 rows, and the backlog here is deliberately larger than that.
-func readyBodies(t *testing.T, h *harness) int {
+// bodyCounter counts fetched bodies straight from the database. ListMessages
+// clamps to 100 rows and the backlog here is deliberately larger, and the
+// connection is opened once: a fresh sql.Open per sample costs milliseconds, which
+// is long enough to distort a measurement of a lock wait.
+func bodyCounter(t *testing.T, h *harness) func() int {
 	t.Helper()
 	database, err := sql.Open("sqlite3", "file:"+h.dbPath+"?_busy_timeout=5000&mode=ro")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer database.Close()
-	var count int
-	if err := database.QueryRow(`SELECT COUNT(*) FROM messages WHERE body_state = 'ready'`).Scan(&count); err != nil {
+	t.Cleanup(func() { _ = database.Close() })
+	statement, err := database.Prepare(`SELECT COUNT(*) FROM messages WHERE body_state = 'ready'`)
+	if err != nil {
 		t.Fatal(err)
 	}
-	return count
+	t.Cleanup(func() { _ = statement.Close() })
+	return func() int {
+		var count int
+		if err := statement.QueryRow().Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		return count
+	}
 }
 
 // backloggedAccount returns a connected supervisor whose body workers have a real
@@ -63,7 +72,8 @@ func backloggedAccount(t *testing.T, size int) *harness {
 	waitConnected(t, h)
 	// Wait until the prefetch is actually running: a measurement taken before the
 	// workers started would show no contention and prove nothing.
-	waitFor(t, 120*time.Second, func() bool { return readyBodies(t, h) >= 3 })
+	ready := bodyCounter(t, h)
+	waitFor(t, 120*time.Second, func() bool { return ready() >= 3 })
 	return h
 }
 
@@ -77,23 +87,31 @@ func TestForegroundNeverQueuesBehindPrefetch(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	ready := bodyCounter(t, h)
 	worst := 0
 	trials := 0
 	for range 12 {
-		before := readyBodies(t, h)
+		// lock() is spelled out rather than called so the sample can be taken
+		// inside the window being measured. urgent is raised first, which is what
+		// makes the sample exact: from that instant no *new* background fetch may
+		// acquire the connection, so however long the count takes, it cannot
+		// attribute an unrelated fetch to this wait. Sampling before raising it
+		// leaves a gap that a slow build fills with real fetches.
+		rt.urgent.Add(1)
+		before := ready()
 		start := time.Now()
-		rt.lock()
-		// Read the counter while still holding the lock: reading after unlock
-		// would also count fetches that started once the connection was free.
-		during := readyBodies(t, h) - before
+		rt.cmdMu.Lock()
+		during := ready() - before
 		waited := time.Since(start)
-		rt.unlock()
+		rt.urgent.Add(-1)
+		rt.cmdMu.Unlock()
+
 		if during > worst {
 			worst = during
 		}
 		trials++
 		t.Logf("trial %d: %d background fetches completed while the foreground waited (%s)", trials, during, waited)
-		if readyBodies(t, h) >= 400 {
+		if ready() >= 400 {
 			break // the backlog drained; later trials would measure nothing
 		}
 		time.Sleep(40 * time.Millisecond)
@@ -243,5 +261,6 @@ func TestPrefetchStillCompletesAfterForegroundBurst(t *testing.T) {
 			t.Fatalf("round %d: %v", round, err)
 		}
 	}
-	waitFor(t, 180*time.Second, func() bool { return readyBodies(t, h) >= 60 })
+	ready := bodyCounter(t, h)
+	waitFor(t, 180*time.Second, func() bool { return ready() >= 60 })
 }
