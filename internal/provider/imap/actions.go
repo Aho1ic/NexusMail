@@ -181,6 +181,8 @@ var archiveCandidateNames = []string{"Archive", "Archives"}
 func (s *Supervisor) ensureArchiveMailbox(ctx context.Context, rt *runtime, client *imapclient.Client) (domain.Mailbox, error) {
 	if mailbox, err := s.repo.GetMailboxByRole(ctx, rt.account.ID, "archive"); err == nil {
 		return mailbox, nil
+	} else if !errors.Is(err, ports.ErrNotFound) {
+		return domain.Mailbox{}, err
 	}
 	// The catalog may predate a folder created in another client. Re-list before
 	// concluding the account has no archive at all.
@@ -190,6 +192,8 @@ func (s *Supervisor) ensureArchiveMailbox(ctx context.Context, rt *runtime, clie
 	}
 	if mailbox, err := s.repo.GetMailboxByRole(ctx, rt.account.ID, "archive"); err == nil {
 		return mailbox, nil
+	} else if !errors.Is(err, ports.ErrNotFound) {
+		return domain.Mailbox{}, err
 	}
 	var createErrs []error
 	for _, name := range archiveCandidateNames {
