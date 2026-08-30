@@ -112,6 +112,10 @@ type harness struct {
 	user       *imapmemserver.User
 	events     *recorder
 	repo       *sqlite.Store
+	// dbPath lets a test reach the database file directly. Only the full-stack test
+	// needs it, to repoint the account's SMTP endpoint at a loopback server: the
+	// endpoint comes from the compiled-in provider preset and has no setter.
+	dbPath string
 	account    domain.Account
 	accounts   *accountservice.Service
 }
@@ -168,7 +172,8 @@ func newHarness(t *testing.T, options ...harnessOption) *harness {
 	t.Cleanup(func() { _ = server.Close() })
 
 	dir := t.TempDir()
-	repo, err := sqlite.Open(filepath.Join(dir, "mail.db"))
+	databasePath := filepath.Join(dir, "mail.db")
+	repo, err := sqlite.Open(databasePath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -197,7 +202,7 @@ func newHarness(t *testing.T, options ...harnessOption) *harness {
 		}
 		return countingConn{conn}, nil
 	}
-	return &harness{supervisor: supervisor, user: user, events: events, repo: repo, account: account, accounts: accounts}
+	return &harness{supervisor: supervisor, user: user, events: events, repo: repo, account: account, accounts: accounts, dbPath: databasePath}
 }
 
 // TestNewMailLatency measures the delay between a message landing on the IMAP
