@@ -55,10 +55,6 @@ func (s *Supervisor) reconcileMailbox(ctx context.Context, client *imapclient.Cl
 // reconcileMailboxWithUIDs is reconcileMailbox over an explicit snapshot of the
 // local UIDs. Splitting it out keeps the snapshot visible as an input, because
 // which UIDs were asked about is exactly what decides which ones may be deleted.
-
-// reconcileMailboxWithUIDs is reconcileMailbox over an explicit snapshot of the
-// local UIDs. Splitting it out keeps the snapshot visible as an input, because
-// which UIDs were asked about is exactly what decides which ones may be deleted.
 func (s *Supervisor) reconcileMailboxWithUIDs(ctx context.Context, client *imapclient.Client, mailbox domain.Mailbox, selected *goimap.SelectData, stored []uint32) error {
 	if len(stored) == 0 {
 		s.lastReconcile.Store(mailbox.ID, time.Now())
@@ -93,15 +89,6 @@ func (s *Supervisor) reconcileMailboxWithUIDs(ctx context.Context, client *imapc
 // provider is free to echo UIDs that were never in the request — some servers
 // answer a chunked UID FETCH with the whole mailbox — which makes that difference
 // negative and panics the calling body worker with "makeslice: cap out of range".
-
-// staleUIDs returns the UIDs that were asked about and did not come back, which
-// is the only safe definition of "expunged" here: anything that arrived after the
-// caller's snapshot is simply not part of the pass and must be left alone.
-//
-// The result is deliberately not pre-sized from len(stored)-len(present). A
-// provider is free to echo UIDs that were never in the request — some servers
-// answer a chunked UID FETCH with the whole mailbox — which makes that difference
-// negative and panics the calling body worker with "makeslice: cap out of range".
 func staleUIDs(stored, present []uint32) []uint32 {
 	seen := make(map[uint32]struct{}, len(present))
 	for _, uid := range present {
@@ -115,16 +102,6 @@ func staleUIDs(stored, present []uint32) []uint32 {
 	}
 	return stale
 }
-
-// reconcileFlags fetches the provider's flags for the UIDs held locally and
-// writes back the ones that differ. It returns the UIDs the provider still has,
-// which is what the caller uses to find the expunged ones.
-//
-// CHANGEDSINCE is deliberately not used. It would shrink the response, but a UID
-// omitted because its flags did not change is indistinguishable from one that was
-// expunged, and treating the first as the second deletes mail that still exists.
-// The request is already bounded by the local row count, so the full answer is
-// affordable.
 
 // reconcileFlags fetches the provider's flags for the UIDs held locally and
 // writes back the ones that differ. It returns the UIDs the provider still has,

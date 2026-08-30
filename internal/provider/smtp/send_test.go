@@ -8,6 +8,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/base64"
 	"errors"
 	"io"
 	"math/big"
@@ -43,6 +44,12 @@ type scriptedBackend struct {
 	recipients []string
 	mailFrom   string
 	mailSize   int64
+
+	// xoauth2Challenge, when set, is what the XOAUTH2 server sends back before
+	// refusing the token. Real providers answer a rejected bearer this way: a
+	// base64 JSON blob describing the reason, then a failure once the client has
+	// acknowledged it with an empty line.
+	xoauth2Challenge string
 }
 
 func (b *scriptedBackend) NewSession(conn *gosmtp.Conn) (gosmtp.Session, error) {
@@ -101,7 +108,10 @@ func (s *scriptedSession) Auth(mechanism string) (sasl.Server, error) {
 		return nil, err
 	}
 	if mechanism == "XOAUTH2" {
-		return &xoauth2Server{}, nil
+		s.backend.mu.Lock()
+		challenge := s.backend.xoauth2Challenge
+		s.backend.mu.Unlock()
+		return &xoauth2Server{challenge: challenge}, nil
 	}
 	return &scriptedLoginServer{}, nil
 }
@@ -141,11 +151,23 @@ func (l *scriptedLoginServer) Next([]byte) ([]byte, bool, error) {
 // xoauth2Server accepts the single base64 blob the XOAUTH2 client sends. It records
 // it so a test can assert the exact wire format, which is what a provider rejects
 // when it is wrong.
-type xoauth2Server struct{ initial string }
+type xoauth2Server struct {
+	initial   string
+	challenge string
+	steps     int
+}
 
 func (x *xoauth2Server) Next(response []byte) ([]byte, bool, error) {
-	x.initial = string(response)
-	return nil, true, nil
+	x.steps++
+	if x.steps == 1 {
+		x.initial = string(response)
+		if x.challenge != "" {
+			// Not done: the client owes an empty line before the refusal.
+			return []byte(x.challenge), false, nil
+		}
+		return nil, true, nil
+	}
+	return nil, false, errors.New("535 5.7.8 authentication failed")
 }
 
 func startServer(t *testing.T, backend gosmtp.Backend, mode string) (domain.Account, *x509.CertPool) {
@@ -167,7 +189,7 @@ func startServer(t *testing.T, backend gosmtp.Backend, mode string) (domain.Acco
 	served := listener
 	switch mode {
 	case "implicit":
-		served = tls.NewListener(listener, tlsConfig).(net.Listener)
+		served = tls.NewListener(listener, tlsConfig)
 	case "starttls":
 		server.TLSConfig = tlsConfig
 	default:
@@ -178,8 +200,21 @@ func startServer(t *testing.T, backend gosmtp.Backend, mode string) (domain.Acco
 	done := make(chan struct{})
 	go func() { defer close(done); _ = server.Serve(served) }()
 	t.Cleanup(func() {
+		// The listener is closed here as well as through the server, because
+		// Server.Close only closes the listeners Serve has already registered with it
+		// and Serve registers as its first act. A Close that lands before that
+		// goroutine is scheduled therefore closes nothing, leaving Serve blocked in
+		// Accept on a listener nothing will ever close. Accept returns on this.
 		_ = server.Close()
-		<-done
+		_ = served.Close()
+		select {
+		case <-done:
+		case <-time.After(15 * time.Second):
+			// Bounded so a server that will not stop is reported here, against the
+			// test that owns it. An unbounded wait instead stalls the whole package
+			// until the go test timeout, whose failure names no test at all.
+			t.Error("SMTP server did not stop")
+		}
 	})
 	return domain.Account{
 		Email: "sender@example.com", Username: "sender@example.com", AuthType: "password",
@@ -449,6 +484,103 @@ func TestSendRejectsAnEmptyOAuthToken(t *testing.T) {
 	}
 	if received, _, _, _ := backend.snapshot(); len(received) != 0 {
 		t.Fatal("a message was sent with an empty bearer token")
+	}
+}
+
+// A rejected bearer token is the most common OAuth failure in practice, and the
+// provider explains it in a challenge rather than in the SMTP status. Without that
+// text the account's last_error reads "authentication failed" for an expired
+// token, a revoked grant and a mailbox with SMTP disabled alike — three problems
+// with three different fixes.
+func TestSendReportsTheProvidersOAuthFailureReason(t *testing.T) {
+	reason := `{"status":"400","schemes":"Bearer","scope":"https://mail.google.com/"}`
+	backend := &scriptedBackend{
+		mechanisms:       []string{"XOAUTH2"},
+		xoauth2Challenge: base64.StdEncoding.EncodeToString([]byte(reason)),
+	}
+	account, roots := startServer(t, backend, "implicit")
+	account.AuthType = "oauth2"
+	client := NewWithRoots(5*time.Second, roots)
+
+	err := client.Send(context.Background(), account, Credential{AccessToken: "an-expired-token"},
+		account.Email, []string{"to@example.com"}, int64(len(testMessage)), strings.NewReader(testMessage))
+	delivery := deliveryError(t, err)
+	if delivery.Stage != "auth" {
+		t.Fatalf("stage = %q, want auth (%v)", delivery.Stage, delivery)
+	}
+	if !strings.Contains(delivery.Error(), `"status":"400"`) {
+		t.Errorf("error is %q, want it to carry the provider's decoded reason", delivery.Error())
+	}
+	if received, _, _, _ := backend.snapshot(); len(received) != 0 {
+		t.Fatal("a message was sent after the token was refused")
+	}
+}
+
+// Not every provider base64s the blob. An undecodable challenge must still reach
+// the error rather than being dropped for failing to decode.
+func TestSendReportsAPlainOAuthFailureReason(t *testing.T) {
+	backend := &scriptedBackend{mechanisms: []string{"XOAUTH2"}, xoauth2Challenge: "token expired at 2026-08-30"}
+	account, roots := startServer(t, backend, "implicit")
+	account.AuthType = "oauth2"
+	client := NewWithRoots(5*time.Second, roots)
+
+	err := client.Send(context.Background(), account, Credential{AccessToken: "an-expired-token"},
+		account.Email, []string{"to@example.com"}, int64(len(testMessage)), strings.NewReader(testMessage))
+	delivery := deliveryError(t, err)
+	if !strings.Contains(delivery.Error(), "token expired at 2026-08-30") {
+		t.Errorf("error is %q, want the raw challenge text", delivery.Error())
+	}
+}
+
+// The challenge comes from the network, so it cannot be allowed to grow the error
+// without bound — an error that large ends up in the account row and the log.
+func TestSendTruncatesAnOversizedOAuthFailureReason(t *testing.T) {
+	backend := &scriptedBackend{mechanisms: []string{"XOAUTH2"}, xoauth2Challenge: strings.Repeat("A", 4096)}
+	account, roots := startServer(t, backend, "implicit")
+	account.AuthType = "oauth2"
+	client := NewWithRoots(5*time.Second, roots)
+
+	err := client.Send(context.Background(), account, Credential{AccessToken: "a-token"},
+		account.Email, []string{"to@example.com"}, int64(len(testMessage)), strings.NewReader(testMessage))
+	delivery := deliveryError(t, err)
+	if runs := strings.Count(delivery.Error(), "A"); runs > maxXOAUTH2Failure {
+		t.Errorf("the error carried %d challenge bytes, want at most %d", runs, maxXOAUTH2Failure)
+	}
+}
+
+// A second challenge is a protocol violation: the exchange is one round trip, and
+// a server that keeps challenging would otherwise loop.
+func TestXOAUTH2RefusesARepeatedChallenge(t *testing.T) {
+	client := &xoauth2Client{username: "user@example.com", token: "a-token"}
+	if _, err := client.Next([]byte("first")); err != nil {
+		t.Fatalf("first challenge: %v", err)
+	}
+	if _, err := client.Next([]byte("second")); err == nil {
+		t.Error("a repeated challenge was accepted")
+	}
+}
+
+// The initial response is a fixed wire format. Empty credentials must fail before
+// it is built rather than sending "user=\x01auth=Bearer \x01\x01".
+func TestXOAUTH2RefusesEmptyCredentials(t *testing.T) {
+	for _, client := range []*xoauth2Client{
+		{username: "", token: "a-token"},
+		{username: "user@example.com", token: ""},
+	} {
+		if _, _, err := client.Start(); err == nil {
+			t.Errorf("Start accepted username=%q token=%q", client.username, client.token)
+		}
+	}
+	client := &xoauth2Client{username: "user@example.com", token: "a-token"}
+	mechanism, initial, err := client.Start()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mechanism != "XOAUTH2" {
+		t.Errorf("mechanism is %q, want XOAUTH2", mechanism)
+	}
+	if want := "user=user@example.com\x01auth=Bearer a-token\x01\x01"; string(initial) != want {
+		t.Errorf("initial response is %q, want %q", initial, want)
 	}
 }
 

@@ -501,8 +501,21 @@ func startSMTPServer(t *testing.T, handler gosmtp.Backend) (string, int, *x509.C
 	done := make(chan struct{})
 	go func() { defer close(done); _ = server.Serve(secure) }()
 	t.Cleanup(func() {
+		// The listener is closed here as well as through the server, because
+		// Server.Close only closes the listeners Serve has already registered with it
+		// and Serve registers as its first act. A Close that lands before that
+		// goroutine is scheduled therefore closes nothing, leaving Serve blocked in
+		// Accept on a listener nothing will ever close. Accept returns on this.
 		_ = server.Close()
-		<-done
+		_ = secure.Close()
+		select {
+		case <-done:
+		case <-time.After(15 * time.Second):
+			// Bounded so a server that will not stop is reported here, against the
+			// test that owns it. An unbounded wait instead stalls the whole package
+			// until the go test timeout, whose failure names no test at all.
+			t.Error("SMTP server did not stop")
+		}
 	})
 	return address.IP.String(), address.Port, roots
 }

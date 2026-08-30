@@ -263,7 +263,7 @@ func (s *Supervisor) idleLoop(ctx context.Context, rt *runtime) {
 		}
 		if !client.Caps().Has(goimap.CapIdle) {
 			_ = client.Close()
-			if !s.pollWithoutIdle(ctx, rt) {
+			if !s.pollWithoutIdle(ctx, rt, realtimePollInterval, periodicSyncInterval) {
 				return
 			}
 			continue
@@ -310,11 +310,6 @@ func (s *Supervisor) idleLoop(ctx context.Context, rt *runtime) {
 // STATUS needs one round trip and leaves the selected mailbox untouched, so the
 // safety net can run often without loading the provider. The caller must hold
 // the command lock.
-
-// probeInbox cheaply checks whether the inbox moved before paying for a sync.
-// STATUS needs one round trip and leaves the selected mailbox untouched, so the
-// safety net can run often without loading the provider. The caller must hold
-// the command lock.
 func (s *Supervisor) probeInbox(ctx context.Context, rt *runtime, client *imapclient.Client) error {
 	mailbox, err := s.repo.GetMailboxByRole(ctx, rt.account.ID, "inbox")
 	if err != nil {
@@ -351,13 +346,15 @@ func (s *Supervisor) probeInbox(ctx context.Context, rt *runtime, client *imapcl
 
 // pollWithoutIdle drives sync signals for servers lacking IDLE. It returns
 // false when the context is done, and true to re-probe capabilities.
-
-// pollWithoutIdle drives sync signals for servers lacking IDLE. It returns
-// false when the context is done, and true to re-probe capabilities.
-func (s *Supervisor) pollWithoutIdle(ctx context.Context, rt *runtime) bool {
-	ticker := time.NewTicker(realtimePollInterval)
+//
+// The two cadences are parameters rather than the package constants because no
+// IMAP server this codebase talks to — nor the in-memory one the tests run —
+// can be made to withhold IDLE: go-imap advertises it for both IMAP4rev1 and
+// IMAP4rev2, so the only way to exercise this loop is to call it.
+func (s *Supervisor) pollWithoutIdle(ctx context.Context, rt *runtime, poll, recheckAfter time.Duration) bool {
+	ticker := time.NewTicker(poll)
 	defer ticker.Stop()
-	recheck := time.NewTimer(periodicSyncInterval)
+	recheck := time.NewTimer(recheckAfter)
 	defer recheck.Stop()
 	for {
 		select {

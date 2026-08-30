@@ -115,9 +115,9 @@ type harness struct {
 	// dbPath lets a test reach the database file directly. Only the full-stack test
 	// needs it, to repoint the account's SMTP endpoint at a loopback server: the
 	// endpoint comes from the compiled-in provider preset and has no setter.
-	dbPath string
-	account    domain.Account
-	accounts   *accountservice.Service
+	dbPath   string
+	account  domain.Account
+	accounts *accountservice.Service
 }
 
 func (h *harness) deliver(t *testing.T, subject string) {
@@ -169,7 +169,10 @@ func newHarness(t *testing.T, options ...harnessOption) *harness {
 		t.Fatal(err)
 	}
 	go func() { _ = server.Serve(listener) }()
-	t.Cleanup(func() { _ = server.Close() })
+	// The listener is closed as well as the server, so that a Close landing before
+	// Serve has registered the listener still stops it rather than leaving Serve in
+	// Accept for the rest of the binary.
+	t.Cleanup(func() { _ = server.Close(); _ = listener.Close() })
 
 	dir := t.TempDir()
 	databasePath := filepath.Join(dir, "mail.db")

@@ -531,9 +531,11 @@ func ftsPrefix(value string) string {
 	if trimmed == "" {
 		return `""`
 	}
-	// If the value already contains an FTS5 operator (quoted phrase, AND/OR,
-	// NEAR, column filter), pass it through unchanged. Only the bare-word
-	// case needs the wildcard.
+	// Everything is quoted either way — that is what keeps an apostrophe or a stray
+	// bracket from reaching FTS5 as syntax and failing the whole query. What this
+	// test decides is only whether the wildcard is appended: "foo("* is not a valid
+	// expression, so a value already carrying FTS5 punctuation or an uppercase
+	// operator is searched as the literal phrase the user typed instead.
 	if strings.ContainsAny(trimmed, `"():*`) || strings.Contains(trimmed, " AND ") || strings.Contains(trimmed, " OR ") || strings.Contains(trimmed, " NOT ") {
 		return quoteFTS(trimmed)
 	}

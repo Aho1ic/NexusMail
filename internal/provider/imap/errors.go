@@ -45,11 +45,6 @@ func isAuthFailure(err error) bool {
 // errors are retryable but on a longer schedule than the network-error ladder:
 // a 1-second reconnect against QQ/163 just keeps the throttle engaged, so the
 // caller pairs this with rateLimitBackoff instead of the 1s→5m ladder.
-
-// isRateLimited reports whether the provider is throttling the account. These
-// errors are retryable but on a longer schedule than the network-error ladder:
-// a 1-second reconnect against QQ/163 just keeps the throttle engaged, so the
-// caller pairs this with rateLimitBackoff instead of the 1s→5m ladder.
 func isRateLimited(err error) bool {
 	if err == nil {
 		return false
@@ -106,15 +101,6 @@ func (s *Supervisor) setError(ctx context.Context, id int64, status string, err 
 // stayed amber for hours despite a ladder that on paper backs off to minutes.
 // Equal jitter keeps enough spread to avoid synchronising every account on one
 // instant after a shared outage while making the floor worth its name.
-
-// backoffDelay jitters a retry delay. Half of the delay is a hard floor and the
-// rest is random: full jitter over [0, delay] spread the load nicely but made
-// the long windows meaningless, because a 15-minute rateLimitBackoff drawing 8
-// seconds reconnects inside the throttle window it was waiting out and re-arms
-// it. Every such draw resets the provider's clock, which is how an account
-// stayed amber for hours despite a ladder that on paper backs off to minutes.
-// Equal jitter keeps enough spread to avoid synchronising every account on one
-// instant after a shared outage while making the floor worth its name.
 func backoffDelay(delay time.Duration) time.Duration {
 	if delay <= 0 {
 		return 0
@@ -124,11 +110,6 @@ func backoffDelay(delay time.Duration) time.Duration {
 	// Never return 0 for a positive delay: a zero-length timer is a spin.
 	return max(floor+time.Duration(rand.Int64N(int64(span)+1)), 1)
 }
-
-// retryDelay maps a failure to how long the caller must leave the provider
-// alone. Credentials the server already refused and a throttle it has already
-// engaged both need a window far longer than the network ladder, and picking
-// the ladder for either is what turns one rejection into a sustained hammering.
 
 // retryDelay maps a failure to how long the caller must leave the provider
 // alone. Credentials the server already refused and a throttle it has already

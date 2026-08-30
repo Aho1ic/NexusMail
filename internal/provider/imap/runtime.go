@@ -26,8 +26,6 @@ type runtime struct {
 }
 
 // lock claims the command connection for sync or user-facing work.
-
-// lock claims the command connection for sync or user-facing work.
 func (rt *runtime) lock() {
 	rt.urgent.Add(1)
 	rt.cmdMu.Lock()
@@ -35,9 +33,6 @@ func (rt *runtime) lock() {
 }
 
 func (rt *runtime) unlock() { rt.cmdMu.Unlock() }
-
-// lockBackground claims the command connection for opportunistic prefetch and
-// steps aside whenever foreground work is waiting.
 
 // lockBackground claims the command connection for opportunistic prefetch and
 // steps aside whenever foreground work is waiting.
@@ -65,13 +60,6 @@ func (s *Supervisor) requestSync(rt *runtime) {
 	default:
 	}
 }
-
-// requestSyncCooldown is the minimum interval between two RequestMailbox
-// signals for the same mailbox. The 5s probe and the IDLE loop are the
-// authoritative source of new-mail detection; this channel only exists to
-// express "the user just opened this folder, prefer not to wait the next
-// probe tick", and a passive reader must not be able to amplify into
-// sustained IMAP traffic.
 
 func (s *Supervisor) RequestMailbox(ctx context.Context, mailboxID int64) error {
 	mailbox, err := s.repo.GetMailbox(ctx, mailboxID)

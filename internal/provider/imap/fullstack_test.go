@@ -161,7 +161,11 @@ func newFullstack(t *testing.T) *fullstack {
 		t.Fatal(err)
 	}
 	go func() { _ = smtpServer.Serve(listener) }()
-	t.Cleanup(func() { _ = smtpServer.Close() })
+	// The listener is closed as well as the server: Server.Close only closes the
+	// listeners Serve has registered with it, and a Close that lands before that
+	// goroutine is scheduled closes nothing, leaving Serve in Accept for the rest of
+	// the binary on a port that stays open.
+	t.Cleanup(func() { _ = smtpServer.Close(); _ = listener.Close() })
 
 	// The account was created from the qq preset, so its SMTP endpoint points at
 	// smtp.qq.com. Repointing it at the loopback server is the only way to exercise

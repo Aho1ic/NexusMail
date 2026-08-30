@@ -35,10 +35,6 @@ type pendingMessage struct {
 // buildFetchedMessage turns an IMAP FetchMessageBuffer into the shape the
 // repository ingests. It does no I/O: the supervisor collects a chunk and
 // flushes it under one transaction.
-
-// buildFetchedMessage turns an IMAP FetchMessageBuffer into the shape the
-// repository ingests. It does no I/O: the supervisor collects a chunk and
-// flushes it under one transaction.
 func (s *Supervisor) buildFetchedMessage(mailbox domain.Mailbox, fetched *imapclient.FetchMessageBuffer) (ports.MessageInput, []domain.Attachment, error) {
 	if fetched.Envelope == nil {
 		return ports.MessageInput{}, nil, errors.New("fetched message has no envelope")
@@ -120,11 +116,6 @@ func (s *Supervisor) buildFetchedMessage(mailbox domain.Mailbox, fetched *imapcl
 // publishes a NEW_EMAIL event for each newly created row. Attachments are
 // written in the same single-transaction section; MessageID on each
 // attachment is patched to the id the repository assigned.
-
-// flushPending commits a chunk of built messages under a single writeMu and
-// publishes a NEW_EMAIL event for each newly created row. Attachments are
-// written in the same single-transaction section; MessageID on each
-// attachment is patched to the id the repository assigned.
 func (s *Supervisor) flushPending(ctx context.Context, mailbox domain.Mailbox, pending []pendingMessage) error {
 	inputs := make([]ports.MessageInput, len(pending))
 	for i, item := range pending {
@@ -192,19 +183,7 @@ func encodeMailAddresses(input []*mail.Address) string {
 // specialsInDisplayName are the RFC 5322 "specials" that force a display name to
 // be quoted. A bare UTF-8 name needs no quoting, which is what keeps the stored
 // form readable.
-
-// specialsInDisplayName are the RFC 5322 "specials" that force a display name to
-// be quoted. A bare UTF-8 name needs no quoting, which is what keeps the stored
-// form readable.
 const specialsInDisplayName = `()<>[]:;@\,."`
-
-// formatAddress renders "Name <addr>" without RFC 2047 encoding. net/mail's
-// Address.String() cannot be used here: it re-encodes every non-ASCII display
-// name into an encoded-word, so a name go-imap had already decoded came back out
-// as a literal "=?utf-8?q?...?=" — visible in the UI and indexed that way by
-// FTS5, which also made the readable name unsearchable. Quoting still follows
-// RFC 5322 so the result round-trips through mail.ParseAddress when a draft
-// built from these values is sent.
 
 // formatAddress renders "Name <addr>" without RFC 2047 encoding. net/mail's
 // Address.String() cannot be used here: it re-encodes every non-ASCII display
@@ -237,10 +216,6 @@ func formatAddress(name, address string) string {
 	}
 	return name + " <" + address + ">"
 }
-
-// pendingMessage is one row ready to be flushed by the supervisor at the end
-// of a UID chunk. input is the message + mailbox mapping; attachments are
-// kept here so the batch can persist them with the same writeMu section.
 
 func addresses(input []goimap.Address) []string {
 	result := make([]string, 0, len(input))

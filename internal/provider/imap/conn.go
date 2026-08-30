@@ -62,12 +62,6 @@ func (c *stallGuard) Write(payload []byte) (int, error) {
 	return c.Conn.Write(payload)
 }
 
-// setupStallWindow bounds silence during the TLS handshake, the greeting and
-// authentication. Those are never slow on a healthy connection, so they do not
-// need the long window an established IDLE connection does — and giving them that
-// window would let a half-open socket hold the account in "connecting" for as long
-// as the window lasts.
-
 func (s *Supervisor) connect(ctx context.Context, account domain.Account, handler *imapclient.UnilateralDataHandler, stall time.Duration) (*imapclient.Client, error) {
 	credential, err := s.accounts.Credential(account)
 	if err != nil {

@@ -90,6 +90,37 @@ func TestSanitizeHTMLNarrowsDataURIs(t *testing.T) {
 	}
 }
 
+// TestSanitizeHTMLAcceptsDataURICasing pins the halves of a data URI that RFC 2397
+// and RFC 2045 define as case-insensitive: the media type and the base64 token. A
+// sender that capitalises either is writing a valid inline image, and matching it
+// case-sensitively drops the image from the message body.
+func TestSanitizeHTMLAcceptsDataURICasing(t *testing.T) {
+	const payload = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAAAAAA6fptVAAAACklEQVQI12NgAAAAAgAB4iG8MwAAAABJRU5ErkJggg=="
+
+	for _, prefix := range []string{
+		"data:IMAGE/PNG;BASE64,",
+		"data:Image/Png;Base64,",
+		"data:image/JPEG;base64,",
+	} {
+		got := sanitizeHTML(`<p><img src="` + prefix + payload + `"></p>`)
+		if !strings.Contains(got, prefix) {
+			t.Errorf("inline image with prefix %q was stripped: %s", prefix, got)
+		}
+	}
+
+	// Casing must not become a way past the allowlist: the reason svg+xml is refused
+	// is that SVG carries script, and that is true in any capitalisation.
+	for _, unsafe := range []string{
+		`<img src="data:IMAGE/SVG+XML;BASE64,PHN2Zz48L3N2Zz4=">`,
+		`<a href="data:TEXT/HTML;BASE64,PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg==">click</a>`,
+	} {
+		got := sanitizeHTML(unsafe)
+		if strings.Contains(strings.ToLower(got), "svg+xml") || strings.Contains(strings.ToLower(got), "text/html") {
+			t.Errorf("sanitizeHTML(%q) kept an unsafe URL: %s", unsafe, got)
+		}
+	}
+}
+
 // TestSanitizeHTMLKeepsCIDReferences protects the other half: a stripped cid: URL
 // turns every embedded image in normal mail into a broken one.
 func TestSanitizeHTMLKeepsCIDReferences(t *testing.T) {

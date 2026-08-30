@@ -102,6 +102,13 @@ func (c *Client) Send(ctx context.Context, account domain.Account, credential Cr
 	}
 	phase()
 	if err := client.Auth(auth); err != nil {
+		// The provider's own reason, when it gave one, is far more actionable than the
+		// SMTP status alone: it distinguishes an expired token from a revoked grant
+		// from a mailbox with IMAP/SMTP access switched off. It is server-generated
+		// and carries no credential of ours.
+		if oauthClient, ok := auth.(*xoauth2Client); ok && oauthClient.failure != "" {
+			err = fmt.Errorf("%w (provider reported: %s)", err, oauthClient.failure)
+		}
 		return classify("auth", err, false)
 	}
 	var mailOptions *gosmtp.MailOptions
@@ -171,7 +178,18 @@ type xoauth2Client struct {
 	username   string
 	token      string
 	challenged bool
+	// failure holds the server's own explanation of a rejected token. XOAUTH2
+	// reports failures by sending a base64 JSON challenge — {"status":"401",…} —
+	// and expecting an empty line back before it issues the final error, which on
+	// its own is an opaque "authentication failed". Keeping the decoded text here
+	// is what lets the caller say why the provider refused.
+	failure string
 }
+
+// maxXOAUTH2Failure bounds how much of a challenge is kept. The blob is short in
+// practice and comes from the network, so it cannot be allowed to grow an error
+// message without limit.
+const maxXOAUTH2Failure = 512
 
 func (c *xoauth2Client) Start() (string, []byte, error) {
 	if c.username == "" || c.token == "" {
@@ -187,9 +205,18 @@ func (c *xoauth2Client) Next(challenge []byte) ([]byte, error) {
 	}
 	c.challenged = true
 	if len(challenge) > 0 {
-		if decoded, err := base64.StdEncoding.DecodeString(strings.TrimSpace(string(challenge))); err == nil {
-			challenge = decoded
+		text := strings.TrimSpace(string(challenge))
+		// Some servers send the JSON base64-encoded, some send it plainly. Prefer the
+		// decoded form and fall back to the raw text rather than dropping either.
+		if decoded, err := base64.StdEncoding.DecodeString(text); err == nil {
+			text = strings.TrimSpace(string(decoded))
 		}
+		if len(text) > maxXOAUTH2Failure {
+			text = text[:maxXOAUTH2Failure]
+		}
+		c.failure = text
 	}
+	// An empty response, not an error: the server is waiting for a line before it
+	// reports the failure, and aborting here would replace its message with ours.
 	return []byte{}, nil
 }

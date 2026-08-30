@@ -57,11 +57,6 @@ func (s *Supervisor) refreshMailboxCatalog(ctx context.Context, rt *runtime, cli
 // mailbox, draining queued sync requests between them. The caller must hold
 // the command lock; each syncMailbox re-selects its own mailbox, so this is
 // only safe between mailboxes, never inside one.
-
-// syncAllMailboxes iterates the catalog and runs syncMailbox on each non-lazy
-// mailbox, draining queued sync requests between them. The caller must hold
-// the command lock; each syncMailbox re-selects its own mailbox, so this is
-// only safe between mailboxes, never inside one.
 func (s *Supervisor) syncAllMailboxes(ctx context.Context, rt *runtime, client *imapclient.Client) error {
 	defer observe("sync_all", rt.account.ID)()
 	mailboxes, err := s.repo.ListMailboxes(ctx, rt.account.ID)
@@ -95,10 +90,6 @@ func (s *Supervisor) syncAllMailboxes(ctx context.Context, rt *runtime, client *
 // mailboxQuiet reports whether a mailbox can be skipped this pass: nothing new
 // arrived and its reconciliation is not yet due. A STATUS failure returns false so
 // the caller falls back to the full path rather than silently skipping a mailbox.
-
-// mailboxQuiet reports whether a mailbox can be skipped this pass: nothing new
-// arrived and its reconciliation is not yet due. A STATUS failure returns false so
-// the caller falls back to the full path rather than silently skipping a mailbox.
 func (s *Supervisor) mailboxQuiet(client *imapclient.Client, mailbox domain.Mailbox) bool {
 	if mailbox.UIDNext == nil || mailbox.UIDValidity == 0 {
 		return false
@@ -115,10 +106,6 @@ func (s *Supervisor) mailboxQuiet(client *imapclient.Client, mailbox domain.Mail
 	}
 	return status.UIDNext != 0 && uint32(status.UIDNext) == *mailbox.UIDNext && status.UIDValidity == mailbox.UIDValidity
 }
-
-// drainPending services queued sync requests. The caller must hold the command
-// lock; each syncMailbox re-selects its own mailbox, so this is only safe
-// between mailboxes, never inside one.
 
 // drainPending services queued sync requests. The caller must hold the command
 // lock; each syncMailbox re-selects its own mailbox, so this is only safe
@@ -176,26 +163,6 @@ func (s *Supervisor) syncRole(ctx context.Context, client *imapclient.Client, ac
 // skipping the round trip is what keeps the 5-second probe cheap. A server that
 // omits UIDNEXT leaves only the sentinel, which is still better than a bound
 // that a provider rejects outright.
-
-// incrementalUIDRange returns the UID range to search for mail newer than the
-// stored cursor, and whether a search is worth sending at all.
-//
-// The upper bound comes from the UIDNEXT that SELECT just reported, which is the
-// only bound that is both finite and true. The two alternatives are both known
-// to break:
-//
-//   - the 0="*" sentinel produces "3355:*", and a server that resolves "*" to a
-//     UID below the start normalises the reversed range per RFC 3501 — so an
-//     up-to-date mailbox re-fetched its newest message on every 5-second probe.
-//   - math.MaxUint32 produces "3355:4294967295", which QQ refuses with
-//     "NO System busy!" on UID SEARCH while accepting SELECT on the same
-//     connection. That reply is classified as a throttle, so the account parked
-//     in backoff and stopped syncing entirely while looking merely rate-limited.
-//
-// When the cursor already covers UIDNEXT-1 there is nothing to ask about, and
-// skipping the round trip is what keeps the 5-second probe cheap. A server that
-// omits UIDNEXT leaves only the sentinel, which is still better than a bound
-// that a provider rejects outright.
 func incrementalUIDRange(lastUID uint32, uidNext goimap.UID) (goimap.UIDSet, bool) {
 	var set goimap.UIDSet
 	start := goimap.UID(lastUID) + 1
@@ -209,14 +176,6 @@ func incrementalUIDRange(lastUID uint32, uidNext goimap.UID) (goimap.UIDSet, boo
 	set.AddRange(start, uidNext-1)
 	return set, true
 }
-
-// syncMailbox ingests new UIDs and, unless skipReconcile is set, repairs
-// flag/expunge drift. The 5s inbox probe passes skipReconcile=true: the safety
-// net's only job is to surface new mail quickly, and reconciliation on a large
-// inbox holds the command connection for the time the probe is supposed to
-// save. Drift is still caught by the 5-minute periodic sync, so the worst case
-// is a 5-minute delay on flag changes or remote expunges — the same as before
-// the safety net existed at all.
 
 // syncMailbox ingests new UIDs and, unless skipReconcile is set, repairs
 // flag/expunge drift. The 5s inbox probe passes skipReconcile=true: the safety

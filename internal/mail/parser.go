@@ -186,8 +186,11 @@ var cssColorValue = regexp.MustCompile(`(?i)^(#[0-9a-f]{3,8}|[a-z]+|rgba?\([0-9%
 
 // inlineRasterImage matches the data URI payloads an embedded image legitimately
 // uses. Raster only and base64 only: SVG is a document format that can carry script,
-// and a non-base64 payload is a text body wearing an image label.
-var inlineRasterImage = regexp.MustCompile(`^image/(gif|jpeg|png|webp);base64,`)
+// and a non-base64 payload is a text body wearing an image label. The match is
+// case-insensitive because RFC 2397 and RFC 2045 both define these halves that way,
+// and a sender that capitalises either is still sending a valid inline image. It
+// widens nothing: no capitalisation of svg+xml or text/html is in the alternation.
+var inlineRasterImage = regexp.MustCompile(`(?i)^image/(gif|jpeg|png|webp);base64,`)
 
 func allowInlineRasterImage(target *url.URL) bool {
 	if target.RawQuery != "" || target.Fragment != "" {

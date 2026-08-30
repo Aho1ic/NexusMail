@@ -29,13 +29,18 @@ import (
 )
 
 func main() {
-	if err := run(); err != nil {
+	// Signal handling is the process's own concern, so it lives here rather than in
+	// run: that keeps run to assembly and lets a test drive the same shutdown path
+	// by cancelling a context instead of raising a signal at the whole test binary.
+	rootCtx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	if err := run(rootCtx); err != nil {
 		slog.Error("nexusmail stopped", "error", err)
 		os.Exit(1)
 	}
 }
 
-func run() error {
+func run(rootCtx context.Context) error {
 	cfg, err := config.Load()
 	if err != nil {
 		return err
@@ -48,8 +53,6 @@ func run() error {
 	slog.SetDefault(logger)
 	slog.Info("nexusmail starting", "version", version.Value)
 
-	rootCtx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
 	repo, err := sqlite.Open(cfg.DatabasePath)
 	if err != nil {
 		return err
@@ -80,7 +83,7 @@ func run() error {
 	// pending draft push must not fire into a supervisor that has already stopped.
 	defer draftSvc.Close()
 	go sender.Start(rootCtx)
-	go maintenance(rootCtx, repo, blobStore)
+	go maintenance(rootCtx, repo, blobStore, maintenanceInterval)
 
 	api := httptransport.New(cfg, repo, blobStore, accountSvc, messageSvc, draftSvc, sessionSvc, oauthManager, syncer, sender, hub, rootCtx)
 	server := &http.Server{Addr: cfg.ListenAddr, Handler: api.Handler(), ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 30 * time.Second, WriteTimeout: 2 * time.Minute, IdleTimeout: 60 * time.Second}
@@ -108,8 +111,16 @@ type maintRepo interface {
 }
 type evictor interface{ Evict(context.Context) error }
 
-func maintenance(ctx context.Context, repo maintRepo, blobs evictor) {
-	ticker := time.NewTicker(15 * time.Minute)
+// maintenanceInterval is how often expired sessions are swept and the blob cache
+// is trimmed. Both are cheap and neither is urgent: a session past its TTL is
+// already rejected on use, and the cache only has to stay under its ceiling over
+// time.
+const maintenanceInterval = 15 * time.Minute
+
+// maintenance takes its interval as a parameter so a test can observe a tick
+// without waiting out the production cadence.
+func maintenance(ctx context.Context, repo maintRepo, blobs evictor, every time.Duration) {
+	ticker := time.NewTicker(every)
 	defer ticker.Stop()
 	for {
 		select {

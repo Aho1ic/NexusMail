@@ -27,18 +27,10 @@ func (s *Supervisor) FetchBody(ctx context.Context, messageID int64) error {
 // otpNotice carries what a verification-code notification needs. The subject
 // travels with the code so the browser can say which service the code is for
 // without another round-trip.
-
-// otpNotice carries what a verification-code notification needs. The subject
-// travels with the code so the browser can say which service the code is for
-// without another round-trip.
 type otpNotice struct {
 	Code    string
 	Subject string
 }
-
-// fetchBody returns any verification code the body carries instead of publishing
-// it, because this runs while holding the account's command connection and the
-// new-mail latency budget leaves no room for extra work under that lock.
 
 // fetchBody returns any verification code the body carries instead of publishing
 // it, because this runs while holding the account's command connection and the
@@ -117,9 +109,6 @@ func (s *Supervisor) fetchBody(ctx context.Context, messageID int64, background 
 	}
 	return otpNotice{Code: code, Subject: message.Subject}, nil
 }
-
-// withinOTPWindow reports whether a message is recent enough that surfacing its
-// verification code as a notification is still useful.
 
 // withinOTPWindow reports whether a message is recent enough that surfacing its
 // verification code as a notification is still useful.
@@ -207,11 +196,6 @@ func (s *Supervisor) bodyWorker(ctx context.Context) {
 		}
 	}
 }
-
-// recordBodyAttempt maintains the per-message failure count the prefetch cap
-// reads. A success clears the entry so a message that recovers is not held
-// against its earlier failures. Cancellation is not a failure of the message: the
-// process is shutting down or the caller went away.
 
 // recordBodyAttempt maintains the per-message failure count the prefetch cap
 // reads. A success clears the entry so a message that recovers is not held

@@ -139,15 +139,6 @@ func (s *Supervisor) Archive(ctx context.Context, messageID int64) error {
 // answers true. An error, or a response whose set cannot be read as UIDs, answers
 // false, because losing another client's pending deletes is worse than leaving one
 // archived message on the server.
-
-// noPendingDeletes reports whether the selected mailbox currently holds no
-// message flagged \Deleted, which is the precondition for a plain EXPUNGE being
-// equivalent to expunging one UID.
-//
-// It is deliberately conservative: only a search that came back and was empty
-// answers true. An error, or a response whose set cannot be read as UIDs, answers
-// false, because losing another client's pending deletes is worse than leaving one
-// archived message on the server.
 func noPendingDeletes(client *imapclient.Client) (bool, error) {
 	data, err := client.UIDSearch(&goimap.SearchCriteria{Flag: []goimap.Flag{goimap.FlagDeleted}}, nil).Wait()
 	if err != nil {
@@ -174,25 +165,7 @@ func noPendingDeletes(client *imapclient.Client) (bool, error) {
 // provider.ClassifyMailbox, otherwise the folder would be created and then not
 // found. The plain root-level name comes first because that is where a provider
 // which allows it puts a real sibling of INBOX.
-
-// archiveCandidateNames are the mailbox names tried when creating an archive
-// folder, in order. Each must classify as the archive role via
-// provider.ClassifyMailbox, otherwise the folder would be created and then not
-// found. The plain root-level name comes first because that is where a provider
-// which allows it puts a real sibling of INBOX.
 var archiveCandidateNames = []string{"Archive", "Archives"}
-
-// ensureArchiveMailbox returns the account's archive mailbox, creating one on the
-// provider when none exists.
-//
-// QQ and 163 ship no archive folder and advertise no \Archive special-use
-// attribute, so the role was simply absent and every archive attempt failed with
-// "archive mailbox is unavailable". Creating the folder is what makes the action
-// mean something on those providers, and it is done once: the second call finds
-// the role and returns immediately.
-//
-// The caller must hold the command lock — this issues CREATE and LIST on the
-// command connection.
 
 // ensureArchiveMailbox returns the account's archive mailbox, creating one on the
 // provider when none exists.
@@ -248,27 +221,12 @@ func (s *Supervisor) ensureArchiveMailbox(ctx context.Context, rt *runtime, clie
 // provider supports CREATE-SPECIAL-USE, so a server that understands roles
 // records this folder as the archive for every other client too. QQ and 163 do
 // not advertise it and get a plain CREATE.
-
-// archiveCreateOptions asks for the \Archive special-use attribute when the
-// provider supports CREATE-SPECIAL-USE, so a server that understands roles
-// records this folder as the archive for every other client too. QQ and 163 do
-// not advertise it and get a plain CREATE.
 func archiveCreateOptions(client *imapclient.Client) *goimap.CreateOptions {
 	if !client.Caps().Has(goimap.Cap("CREATE-SPECIAL-USE")) {
 		return nil
 	}
 	return &goimap.CreateOptions{SpecialUse: []goimap.MailboxAttr{goimap.MailboxAttrArchive}}
 }
-
-// archivePaths returns where to try creating an archive folder called name: at
-// the root first, then under each \Noselect container the provider exposes.
-//
-// QQ accepts both, but a provider that only allows user folders beneath a
-// container ("其他文件夹" on QQ, "[Gmail]" on Gmail) rejects the root-level CREATE,
-// and the nested path is the one that works there. \Noselect is the server's own
-// statement that a folder holds only children, which is why the attribute is used
-// rather than guessing from the stored role — a top-level folder the user created
-// for their own mail must never become the archive's parent.
 
 // archivePaths returns where to try creating an archive folder called name: at
 // the root first, then under each \Noselect container the provider exposes.
@@ -306,13 +264,6 @@ func archivePaths(name string, items []*goimap.ListData) []string {
 //
 // Failures are per account: one offline mailbox must not discard the flags that
 // other accounts already stored.
-
-// SetSeenBulk adds \Seen to many messages, grouped so each account's command
-// connection is taken once. It returns the message IDs the provider accepted so
-// the caller only writes through the rows that really changed remotely.
-//
-// Failures are per account: one offline mailbox must not discard the flags that
-// other accounts already stored.
 func (s *Supervisor) SetSeenBulk(ctx context.Context, messageIDs []int64) ([]int64, error) {
 	locations, err := s.repo.MessageLocations(ctx, messageIDs)
 	if err != nil {
@@ -341,13 +292,6 @@ func (s *Supervisor) SetSeenBulk(ctx context.Context, messageIDs []int64) ([]int
 	}
 	return done, errors.Join(failures...)
 }
-
-// setSeenAccount holds one account's command lock for the duration of one
-// mailbox at a time, not for the whole account. The 5s inbox probe and the
-// IDLE-driven sync contend for the same lock, so a slow mailbox (large chunk,
-// network latency) cannot block the new-mail path for the rest of the
-// account. The lock is released and re-taken per mailbox; the IMAP connection
-// itself is shared and stays put.
 
 // setSeenAccount holds one account's command lock for the duration of one
 // mailbox at a time, not for the whole account. The 5s inbox probe and the

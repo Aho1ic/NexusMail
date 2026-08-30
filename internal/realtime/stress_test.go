@@ -157,7 +157,12 @@ func TestHubSlowClientDoesNotBlockTheOthers(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
-	stalled := &client{send: make(chan []byte, 64), done: make(chan struct{})}
+	// A deliberately small buffer. The burst below is sized to overflow it, so it has
+	// to be far smaller than the 64 slots Serve gives the real client: with both at
+	// 64, the burst is 65 events and the healthy client survives only if Serve has
+	// already drained a frame to its socket, which is a race and not the property
+	// under test.
+	stalled := &client{send: make(chan []byte, 4), done: make(chan struct{})}
 	hub.mu.Lock()
 	hub.clients[stalled] = struct{}{}
 	hub.mu.Unlock()
@@ -200,10 +205,10 @@ func TestHubSlowClientDoesNotBlockTheOthers(t *testing.T) {
 		}
 	}()
 
-	// Fill the stalled client's 64-slot buffer and publish one more, which is the
-	// event that cannot be enqueued. Publish must not block on it, so the loop has
-	// to finish promptly. Kept to exactly the buffer size plus one so the healthy
-	// client's own buffer is never at risk.
+	// Fill the stalled client's buffer and publish one more, which is the event that
+	// cannot be enqueued. Publish must not block on it, so the loop has to finish
+	// promptly. The count stays an order of magnitude below the healthy client's own
+	// capacity so nothing here can evict it as a side effect.
 	done := make(chan struct{})
 	go func() {
 		defer close(done)

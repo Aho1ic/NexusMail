@@ -63,7 +63,13 @@ func New(repo Store, blobs ports.BlobStore, accounts *accountservice.Service, to
 }
 
 func (w *Worker) Start(ctx context.Context) {
-	_ = w.repo.RecoverSendingDrafts(ctx)
+	// A draft left in "sending" by a crash is claimed by nothing: the queue only
+	// reads "queued" and "retry_wait". This sweep is the sole path back, it runs
+	// once per process, and a failure here strands those drafts until the next
+	// restart — so it is the one call in this file that must not fail quietly.
+	if err := w.repo.RecoverSendingDrafts(ctx); err != nil {
+		slog.Error("recover drafts left in sending", "error", err)
+	}
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 	for {
