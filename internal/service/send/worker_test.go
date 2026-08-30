@@ -36,7 +36,7 @@ import (
 // TestDeliverSent walks the success path end to end against a real SMTP
 // conversation: the draft becomes sent, and a message appears in Sent.
 func TestDeliverSent(t *testing.T) {
-	harness := newHarness(t, backend{})
+	harness := newHarness(t, &backend{})
 	draft := harness.queueDraft(t, "Sent path", "hello")
 
 	harness.worker.deliver(context.Background(), draft.ID)
@@ -48,11 +48,11 @@ func TestDeliverSent(t *testing.T) {
 	if stored.SentAt == nil {
 		t.Fatal("sent_at not recorded")
 	}
-	if len(harness.backend.received) != 1 {
-		t.Fatalf("server received %d messages", len(harness.backend.received))
+	if len(harness.backend.messages()) != 1 {
+		t.Fatalf("server received %d messages", len(harness.backend.messages()))
 	}
-	if !strings.Contains(harness.backend.received[0], "Subject:") {
-		t.Fatalf("delivered payload has no header block: %q", harness.backend.received[0])
+	if !strings.Contains(harness.backend.messages()[0], "Subject:") {
+		t.Fatalf("delivered payload has no header block: %q", harness.backend.messages()[0])
 	}
 	if harness.statuses() != "sent" {
 		t.Fatalf("published statuses = %q", harness.statuses())
@@ -71,7 +71,7 @@ func TestDeliverSent(t *testing.T) {
 // TestDeliverPermanentFailure covers a 5xx: no retry, because the server has
 // already made a final decision and retrying only burns the account's reputation.
 func TestDeliverPermanentFailure(t *testing.T) {
-	harness := newHarness(t, backend{rcptErr: &gosmtp.SMTPError{Code: 550, Message: "no such user"}})
+	harness := newHarness(t, &backend{rcptErr: &gosmtp.SMTPError{Code: 550, Message: "no such user"}})
 	draft := harness.queueDraft(t, "Permanent", "hello")
 
 	harness.worker.deliver(context.Background(), draft.ID)
@@ -91,7 +91,7 @@ func TestDeliverPermanentFailure(t *testing.T) {
 // TestDeliverTemporaryFailureRetries covers a 4xx: retry_wait with a scheduled
 // next attempt, which is what makes a greylisting provider eventually succeed.
 func TestDeliverTemporaryFailureRetries(t *testing.T) {
-	harness := newHarness(t, backend{rcptErr: &gosmtp.SMTPError{Code: 451, Message: "try again later"}})
+	harness := newHarness(t, &backend{rcptErr: &gosmtp.SMTPError{Code: 451, Message: "try again later"}})
 	draft := harness.queueDraft(t, "Temporary", "hello")
 
 	before := time.Now().UnixMilli()
@@ -128,7 +128,7 @@ func TestDeliverTemporaryFailureRetries(t *testing.T) {
 // grow, and attempt 5 is the last one. Without the cap a permanently broken account
 // retries forever.
 func TestRetryLadderAndAttemptCap(t *testing.T) {
-	harness := newHarness(t, backend{rcptErr: &gosmtp.SMTPError{Code: 451, Message: "try again later"}})
+	harness := newHarness(t, &backend{rcptErr: &gosmtp.SMTPError{Code: 451, Message: "try again later"}})
 	draft := harness.queueDraft(t, "Ladder", "hello")
 	ctx := context.Background()
 
@@ -172,7 +172,7 @@ func TestRetryLadderAndAttemptCap(t *testing.T) {
 // connection dropped after DATA, so the message may well have been accepted;
 // retrying would deliver it twice. The draft has to stop here and wait for a person.
 func TestDeliverUnknownIsTerminal(t *testing.T) {
-	harness := newHarness(t, backend{dropAfterData: true})
+	harness := newHarness(t, &backend{dropAfterData: true})
 	draft := harness.queueDraft(t, "Unknown", "hello")
 	ctx := context.Background()
 
@@ -213,7 +213,7 @@ func TestDeliverUnknownIsTerminal(t *testing.T) {
 // TestQueueRejectsInFlightDraft guards against a double send from the API: a draft
 // already being delivered cannot be queued again.
 func TestQueueRejectsInFlightDraft(t *testing.T) {
-	harness := newHarness(t, backend{})
+	harness := newHarness(t, &backend{})
 	draft := harness.queueDraft(t, "In flight", "hello")
 	ctx := context.Background()
 
@@ -235,7 +235,7 @@ func TestQueueRejectsInFlightDraft(t *testing.T) {
 // the composed size is known, so an oversize send fails without opening a
 // connection and without consuming a retry budget on the provider.
 func TestDeliverRejectsOversizeMessage(t *testing.T) {
-	harness := newHarness(t, backend{})
+	harness := newHarness(t, &backend{})
 	harness.worker.maxBytes = 32
 	draft := harness.queueDraft(t, "Oversize", strings.Repeat("body ", 200))
 
@@ -245,7 +245,7 @@ func TestDeliverRejectsOversizeMessage(t *testing.T) {
 	if stored.Status != "failed" {
 		t.Fatalf("status = %q, want failed", stored.Status)
 	}
-	if len(harness.backend.received) != 0 {
+	if len(harness.backend.messages()) != 0 {
 		t.Fatal("oversize message was transmitted")
 	}
 	if stored.LastError == nil || !strings.Contains(*stored.LastError, "exceeds") {
@@ -258,7 +258,7 @@ func TestDeliverRejectsOversizeMessage(t *testing.T) {
 // IMAP by another client. Composition has to fail it locally rather than open a
 // connection and let the provider refuse it.
 func TestDeliverRejectsMalformedRecipient(t *testing.T) {
-	harness := newHarness(t, backend{})
+	harness := newHarness(t, &backend{})
 	ctx := context.Background()
 	draft := harness.queueDraftWith(t, "Bad recipient", "hello", `["not an address"]`)
 
@@ -266,7 +266,7 @@ func TestDeliverRejectsMalformedRecipient(t *testing.T) {
 	if stored := harness.draft(t, draft.ID); stored.Status != "failed" {
 		t.Fatalf("status = %q, want failed", stored.Status)
 	}
-	if len(harness.backend.received) != 0 {
+	if len(harness.backend.messages()) != 0 {
 		t.Fatal("a message with an unparseable recipient was transmitted")
 	}
 }
@@ -277,12 +277,17 @@ type harness struct {
 	account domain.Account
 	backend *backend
 	events  *recorder
+	// blobs and dbPath exist for remote_test.go: attachments need a real blob, and
+	// the account's provider column has no setter because it comes from a preset.
+	blobs  *storage.Store
+	dbPath string
 }
 
-func newHarness(t *testing.T, behaviour backend) *harness {
+func newHarness(t *testing.T, behaviour *backend) *harness {
 	t.Helper()
 	root := t.TempDir()
-	repo, err := sqlite.Open(filepath.Join(root, "mail.db"))
+	databasePath := filepath.Join(root, "mail.db")
+	repo, err := sqlite.Open(databasePath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -296,7 +301,7 @@ func newHarness(t *testing.T, behaviour backend) *harness {
 		t.Fatal(err)
 	}
 
-	server := &behaviour
+	server := behaviour
 	host, port, roots := startSMTPServer(t, server)
 	credential, err := json.Marshal(accountservice.Credential{Password: "secret"})
 	if err != nil {
@@ -321,7 +326,7 @@ func newHarness(t *testing.T, behaviour backend) *harness {
 
 	events := &recorder{}
 	worker := New(repo, blobs, accountservice.New(repo, box), stubTokens{}, smtpprovider.NewWithRoots(5*time.Second, roots), events, 1<<20, nil)
-	return &harness{repo: repo, worker: worker, account: account, backend: server, events: events}
+	return &harness{repo: repo, worker: worker, account: account, backend: server, events: events, blobs: blobs, dbPath: databasePath}
 }
 
 func (h *harness) queueDraft(t *testing.T, subject, body string) domain.Draft {
@@ -400,7 +405,19 @@ type backend struct {
 	rcptErr       error
 	dataErr       error
 	dropAfterData bool
-	received      []string
+
+	// Guards the recorded state: one server session runs per connection, and
+	// remote_test.go delivers the same draft from several goroutines at once.
+	mu         sync.Mutex
+	received   []string
+	recipients int
+}
+
+// messages returns a copy of what the server accepted.
+func (b *backend) messages() []string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return append([]string(nil), b.received...)
 }
 
 func (b *backend) NewSession(conn *gosmtp.Conn) (gosmtp.Session, error) {
@@ -415,7 +432,15 @@ type session struct {
 func (s *session) Reset()                                 {}
 func (s *session) Logout() error                          { return nil }
 func (s *session) Mail(string, *gosmtp.MailOptions) error { return nil }
-func (s *session) Rcpt(string, *gosmtp.RcptOptions) error { return s.backend.rcptErr }
+func (s *session) Rcpt(string, *gosmtp.RcptOptions) error {
+	s.backend.mu.Lock()
+	defer s.backend.mu.Unlock()
+	if s.backend.rcptErr != nil {
+		return s.backend.rcptErr
+	}
+	s.backend.recipients++
+	return nil
+}
 
 // The client authenticates with LOGIN, which go-sasl has no server for, so the
 // exchange is scripted here. Credentials are not what these tests check; reaching
@@ -440,17 +465,19 @@ func (s *session) Data(reader io.Reader) error {
 	if err != nil {
 		return err
 	}
-	if s.backend.dropAfterData {
+	s.backend.mu.Lock()
+	drop, dataErr := s.backend.dropAfterData, s.backend.dataErr
+	if !drop && dataErr == nil {
+		s.backend.received = append(s.backend.received, string(body))
+	}
+	s.backend.mu.Unlock()
+	if drop {
 		// The body was accepted and then the connection went away before the reply, so
 		// the client cannot know whether the message was queued.
 		_ = s.conn.Conn().Close()
 		return errors.New("connection lost")
 	}
-	if s.backend.dataErr != nil {
-		return s.backend.dataErr
-	}
-	s.backend.received = append(s.backend.received, string(body))
-	return nil
+	return dataErr
 }
 
 // startSMTPServer runs a real SMTP server on loopback behind implicit TLS and
