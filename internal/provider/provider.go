@@ -1,11 +1,11 @@
 package provider
 
 import (
-	"errors"
 	"strings"
 	"unicode"
 
 	"nexusmail/internal/domain"
+	"nexusmail/internal/ports"
 )
 
 type Preset struct {
@@ -42,7 +42,7 @@ var presets = map[domain.Provider]Preset{
 func Get(name string) (Preset, error) {
 	preset, ok := presets[domain.Provider(strings.ToLower(name))]
 	if !ok {
-		return Preset{}, errors.New("unsupported email provider")
+		return Preset{}, ports.Invalidf("unsupported email provider")
 	}
 	return preset, nil
 }

@@ -1160,19 +1160,7 @@ func (s *Supervisor) reconcileMailboxWithUIDs(ctx context.Context, client *imapc
 	if err != nil {
 		return err
 	}
-	// Only UIDs that were asked about and did not come back are gone. Anything that
-	// arrived after the snapshot above is simply not part of this pass.
-	seen := make(map[uint32]struct{}, len(present))
-	for _, uid := range present {
-		seen[uid] = struct{}{}
-	}
-	stale := make([]uint32, 0, len(stored)-len(present))
-	for _, uid := range stored {
-		if _, ok := seen[uid]; !ok {
-			stale = append(stale, uid)
-		}
-	}
-	removed, err := s.repo.DeleteMailboxUIDs(ctx, mailbox.ID, stale)
+	removed, err := s.repo.DeleteMailboxUIDs(ctx, mailbox.ID, staleUIDs(stored, present))
 	if err != nil {
 		return fmt.Errorf("drop expunged: %w", err)
 	}
@@ -1186,6 +1174,28 @@ func (s *Supervisor) reconcileMailboxWithUIDs(ctx context.Context, client *imapc
 		"bulk": true, "reconciled": changed, "removed": removed, "mailbox_id": mailbox.ID,
 	}})
 	return nil
+}
+
+// staleUIDs returns the UIDs that were asked about and did not come back, which
+// is the only safe definition of "expunged" here: anything that arrived after the
+// caller's snapshot is simply not part of the pass and must be left alone.
+//
+// The result is deliberately not pre-sized from len(stored)-len(present). A
+// provider is free to echo UIDs that were never in the request — some servers
+// answer a chunked UID FETCH with the whole mailbox — which makes that difference
+// negative and panics the calling body worker with "makeslice: cap out of range".
+func staleUIDs(stored, present []uint32) []uint32 {
+	seen := make(map[uint32]struct{}, len(present))
+	for _, uid := range present {
+		seen[uid] = struct{}{}
+	}
+	stale := make([]uint32, 0, len(stored))
+	for _, uid := range stored {
+		if _, ok := seen[uid]; !ok {
+			stale = append(stale, uid)
+		}
+	}
+	return stale
 }
 
 // reconcileFlags fetches the provider's flags for the UIDs held locally and
@@ -1711,7 +1721,7 @@ func (s *Supervisor) fetchBody(ctx context.Context, messageID int64, background 
 	defer rt.unlock()
 	client := rt.client.Load()
 	if client == nil {
-		return otpNotice{}, errors.New("account is offline")
+		return otpNotice{}, ports.Unavailablef("account is offline")
 	}
 	if _, err := client.Select(location.Mailbox.RemoteName, &goimap.SelectOptions{ReadOnly: true}).Wait(); err != nil {
 		return otpNotice{}, err
@@ -1879,7 +1889,7 @@ func (s *Supervisor) FetchAttachment(ctx context.Context, messageID, attachmentI
 	defer rt.unlock()
 	client := rt.client.Load()
 	if client == nil {
-		return domain.BlobObject{}, attachment, errors.New("account is offline")
+		return domain.BlobObject{}, attachment, ports.Unavailablef("account is offline")
 	}
 	if _, err := client.Select(location.Mailbox.RemoteName, &goimap.SelectOptions{ReadOnly: true}).Wait(); err != nil {
 		return domain.BlobObject{}, attachment, err
@@ -1888,7 +1898,7 @@ func (s *Supervisor) FetchAttachment(ctx context.Context, messageID, attachmentI
 	items, err := client.Fetch(goimap.UIDSetNum(goimap.UID(location.UID)), &goimap.FetchOptions{UID: true, BodySection: []*goimap.FetchItemBodySection{section}}).Collect()
 	if err != nil || len(items) == 0 {
 		if err == nil {
-			err = errors.New("attachment not found")
+			err = ports.NotFoundf("attachment not found")
 		}
 		return domain.BlobObject{}, attachment, err
 	}
@@ -1917,13 +1927,23 @@ func (s *Supervisor) SetFlags(ctx context.Context, messageID int64, isRead, isSt
 	defer rt.unlock()
 	client := rt.client.Load()
 	if client == nil {
-		return errors.New("account is offline")
+		return ports.Unavailablef("account is offline")
 	}
 	if _, err := client.Select(location.Mailbox.RemoteName, nil).Wait(); err != nil {
 		return err
 	}
 	uidSet := goimap.UIDSetNum(goimap.UID(location.UID))
-	for flag, value := range map[goimap.Flag]*bool{goimap.FlagSeen: isRead, goimap.FlagFlagged: isStarred} {
+	// Ordered on purpose: a map range would emit the two STOREs in a random order,
+	// so a provider that only reports the last one, or a test asserting the wire
+	// sequence, would see different behaviour run to run.
+	for _, update := range []struct {
+		flag  goimap.Flag
+		value *bool
+	}{
+		{goimap.FlagSeen, isRead},
+		{goimap.FlagFlagged, isStarred},
+	} {
+		flag, value := update.flag, update.value
 		if value == nil {
 			continue
 		}
@@ -1951,7 +1971,7 @@ func (s *Supervisor) Archive(ctx context.Context, messageID int64) error {
 	defer rt.unlock()
 	client := rt.client.Load()
 	if client == nil {
-		return errors.New("account is offline")
+		return ports.Unavailablef("account is offline")
 	}
 	destination, err := s.ensureArchiveMailbox(ctx, rt, client)
 	if err != nil {
@@ -2091,9 +2111,9 @@ func (s *Supervisor) ensureArchiveMailbox(ctx context.Context, rt *runtime, clie
 		}
 	}
 	if len(createErrs) > 0 {
-		return domain.Mailbox{}, fmt.Errorf("archive mailbox is unavailable: %w", errors.Join(createErrs...))
+		return domain.Mailbox{}, ports.Unavailablef("archive mailbox is unavailable: %w", errors.Join(createErrs...))
 	}
-	return domain.Mailbox{}, errors.New("archive mailbox is unavailable")
+	return domain.Mailbox{}, ports.Unavailablef("archive mailbox is unavailable")
 }
 
 // archiveCreateOptions asks for the \Archive special-use attribute when the
@@ -2193,7 +2213,7 @@ func (s *Supervisor) setSeenAccount(ctx context.Context, accountID int64, byMail
 		client := rt.client.Load()
 		if client == nil {
 			rt.unlock()
-			return nil, errors.New("account is offline")
+			return nil, ports.Unavailablef("account is offline")
 		}
 		if _, err := client.Select(group[0].Mailbox.RemoteName, nil).Wait(); err != nil {
 			failures = append(failures, fmt.Errorf("select %q: %w", group[0].Mailbox.RemoteName, err))
@@ -2249,7 +2269,7 @@ func parsePartID(value string) ([]int, error) {
 	for i, part := range parts {
 		n, err := strconv.Atoi(part)
 		if err != nil || n <= 0 {
-			return nil, errors.New("invalid attachment part")
+			return nil, ports.Invalidf("invalid attachment part")
 		}
 		result[i] = n
 	}
@@ -2270,7 +2290,7 @@ func (s *Supervisor) SyncDraft(ctx context.Context, draftID int64) error {
 	}
 	mailbox, err := s.repo.GetMailboxByRole(ctx, draft.AccountID, "drafts")
 	if err != nil {
-		return errors.New("remote drafts mailbox is unavailable")
+		return ports.Unavailablef("remote drafts mailbox is unavailable")
 	}
 	to, err := decodeDraftAddresses(draft.ToJSON)
 	if err != nil {
@@ -2318,7 +2338,7 @@ func (s *Supervisor) SyncDraft(ctx context.Context, draftID int64) error {
 	defer rt.unlock()
 	client := rt.client.Load()
 	if client == nil {
-		return errors.New("account is offline")
+		return ports.Unavailablef("account is offline")
 	}
 	command := client.Append(mailbox.RemoteName, int64(len(payload)), &goimap.AppendOptions{Flags: []goimap.Flag{goimap.FlagDraft}, Time: time.Now()})
 	if _, err := command.Write(payload); err != nil {
@@ -2364,7 +2384,7 @@ func (s *Supervisor) DeleteRemoteDraft(ctx context.Context, draftID int64) error
 	defer rt.unlock()
 	client := rt.client.Load()
 	if client == nil {
-		return errors.New("account is offline")
+		return ports.Unavailablef("account is offline")
 	}
 	selected, err := client.Select(mailbox.RemoteName, nil).Wait()
 	if err != nil {
@@ -2387,7 +2407,7 @@ func (s *Supervisor) DeleteRemoteDraft(ctx context.Context, draftID int64) error
 func (s *Supervisor) AppendSent(ctx context.Context, accountID int64, payload []byte) error {
 	mailbox, err := s.repo.GetMailboxByRole(ctx, accountID, "sent")
 	if err != nil {
-		return errors.New("remote sent mailbox is unavailable")
+		return ports.Unavailablef("remote sent mailbox is unavailable")
 	}
 	rt, err := s.runtime(accountID)
 	if err != nil {
@@ -2397,7 +2417,7 @@ func (s *Supervisor) AppendSent(ctx context.Context, accountID int64, payload []
 	defer rt.unlock()
 	client := rt.client.Load()
 	if client == nil {
-		return errors.New("account is offline")
+		return ports.Unavailablef("account is offline")
 	}
 	command := client.Append(mailbox.RemoteName, int64(len(payload)), &goimap.AppendOptions{Flags: []goimap.Flag{goimap.FlagSeen}, Time: time.Now()})
 	if _, err := command.Write(payload); err != nil {

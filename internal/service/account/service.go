@@ -32,17 +32,17 @@ func (s *Service) AddPassword(ctx context.Context, providerName, email, displayN
 		return domain.Account{}, err
 	}
 	if preset.AuthType != "password" {
-		return domain.Account{}, errors.New("provider requires OAuth2")
+		return domain.Account{}, ports.Invalidf("provider requires OAuth2")
 	}
 	address, err := mail.ParseAddress(strings.TrimSpace(email))
 	if err != nil || address.Address != strings.TrimSpace(email) {
-		return domain.Account{}, errors.New("invalid email address")
+		return domain.Account{}, ports.Invalidf("invalid email address")
 	}
 	if username == "" {
 		username = address.Address
 	}
 	if password == "" {
-		return domain.Account{}, errors.New("authorization code is required")
+		return domain.Account{}, ports.Invalidf("authorization code is required")
 	}
 	return s.create(ctx, preset, address.Address, displayName, username, Credential{Password: password})
 }
@@ -53,7 +53,7 @@ func (s *Service) AddOAuth(ctx context.Context, providerName, email, displayName
 		return domain.Account{}, err
 	}
 	if preset.AuthType != "oauth2" || refreshToken == "" {
-		return domain.Account{}, errors.New("invalid OAuth account")
+		return domain.Account{}, ports.Invalidf("invalid OAuth account")
 	}
 	return s.create(ctx, preset, email, displayName, email, Credential{RefreshToken: refreshToken})
 }

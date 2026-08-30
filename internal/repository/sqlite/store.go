@@ -26,7 +26,25 @@ import (
 	"gorm.io/gorm/logger"
 )
 
-var ErrConflict = errors.New("revision conflict")
+// ErrConflict is a lost optimistic-lock race on a draft. It is classified as
+// ports.ErrConflict so the transport can map it to 409 without reading its text,
+// while errors.Is(err, ErrConflict) keeps working for callers that care about
+// this specific cause.
+var ErrConflict = ports.Conflictf("revision conflict")
+
+// classifyRead translates the driver's "record not found" into the port-level
+// sentinel on its way out of the repository. Without it every caller that wants
+// to distinguish a missing row from a real failure has to import gorm, which puts
+// the persistence library in the transport and service layers.
+//
+// The gorm error stays in the chain, so errors.Is(err, gorm.ErrRecordNotFound)
+// keeps working inside this package, and the message the client sees is unchanged.
+func classifyRead(err error) error {
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return ports.NotFoundf("%w", err)
+	}
+	return err
+}
 
 const (
 	// maxBulkMessageIDs bounds one bulk mark-read so a stale view cannot queue an
@@ -205,7 +223,7 @@ func (s *Store) CreateAccount(ctx context.Context, account *domain.Account) erro
 func (s *Store) GetAccount(ctx context.Context, id int64) (domain.Account, error) {
 	var account domain.Account
 	err := s.db.WithContext(ctx).First(&account, id).Error
-	return account, err
+	return account, classifyRead(err)
 }
 
 func (s *Store) ListAccounts(ctx context.Context) ([]domain.Account, error) {
@@ -613,7 +631,7 @@ func (s *Store) UpdateMessages(ctx context.Context, ids []int64, patch ports.Mes
 func (s *Store) GetMessage(ctx context.Context, id int64) (domain.Message, []domain.Attachment, error) {
 	var message domain.Message
 	if err := s.db.WithContext(ctx).First(&message, id).Error; err != nil {
-		return message, nil, err
+		return message, nil, classifyRead(err)
 	}
 	var attachments []domain.Attachment
 	err := s.db.WithContext(ctx).Where("message_id = ?", id).Order("id").Find(&attachments).Error
@@ -634,13 +652,16 @@ func (s *Store) UpdateMessage(ctx context.Context, id int64, patch ports.Message
 	if err := s.db.WithContext(ctx).Model(&domain.Message{}).Where("id = ?", id).Updates(updates).Error; err != nil {
 		return domain.Message{}, err
 	}
-	return s.GetMessageOnly(ctx, id)
+	return s.messageByID(ctx, id)
 }
 
-func (s *Store) GetMessageOnly(ctx context.Context, id int64) (domain.Message, error) {
+// messageByID reads one message row without its attachments. It is unexported
+// because nothing outside this package has a use for a message without them;
+// ports.Repository intentionally only offers GetMessage.
+func (s *Store) messageByID(ctx context.Context, id int64) (domain.Message, error) {
 	var message domain.Message
 	err := s.db.WithContext(ctx).First(&message, id).Error
-	return message, err
+	return message, classifyRead(err)
 }
 
 func quoteFTS(input string) string { return `"` + strings.ReplaceAll(input, `"`, `""`) + `"` }
@@ -656,11 +677,11 @@ func encodeCursor(value cursorValue) string {
 func decodeCursor(value string) (cursorValue, error) {
 	b, err := base64.RawURLEncoding.DecodeString(value)
 	if err != nil {
-		return cursorValue{}, errors.New("invalid cursor")
+		return cursorValue{}, ports.Invalidf("invalid cursor")
 	}
 	var cursor cursorValue
 	if err := json.Unmarshal(b, &cursor); err != nil || cursor.ID <= 0 {
-		return cursorValue{}, errors.New("invalid cursor")
+		return cursorValue{}, ports.Invalidf("invalid cursor")
 	}
 	return cursor, nil
 }

@@ -79,7 +79,7 @@ func (w *Worker) Queue(ctx context.Context, id int64) error {
 		return err
 	}
 	if draft.Status != "draft" && draft.Status != "failed" && draft.Status != "unknown" {
-		return errors.New("draft cannot be queued in its current state")
+		return ports.Conflictf("draft cannot be queued in its current state")
 	}
 	if err := w.repo.SetDraftDelivery(ctx, id, "queued", draft.AttemptCount, nil, nil, nil, nil); err != nil {
 		return err

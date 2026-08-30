@@ -45,7 +45,7 @@ func New(repo ports.Repository, events ports.Publisher, remote RemoteSyncer) *Se
 
 func (s *Service) Create(ctx context.Context, input Input) (domain.Draft, error) {
 	if input.AccountID <= 0 {
-		return domain.Draft{}, errors.New("account_id is required")
+		return domain.Draft{}, ports.Invalidf("account_id is required")
 	}
 	if err := validateRecipients(input.To, input.CC, input.BCC); err != nil {
 		return domain.Draft{}, err
@@ -92,7 +92,11 @@ func (s *Service) Get(ctx context.Context, id int64) (domain.Draft, []domain.Dra
 }
 func (s *Service) Delete(ctx context.Context, id int64) error {
 	if s.remote != nil {
-		if err := s.remote.DeleteRemoteDraft(ctx, id); err != nil && !strings.Contains(err.Error(), "not found") {
+		// A draft the provider no longer has is the outcome the caller wanted, so
+		// only a different remote failure blocks the local delete. Matched on the
+		// sentinel: the previous substring check on "not found" also swallowed any
+		// unrelated error whose text happened to contain those words.
+		if err := s.remote.DeleteRemoteDraft(ctx, id); err != nil && !errors.Is(err, ports.ErrNotFound) {
 			return err
 		}
 	}
@@ -123,7 +127,7 @@ func validateRecipients(groups ...[]string) error {
 		for _, value := range group {
 			address, err := mail.ParseAddress(value)
 			if err != nil || address.Address == "" {
-				return fmt.Errorf("invalid recipient: %s", value)
+				return ports.Invalidf("invalid recipient: %s", value)
 			}
 		}
 	}

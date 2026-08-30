@@ -31,7 +31,6 @@ import (
 
 	"github.com/coder/websocket"
 	"github.com/gin-gonic/gin"
-	"gorm.io/gorm"
 )
 
 type Hub interface {
@@ -691,20 +690,30 @@ func fail(c *gin.Context, status int, code, message string, details any) {
 	requestID, _ := c.Get("request_id")
 	c.JSON(status, gin.H{"error": gin.H{"code": code, "message": message, "request_id": requestID, "details": details}})
 }
+// writeError maps a failure to a status from the class its producer declared, via
+// the ports sentinels. It used to sniff substrings — "invalid" or "required" meant
+// 400, "offline" meant 503 — which failed in both directions: only the 500 branch
+// redacts, so any internal error whose text happened to contain one of those words
+// was echoed to the client verbatim, and any deliberate 400 whose wording drifted
+// silently became a redacted 500.
+//
+// Anything unclassified is an internal failure by definition: it gets 500 and its
+// text is dropped rather than being guessed at.
 func writeError(c *gin.Context, err error) {
 	status, code := 500, "internal_error"
 	switch {
-	case errors.Is(err, gorm.ErrRecordNotFound):
+	case errors.Is(err, ports.ErrNotFound):
 		status, code = 404, "not_found"
-	case strings.Contains(err.Error(), "revision conflict"), strings.Contains(err.Error(), "current state"):
+	case errors.Is(err, ports.ErrConflict):
 		status, code = 409, "conflict"
-	case strings.Contains(err.Error(), "invalid"), strings.Contains(err.Error(), "required"), strings.Contains(err.Error(), "unsupported"):
+	case errors.Is(err, ports.ErrInvalidInput):
 		status, code = 400, "invalid_request"
-	case strings.Contains(err.Error(), "offline"), strings.Contains(err.Error(), "unavailable"):
+	case errors.Is(err, ports.ErrUnavailable):
 		status, code = 503, "provider_unavailable"
 	}
 	message := err.Error()
 	if status == 500 {
+		slog.Error("request failed", "request_id", c.GetString("request_id"), "path", c.FullPath(), "error", err)
 		message = "internal server error"
 	}
 	fail(c, status, code, message, nil)

@@ -343,7 +343,7 @@ func TestUnreadMessageIDsScopeAndBulkUpdate(t *testing.T) {
 		t.Fatalf("bulk update: %v", err)
 	}
 	for _, id := range all {
-		message, err := store.GetMessageOnly(ctx, id)
+		message, err := store.messageByID(ctx, id)
 		if err != nil || !message.IsRead {
 			t.Fatalf("message %d is_read=%v err=%v, want read", id, message.IsRead, err)
 		}
@@ -353,7 +353,7 @@ func TestUnreadMessageIDsScopeAndBulkUpdate(t *testing.T) {
 	}
 	// The outgoing message was never in scope, so the bulk patch must not have
 	// touched it.
-	if message, err := store.GetMessageOnly(ctx, outgoing); err != nil || message.IsRead {
+	if message, err := store.messageByID(ctx, outgoing); err != nil || message.IsRead {
 		t.Fatalf("outgoing message is_read=%v err=%v, want untouched", message.IsRead, err)
 	}
 	if err := store.UpdateMessages(ctx, nil, ports.MessagePatch{IsRead: &value}); err != nil {

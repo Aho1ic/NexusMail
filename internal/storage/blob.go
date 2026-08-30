@@ -31,7 +31,7 @@ func New(root string, maxBytes int64, repo ports.Repository) (*Store, error) {
 
 func (s *Store) Put(ctx context.Context, reader io.Reader, durability string) (domain.BlobObject, error) {
 	if durability != "cache" && durability != "durable" {
-		return domain.BlobObject{}, errors.New("invalid blob durability")
+		return domain.BlobObject{}, ports.Invalidf("invalid blob durability")
 	}
 	temp, err := os.CreateTemp(s.root, ".upload-*")
 	if err != nil {
@@ -71,16 +71,19 @@ func (s *Store) Put(ctx context.Context, reader io.Reader, durability string) (d
 	return blob, nil
 }
 
-func (s *Store) Open(ctx context.Context, blob domain.BlobObject) (io.ReadCloser, error) {
+// Open reads a stored blob. ctx is part of the ports.BlobStore contract and is
+// unused here because the local filesystem read is not cancellable; a remote
+// implementation of the same port would need it.
+func (s *Store) Open(_ context.Context, blob domain.BlobObject) (io.ReadCloser, error) {
 	if !safeStorageKey(blob.StorageKey) {
-		return nil, errors.New("invalid blob storage key")
+		return nil, ports.Invalidf("invalid blob storage key")
 	}
 	return os.Open(filepath.Join(s.root, blob.StorageKey))
 }
 
 func (s *Store) Remove(ctx context.Context, blob domain.BlobObject) error {
 	if !safeStorageKey(blob.StorageKey) {
-		return errors.New("invalid blob storage key")
+		return ports.Invalidf("invalid blob storage key")
 	}
 	if err := os.Remove(filepath.Join(s.root, blob.StorageKey)); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err

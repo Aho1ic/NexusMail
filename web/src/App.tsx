@@ -303,7 +303,37 @@ function Composer({ accounts, replyTo, initialDraft, onClose, onSent }: { accoun
   const [busy, setBusy] = useState(false)
   const [status, setStatus] = useState('尚未保存')
   const timer = useRef<number | undefined>(undefined)
+  // The draft is mirrored in a ref because three callers persist it — the autosave
+  // timer, send and attach — and each has to see what the others already created.
+  // Reading the state variable instead captured whatever value existed when the
+  // closure was made: two edits two seconds apart both ran with draft === null and
+  // each POSTed a new draft, so the second one silently orphaned the first.
+  const draftRef = useRef<Draft | null>(initialDraft)
+  const latest = useRef<DraftInput | null>(null)
+  // Saves are chained rather than fired independently: a create that is still in
+  // flight has not returned an id yet, so a concurrent save has nothing to update
+  // and would create a second draft.
+  const saving = useRef<Promise<unknown>>(Promise.resolve())
   const input: DraftInput = useMemo(() => ({ account_id: accountID, to: splitEmails(to), cc: splitEmails(cc), bcc: splitEmails(bcc), subject, body_text: body }), [accountID, to, cc, bcc, subject, body])
+  latest.current = input
+
+  // persist writes the newest input and returns the stored draft. Callers never
+  // pass the draft in: whether this is a create or an update is decided at the
+  // moment the turn actually runs, after any earlier save has settled.
+  const persist = useCallback(async () => {
+    const run = saving.current.then(async () => {
+      const payload = latest.current!
+      const current = draftRef.current
+      const saved = current ? await api.updateDraft(current.id, current.revision, payload) : await api.createDraft(payload)
+      draftRef.current = saved
+      setDraft(saved)
+      return saved
+    })
+    // Keep the chain alive after a rejection so one failed save does not wedge
+    // every later one, while still surfacing the error to this caller.
+    saving.current = run.catch(() => undefined)
+    return run
+  }, [])
 
   useEffect(() => {
     if (!accountID) return
@@ -311,23 +341,28 @@ function Composer({ accounts, replyTo, initialDraft, onClose, onSent }: { accoun
     timer.current = window.setTimeout(async () => {
       try {
         setStatus('保存中…')
-        const saved = draft ? await api.updateDraft(draft.id, draft.revision, input) : await api.createDraft(input)
-        setDraft(saved); setStatus(saved.remote_sync_state === 'synced' ? '已同步到远端' : '已保存，等待远端同步')
+        const saved = await persist()
+        setStatus(saved.remote_sync_state === 'synced' ? '已同步到远端' : '已保存，等待远端同步')
       } catch (err) { setStatus(messageOf(err)) }
     }, 2000)
     return () => clearTimeout(timer.current)
-  }, [input]) // eslint-disable-line react-hooks/exhaustive-deps
+  }, [input, accountID, persist])
 
   async function send() {
     setBusy(true)
+    // A pending autosave would otherwise land after the send and revive the draft.
+    window.clearTimeout(timer.current)
     try {
-      const saved = draft ? await api.updateDraft(draft.id, draft.revision, input) : await api.createDraft(input)
+      const saved = await persist()
       await api.sendDraft(saved.id); onSent()
     } catch (err) { setStatus(messageOf(err)); setBusy(false) }
   }
   async function attach(file?: File) {
     if (!file) return
-    try { const saved = draft ?? await api.createDraft(input); setDraft(saved); await api.uploadAttachment(saved.id, file); setStatus(`已添加 ${file.name}`) } catch (err) { setStatus(messageOf(err)) }
+    try {
+      const saved = await persist()
+      await api.uploadAttachment(saved.id, file); setStatus(`已添加 ${file.name}`)
+    } catch (err) { setStatus(messageOf(err)) }
   }
   return <div className="modal-backdrop"><div className="flex h-[min(92vh,760px)] w-[min(94vw,760px)] flex-col overflow-hidden rounded-[1.7rem] bg-white shadow-2xl">
     <header className="flex items-center justify-between border-b border-black/5 px-5 py-4"><div><h2 className="font-serif text-2xl">新邮件</h2><p className="text-[10px] text-black/35">{status}</p></div><button onClick={onClose} className="icon-button"><X size={19} /></button></header>

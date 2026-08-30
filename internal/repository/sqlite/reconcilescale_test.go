@@ -6,6 +6,8 @@ import (
 	"context"
 	"crypto/sha256"
 	"fmt"
+	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -112,7 +114,53 @@ func TestReconcileScaleCost(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Logf("DeleteMailboxUIDs with 1 stale UID took %s, removed=%d", time.Since(start), removed)
+	elapsed = time.Since(start)
+	t.Logf("DeleteMailboxUIDs with 1 stale UID took %s, removed=%d", elapsed, removed)
+	if removed != 1 {
+		t.Fatalf("removed = %d, want 1", removed)
+	}
+	// writeMu is held for the whole call, so this is time no newly arrived message
+	// can be inserted. The sweep used to be `id NOT IN (SELECT message_id FROM
+	// mailbox_messages)` across the whole table, which cost the same whether one
+	// UID or ten thousand were expunged.
+	if elapsed > time.Second {
+		t.Errorf("expunging 1 uid out of %d held writeMu for %s", total, elapsed)
+	}
+}
+
+// TestOrphanSweepIsIndexed asserts the plan rather than the clock: a full scan of
+// messages is fast enough at test scale to pass a timing bound while still costing
+// seconds on a real 100k-message account.
+func TestOrphanSweepIsIndexed(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+	account, mailbox := seedAccountMailbox(t, store)
+	bulkSeed(t, store, account.ID, mailbox.ID, 200)
+
+	var steps []struct {
+		Detail string `gorm:"column:detail"`
+	}
+	// The statement under test is the shipped constant, so reverting the sweep to an
+	// unbounded form fails here rather than only showing up as latency in production.
+	err := store.db.WithContext(ctx).Raw("EXPLAIN QUERY PLAN "+orphanSweepSQL, []int64{1, 2, 3}).Scan(&steps).Error
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan := make([]string, 0, len(steps))
+	for _, step := range steps {
+		plan = append(plan, step.Detail)
+	}
+	t.Logf("orphan sweep plan: %v", plan)
+	for _, detail := range plan {
+		// "SCAN messages" is the shape being ruled out; "SEARCH messages" over the
+		// rowid list is the shape being required.
+		if strings.Contains(detail, "SCAN messages") {
+			t.Fatalf("orphan sweep scans the whole messages table: %v", plan)
+		}
+	}
+	if !slices.ContainsFunc(plan, func(detail string) bool { return strings.Contains(detail, "SEARCH messages") }) {
+		t.Fatalf("orphan sweep does not look up messages by rowid: %v", plan)
+	}
 }
 
 // bulkSeed inserts count messages through the production write path so the FTS

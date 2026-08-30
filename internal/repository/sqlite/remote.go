@@ -14,13 +14,13 @@ import (
 func (s *Store) GetMailboxByRole(ctx context.Context, accountID int64, role string) (domain.Mailbox, error) {
 	var mailbox domain.Mailbox
 	err := s.db.WithContext(ctx).Where("account_id = ? AND role = ?", accountID, role).Order("id").First(&mailbox).Error
-	return mailbox, err
+	return mailbox, classifyRead(err)
 }
 
 func (s *Store) GetMailbox(ctx context.Context, id int64) (domain.Mailbox, error) {
 	var mailbox domain.Mailbox
 	err := s.db.WithContext(ctx).First(&mailbox, id).Error
-	return mailbox, err
+	return mailbox, classifyRead(err)
 }
 
 func (s *Store) UpdateMailboxCursor(ctx context.Context, id int64, uidValidity, lastUID uint32, uidNext *uint32, highestModSeq *uint64) error {
@@ -138,6 +138,12 @@ func (s *Store) ListMailboxUIDs(ctx context.Context, mailboxID int64) ([]uint32,
 // remain: deriving the stale set here from "everything not in this list" would
 // delete any row inserted after the caller took its snapshot, which for the inbox
 // means deleting mail that had just arrived.
+// orphanSweepSQL removes messages left in no mailbox by a delete pass, bounded to
+// the ids that pass actually unmapped. It is a named constant so the query plan
+// test runs against the statement that ships rather than against a copy of it.
+const orphanSweepSQL = `DELETE FROM messages WHERE direction = 'incoming' AND id IN ?
+    AND NOT EXISTS (SELECT 1 FROM mailbox_messages WHERE message_id = messages.id)`
+
 func (s *Store) DeleteMailboxUIDs(ctx context.Context, mailboxID int64, stale []uint32) (int, error) {
 	if len(stale) == 0 {
 		return 0, nil
@@ -146,9 +152,19 @@ func (s *Store) DeleteMailboxUIDs(ctx context.Context, mailboxID int64, stale []
 	defer s.writeMu.Unlock()
 	removed := 0
 	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		// The message ids behind the doomed mappings are read first: after the
+		// mappings are gone there is no way to name them, and they are what bounds
+		// the orphan sweep below.
+		var affected []int64
 		for start := 0; start < len(stale); start += sqliteParameterChunk {
 			end := min(start+sqliteParameterChunk, len(stale))
-			result := tx.Exec("DELETE FROM mailbox_messages WHERE mailbox_id = ? AND uid IN ?", mailboxID, stale[start:end])
+			chunk := stale[start:end]
+			var ids []int64
+			if err := tx.Raw("SELECT message_id FROM mailbox_messages WHERE mailbox_id = ? AND uid IN ?", mailboxID, chunk).Scan(&ids).Error; err != nil {
+				return err
+			}
+			affected = append(affected, ids...)
+			result := tx.Exec("DELETE FROM mailbox_messages WHERE mailbox_id = ? AND uid IN ?", mailboxID, chunk)
 			if result.Error != nil {
 				return result.Error
 			}
@@ -160,8 +176,20 @@ func (s *Store) DeleteMailboxUIDs(ctx context.Context, mailboxID int64, stale []
 		// An incoming message that is in no mailbox is unreachable: it cannot be
 		// opened, its body cannot be fetched, and it would sit in the feed as a
 		// permanent error. Outgoing mail has no mailbox mapping by design.
-		return tx.Exec(`DELETE FROM messages WHERE direction = 'incoming'
-            AND id NOT IN (SELECT message_id FROM mailbox_messages)`).Error
+		//
+		// Scoped to the ids this pass actually unmapped. The earlier form was
+		// `id NOT IN (SELECT message_id FROM mailbox_messages)` over the whole
+		// messages table, which scanned every message and re-materialised every
+		// mapping on each reconcile that expunged even one UID — and it also made
+		// the sweep's cost independent of how much was deleted, so the cheapest
+		// possible correction paid the full price.
+		for start := 0; start < len(affected); start += sqliteParameterChunk {
+			end := min(start+sqliteParameterChunk, len(affected))
+			if err := tx.Exec(orphanSweepSQL, affected[start:end]).Error; err != nil {
+				return err
+			}
+		}
+		return nil
 	})
 	return removed, err
 }
@@ -181,13 +209,13 @@ func (s *Store) MessageLocation(ctx context.Context, messageID int64) (ports.Mes
 		if err == nil {
 			err = gorm.ErrRecordNotFound
 		}
-		return location, err
+		return location, classifyRead(err)
 	}
 	if err = s.db.WithContext(ctx).First(&location.Account, mapping.AccountID).Error; err != nil {
-		return location, err
+		return location, classifyRead(err)
 	}
 	if err = s.db.WithContext(ctx).First(&location.Mailbox, mapping.MailboxID).Error; err != nil {
-		return location, err
+		return location, classifyRead(err)
 	}
 	location.UID = mapping.UID
 	location.MessageID = messageID
@@ -385,7 +413,7 @@ func (s *Store) BatchUpsertAttachments(ctx context.Context, attachments []domain
 func (s *Store) GetAttachment(ctx context.Context, messageID, attachmentID int64) (domain.Attachment, error) {
 	var attachment domain.Attachment
 	err := s.db.WithContext(ctx).Where("id = ? AND message_id = ?", attachmentID, messageID).First(&attachment).Error
-	return attachment, err
+	return attachment, classifyRead(err)
 }
 
 func (s *Store) UpdateAttachmentBlob(ctx context.Context, id, blobID int64) error {

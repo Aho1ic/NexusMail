@@ -33,7 +33,7 @@ func (s *Store) ListDrafts(ctx context.Context, status string) ([]domain.Draft, 
 func (s *Store) GetDraft(ctx context.Context, id int64) (domain.Draft, []domain.DraftAttachment, error) {
 	var draft domain.Draft
 	if err := s.db.WithContext(ctx).First(&draft, id).Error; err != nil {
-		return draft, nil, err
+		return draft, nil, classifyRead(err)
 	}
 	var attachments []domain.DraftAttachment
 	err := s.db.WithContext(ctx).Where("draft_id = ?", id).Order("position, id").Find(&attachments).Error
@@ -155,7 +155,7 @@ func (s *Store) DeleteDraft(ctx context.Context, id int64) error {
 	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var draft domain.Draft
 		if err := tx.First(&draft, id).Error; err != nil {
-			return err
+			return classifyRead(err)
 		}
 		if draft.Status == "sending" || draft.Status == "queued" {
 			return ErrConflict
@@ -187,7 +187,7 @@ func (s *Store) GetBlob(ctx context.Context, id int64) (domain.BlobObject, error
 	var blob domain.BlobObject
 	err := s.db.WithContext(ctx).First(&blob, id).Error
 	if err != nil {
-		return blob, err
+		return blob, classifyRead(err)
 	}
 	// Hold writeMu for the LRU bookkeeping: every other write path does, and
 	// the row is the input to the eviction decision. Without the lock, a
