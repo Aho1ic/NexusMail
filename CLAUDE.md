@@ -78,6 +78,8 @@ cd web && npx playwright test e2e/mailbox.spec.ts
 
 **任何新增的命令连接操作都必须显式选择其中之一**。用错会让新邮件同步排在正文预取积压之后，重现历史上的分钟级延迟问题。
 
+抢占只在 `urgent` 抬起后才生效，所以**任何在 `rt.lock()` 之前的阻塞都会架空它**。`body.go` 的 `bodySlots` 信号量踩过这一点：它曾按 worker 数量（4）在前后台之间共用，4 个 worker 占满全部 slot，前台正文抓取阻塞在信号量上、还没来得及抬 `urgent`，于是既没抢占预取也没被计为等待。现在只有前台占 slot（预取由 worker 数量自然设界）。新增排队原语时，先确认它不在 `urgent` 的保护范围之外。
+
 ### 持久化
 
 - `internal/repository/sqlite/store.go` 用单个 `writeMu` 串行化**全部写操作**；读路径不加锁。新增写方法必须同样持有它，否则在 WAL + 8 连接池下会出现 `SQLITE_BUSY`。
