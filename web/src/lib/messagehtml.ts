@@ -16,6 +16,13 @@ const bodyStyles = `
   /* Wide fixed-width mail (the 600px newsletter) scrolls in place instead of
      forcing the whole pane sideways or being squeezed out of proportion. */
   .nexusmail-scroll{max-width:100%;overflow-x:auto}
+  /* The frame is now much wider than the fixed width most newsletters are built
+     for, which would leave a 600px design pinned to the left with the rest of the
+     frame empty. Only the outermost table is centred — the wrapper never holds a
+     nested one — so no layout inside the sender's design is touched, and a table
+     wider than the frame ignores auto margins and still starts at the scroll
+     origin. */
+  .nexusmail-scroll > table{margin-inline:auto}
   /* Only tables that carry a header row or an explicit border are data tables;
      giving layout tables the same rules would draw grid lines through a design
      that never asked for them. The cell rules key off a class placed on the
