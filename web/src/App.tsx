@@ -198,17 +198,23 @@ function MailboxApp({ onLogout }: { onLogout: () => void }) {
   // Three stacked layers: the lit stage, the frosted shell floating on it, and the
   // panes floating inside the shell. The orbs sit behind the shell and are decorative
   // only — they are hidden below md, where the shell is full-bleed and no gutter shows.
-  // The gutter only widens from lg. At md the three panes are still flush, so every
-  // pixel of padding comes straight out of a reading pane that is already narrow
-  // there — p-4 keeps that cost to 8px against the previous p-3.
-  return <div className="app-stage relative isolate h-screen overflow-hidden p-0 text-ink md:p-4 lg:p-7 xl:p-9">
+  // The gutter is deliberately thin and does not grow with the viewport: it exists
+  // only to give the shell's radius and shadow somewhere to land. At 8px the shell is
+  // within 0.5% of the full viewport, and dropping to 0 would buy that back at the
+  // cost of clipping the shadow against the screen edge.
+  return <div className="app-stage relative isolate h-screen overflow-hidden p-0 text-ink md:p-2">
     <div aria-hidden className="pointer-events-none absolute -left-16 -top-24 hidden h-[26rem] w-[26rem] rounded-full bg-sage/70 blur-[110px] md:block" />
     <div aria-hidden className="pointer-events-none absolute -bottom-28 -right-20 hidden h-[30rem] w-[30rem] rounded-full bg-coral/20 blur-[120px] md:block" />
     <div aria-hidden className="pointer-events-none absolute -top-32 right-1/4 hidden h-[22rem] w-[22rem] rounded-full bg-pine/10 blur-[130px] lg:block" />
-    {/* The frosted frame is only visible in the padding that starts at lg — at md the
+    {/* No width cap: the shell fills the viewport. The old max-w-[1680px] was the
+        real source of the empty margin — on a 2560px screen it left 440px unused on
+        each side, against 36px from the padding. Wide screens are safe because the
+        reading pane caps its own text at max-w-3xl, so the extra width becomes
+        margin around the article rather than 200-character lines.
+        The frosted frame is only visible in the padding that starts at lg — at md the
         panes cover the shell edge to edge, so the blur is composited there for
         nothing. Hence the glass is an lg treatment and md stays opaque. */}
-    <div className="relative mx-auto flex h-full max-w-[1680px] overflow-hidden bg-white md:rounded-shell md:border md:border-white/60 md:shadow-stage lg:gap-2.5 lg:bg-white/55 lg:p-2.5 lg:backdrop-blur-2xl">
+    <div className="relative flex h-full w-full overflow-hidden bg-white md:rounded-shell md:border md:border-white/60 md:shadow-stage lg:gap-2.5 lg:bg-white/55 lg:p-2.5 lg:backdrop-blur-2xl">
       <MailboxNav visible={pane === 'nav'} accounts={accounts} mailboxes={mailboxes} selectedAccount={selectedAccount} selectedMailbox={selectedMailbox} unreadCount={unreadCount}
         onCompose={() => compose()}
         onSelectAll={() => { setSelectedAccount(null); setSelectedMailbox(null); setPane('list') }}
