@@ -195,8 +195,20 @@ function MailboxApp({ onLogout }: { onLogout: () => void }) {
     ? mailboxes.find(box => box.id === selectedMailbox)?.display_name
     : selectedAccount ? accountMap.get(selectedAccount)?.display_name || accountMap.get(selectedAccount)?.email : 'All Inboxes'
 
-  return <div className="h-screen bg-paper text-ink p-0 md:p-3 lg:p-5 overflow-hidden">
-    <div className="mx-auto flex h-full max-w-[1680px] overflow-hidden bg-white md:rounded-[1.8rem] md:border md:border-black/5 md:shadow-panel">
+  // Three stacked layers: the lit stage, the frosted shell floating on it, and the
+  // panes floating inside the shell. The orbs sit behind the shell and are decorative
+  // only — they are hidden below md, where the shell is full-bleed and no gutter shows.
+  // The gutter only widens from lg. At md the three panes are still flush, so every
+  // pixel of padding comes straight out of a reading pane that is already narrow
+  // there — p-4 keeps that cost to 8px against the previous p-3.
+  return <div className="app-stage relative isolate h-screen overflow-hidden p-0 text-ink md:p-4 lg:p-7 xl:p-9">
+    <div aria-hidden className="pointer-events-none absolute -left-16 -top-24 hidden h-[26rem] w-[26rem] rounded-full bg-sage/70 blur-[110px] md:block" />
+    <div aria-hidden className="pointer-events-none absolute -bottom-28 -right-20 hidden h-[30rem] w-[30rem] rounded-full bg-coral/20 blur-[120px] md:block" />
+    <div aria-hidden className="pointer-events-none absolute -top-32 right-1/4 hidden h-[22rem] w-[22rem] rounded-full bg-pine/10 blur-[130px] lg:block" />
+    {/* The frosted frame is only visible in the padding that starts at lg — at md the
+        panes cover the shell edge to edge, so the blur is composited there for
+        nothing. Hence the glass is an lg treatment and md stays opaque. */}
+    <div className="relative mx-auto flex h-full max-w-[1680px] overflow-hidden bg-white md:rounded-shell md:border md:border-white/60 md:shadow-stage lg:gap-2.5 lg:bg-white/55 lg:p-2.5 lg:backdrop-blur-2xl">
       <MailboxNav visible={pane === 'nav'} accounts={accounts} mailboxes={mailboxes} selectedAccount={selectedAccount} selectedMailbox={selectedMailbox} unreadCount={unreadCount}
         onCompose={() => compose()}
         onSelectAll={() => { setSelectedAccount(null); setSelectedMailbox(null); setPane('list') }}
@@ -209,7 +221,10 @@ function MailboxApp({ onLogout }: { onLogout: () => void }) {
         onOpenNav={() => setPane('nav')} onMarkViewRead={markViewRead} onRefresh={refresh} onQueryChange={setQuery}
         onOpen={openMessage} onLoadMore={() => loadMessages(true, cursor)} />
 
-      <main className={`${pane === 'detail' ? 'flex' : 'hidden'} md:flex min-w-0 flex-1 flex-col bg-white`}>
+      {/* The reading pane is the top layer: pure white and the strongest shadow of
+          the three. The radius and shadow are inline rather than via .pane-light so
+          the higher elevation cannot be overwritten by that class's own lg rule. */}
+      <main className={`${pane === 'detail' ? 'flex' : 'hidden'} md:flex min-w-0 flex-1 flex-col overflow-hidden bg-white lg:rounded-panel lg:shadow-glass-high`}>
         {selected ? <MessageDetail selected={selected} details={details} autoLoadRemoteImages={preferences.autoLoadRemoteImages} onBack={() => setPane('list')} onStar={() => mutateMessage({ is_starred: !selected.is_starred })} onArchive={() => mutateMessage({ archive: true })} onReply={() => compose()} onNotice={announce} /> : <Welcome count={unreadCount} />}
       </main>
     </div>
@@ -217,6 +232,6 @@ function MailboxApp({ onLogout }: { onLogout: () => void }) {
     {showOutbox && <OutboxDialog onClose={() => setShowOutbox(false)} onEdit={draft => { setShowOutbox(false); compose(draft) }} />}
     {showComposer && <Composer accounts={accounts} replyTo={composerDraft ? null : selected} initialDraft={composerDraft} onClose={() => setShowComposer(false)} onSent={() => { setShowComposer(false); refresh() }} />}
     {showSettings && <SettingsDialog preferences={preferences} accounts={accounts} onChange={updatePreferences} onClose={() => setShowSettings(false)} onAddAccount={() => { setShowSettings(false); setShowAccounts(true) }} onLogout={logout} />}
-    {toast && <div role="status" className="pointer-events-none fixed bottom-6 left-1/2 z-50 -translate-x-1/2 rounded-full bg-pine px-5 py-2.5 text-xs font-semibold text-white shadow-panel">{toast}</div>}
+    {toast && <div role="status" className="pointer-events-none fixed bottom-6 left-1/2 z-50 -translate-x-1/2 rounded-full bg-pine px-5 py-2.5 text-xs font-semibold text-white shadow-lift-4">{toast}</div>}
   </div>
 }

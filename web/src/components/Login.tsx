@@ -16,10 +16,10 @@ export function Login({ onAuthenticated }: { onAuthenticated: () => void }) {
       onAuthenticated()
     } catch (err) { setError(messageOf(err)) } finally { setBusy(false) }
   }
-  return <main className="min-h-screen bg-paper text-ink grid place-items-center overflow-hidden relative">
-    <div className="absolute -top-32 -right-24 h-96 w-96 rounded-full bg-sage blur-3xl opacity-80" />
-    <div className="absolute -bottom-36 -left-24 h-96 w-96 rounded-full bg-orange-100 blur-3xl opacity-70" />
-    <form onSubmit={submit} className="relative w-[min(92vw,420px)] rounded-[2rem] border border-black/5 bg-white/80 p-9 shadow-panel backdrop-blur-xl">
+  return <main className="app-stage relative grid min-h-screen place-items-center overflow-hidden text-ink">
+    <div aria-hidden className="pointer-events-none absolute -right-24 -top-32 h-96 w-96 rounded-full bg-sage opacity-80 blur-3xl" />
+    <div aria-hidden className="pointer-events-none absolute -bottom-36 -left-24 h-96 w-96 rounded-full bg-coral/25 blur-3xl" />
+    <form onSubmit={submit} className="relative w-[min(92vw,420px)] rounded-shell border border-white/60 bg-white/70 p-9 shadow-stage backdrop-blur-2xl">
       <Brand />
       <h1 className="mt-10 font-serif text-4xl leading-tight">欢迎回到你的<br />统一收件箱。</h1>
       <p className="mt-3 text-sm leading-6 text-black/50">输入部署时配置的主 API Key，凭据只用于换取安全的浏览器会话。</p>

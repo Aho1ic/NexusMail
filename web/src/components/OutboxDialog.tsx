@@ -15,14 +15,14 @@ export function OutboxDialog({ onClose, onEdit }: { onClose: () => void; onEdit:
   useEffect(() => { load() }, [load])
   async function retry(id: number) { try { await api.retryDraft(id); await load() } catch (err) { setError(messageOf(err)) } }
   async function remove(id: number) { try { await api.deleteDraft(id); await load() } catch (err) { setError(messageOf(err)) } }
-  return <div className="modal-backdrop"><div className="flex h-[min(86vh,680px)] w-[min(94vw,680px)] flex-col overflow-hidden rounded-[1.7rem] bg-white shadow-2xl">
+  return <div className="modal-backdrop"><div className="flex h-[min(86vh,680px)] w-[min(94vw,680px)] flex-col overflow-hidden rounded-panel bg-white shadow-glass-high">
     <header className="flex items-center justify-between border-b border-black/5 px-6 py-5"><div><p className="text-[10px] font-bold uppercase tracking-[.2em] text-pine/40">Delivery</p><h2 className="font-serif text-3xl">草稿与发件箱</h2></div><div className="flex gap-1"><button onClick={load} aria-label="刷新" className="icon-button"><RefreshCw className={loading ? 'animate-spin' : ''} size={18} /></button><button onClick={onClose} aria-label="关闭" className="icon-button"><X size={19} /></button></div></header>
     <div className="flex-1 overflow-y-auto p-4">
-      {error && <p className="m-2 rounded-xl bg-red-50 p-3 text-xs text-red-700">{error}</p>}
-      {!loading && items.length === 0 && <div className="grid h-72 place-items-center text-center"><div><Bell className="mx-auto text-pine/20" size={38} /><p className="mt-3 font-serif text-xl">没有待处理邮件</p></div></div>}
-      {items.map(draft => <div key={draft.id} className="mb-2 rounded-2xl border border-black/5 bg-paper/50 p-4">
+      {error && <p className="m-2 rounded-card bg-red-50 p-3 text-xs text-red-700">{error}</p>}
+      {!loading && items.length === 0 && <div className="grid h-72 place-items-center text-center"><div><Bell className="mx-auto text-pine/25" size={38} /><p className="mt-3 font-serif text-xl">没有待处理邮件</p></div></div>}
+      {items.map(draft => <div key={draft.id} className="mb-2 rounded-card border border-black/5 bg-paper/50 p-4 shadow-lift-1">
         <div className="flex items-start justify-between gap-4"><div className="min-w-0"><div className="truncate text-sm font-bold">{draft.subject || '（无主题）'}</div><div className="mt-1 truncate text-xs text-black/40">发给 {decodeAddressList(draft.to).join(', ') || '尚未填写'}</div></div><StatusPill status={draft.status} remote={draft.remote_sync_state} /></div>
-        {draft.last_error && <p className="mt-3 rounded-lg bg-red-50 p-2 text-[11px] text-red-700">{draft.last_error}</p>}
+        {draft.last_error && <p className="mt-3 rounded-xl bg-red-50 p-2 text-[11px] text-red-700">{draft.last_error}</p>}
         <div className="mt-3 flex items-center justify-between text-[10px] text-black/35"><time>{formatFullDate(draft.updated_at)}</time><div className="flex gap-2">{['failed', 'unknown'].includes(draft.status) && <button onClick={() => retry(draft.id)} className="font-semibold text-coral">确认重试</button>}{['draft', 'failed', 'unknown'].includes(draft.status) && <button onClick={() => onEdit(draft)} className="font-semibold text-pine">编辑</button>}{!['queued', 'sending'].includes(draft.status) && <button onClick={() => remove(draft.id)} className="font-semibold text-black/40">删除</button>}</div></div>
       </div>)}
     </div>

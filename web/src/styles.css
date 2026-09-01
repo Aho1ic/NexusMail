@@ -6,7 +6,10 @@
 @layer base {
   * { box-sizing: border-box; }
   html { color-scheme: light; }
-  body { margin: 0; min-width: 320px; min-height: 100vh; background: #f7f5ee; }
+  /* The body colour is the middle stop of .app-stage, not the old flat paper:
+     overscroll and the area behind a short viewport would otherwise show a seam
+     where the gradient ends. */
+  body { margin: 0; min-width: 320px; min-height: 100vh; background: #f4f1e8; }
   button, input, textarea, select { font: inherit; }
   button { -webkit-tap-highlight-color: transparent; }
   kbd { @apply rounded border border-black/10 bg-white px-1.5 py-0.5 font-sans shadow-sm; }
@@ -16,11 +19,41 @@
 }
 
 @layer components {
-  .input { @apply w-full rounded-xl border border-black/10 bg-white px-3.5 py-3 text-sm outline-none transition placeholder:text-black/25 focus:border-pine/30 focus:ring-2 focus:ring-pine/10; }
+  /* The gutter around the shell. Two radial pools give the light a direction —
+     cool sage from the top left, warm coral from the bottom right — over a
+     diagonal base ramp, so the margin reads as lit depth rather than dead space.
+     Percent-positioned stops keep the pools in the corners at any window size. */
+  .app-stage {
+    background-color: #f4f1e8;
+    background-image:
+      radial-gradient(78% 62% at 6% -4%, rgba(220,231,220,.85) 0%, rgba(220,231,220,0) 62%),
+      radial-gradient(64% 56% at 104% 102%, rgba(220,107,75,.16) 0%, rgba(220,107,75,0) 58%),
+      linear-gradient(160deg, #fbfaf4 0%, #f5f2e9 46%, #ebe8dc 100%);
+  }
+
+  /* A pane that floats above the shell. Applied from lg up only: below that the
+     three panes stay flush, because the padding and gaps that make them read as
+     separate cards come out of the reading pane's width, which is already tight
+     at md. */
+  .pane-light { @apply lg:rounded-panel lg:shadow-glass; }
+  .pane-dark { @apply lg:rounded-panel lg:shadow-glass-dark; }
+
+  /* Rows lift toward the pointer instead of only changing colour, which is what
+     ties them to the elevation of the panes around them. Two variants because the
+     hover shadow has to be one step above wherever the element rests: row-lift for
+     rows that rest flat, card-lift for surfaces that already carry lift-1. */
+  .row-lift { @apply transition duration-150 hover:-translate-y-px hover:shadow-lift-1; }
+  .card-lift { @apply shadow-lift-1 transition duration-150 hover:-translate-y-px hover:shadow-lift-2; }
+
+  .input { @apply w-full rounded-2xl border border-black/10 bg-white px-3.5 py-3 text-sm outline-none transition placeholder:text-black/25 focus:border-pine/30 focus:ring-2 focus:ring-pine/10; }
   .field-label { @apply mb-2 mt-5 block text-[10px] font-bold uppercase tracking-[.18em] text-black/40; }
-  .button-primary { @apply inline-flex min-h-11 items-center justify-center gap-2 rounded-xl bg-pine px-5 py-2.5 text-sm font-semibold text-white transition hover:-translate-y-0.5 hover:bg-[#183e2e] disabled:pointer-events-none disabled:opacity-40; }
-  .button-secondary { @apply inline-flex items-center gap-2 rounded-xl border border-black/10 bg-white px-4 py-2 text-xs font-semibold transition hover:bg-paper; }
-  .icon-button { @apply inline-grid h-9 w-9 place-items-center rounded-xl text-black/45 transition hover:bg-sage hover:text-pine; }
-  .modal-backdrop { @apply fixed inset-0 z-50 grid place-items-center bg-pine/30 p-3 backdrop-blur-sm; }
+  .button-primary { @apply inline-flex min-h-11 items-center justify-center gap-2 rounded-2xl bg-pine px-5 py-2.5 text-sm font-semibold text-white shadow-lift-2 transition hover:-translate-y-0.5 hover:bg-[#183e2e] hover:shadow-lift-3 disabled:pointer-events-none disabled:opacity-40 disabled:shadow-none; }
+  .button-secondary { @apply inline-flex items-center gap-2 rounded-2xl border border-black/10 bg-white px-4 py-2 text-xs font-semibold shadow-lift-1 transition hover:-translate-y-px hover:bg-paper hover:shadow-lift-2; }
+  .icon-button { @apply inline-grid h-9 w-9 place-items-center rounded-2xl text-black/45 transition hover:bg-sage hover:text-pine; }
+  .modal-backdrop { @apply fixed inset-0 z-50 grid place-items-center bg-pine/25 p-3 backdrop-blur-md; }
 }
 
+/* Colour and shadow still carry every state above; only the travel is dropped. */
+@media (prefers-reduced-motion: reduce) {
+  .row-lift:hover, .card-lift:hover, .button-primary:hover, .button-secondary:hover { transform: none; }
+}

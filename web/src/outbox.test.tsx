@@ -43,9 +43,10 @@ function stubDrafts(pages: Draft[][], overrides: Record<string, () => Response> 
 }
 
 function row(subject: string) {
-  // Each draft renders as one card; the subject is its only stable anchor.
+  // Each draft renders as one card; the subject is its only stable anchor. The
+  // card is found by its radius class, which comes from the shared `card` token.
   const heading = screen.getByText(subject)
-  const card = heading.closest('div.rounded-2xl')
+  const card = heading.closest('div.rounded-card')
   if (!card) throw new Error(`no card around ${subject}`)
   return within(card as HTMLElement)
 }
