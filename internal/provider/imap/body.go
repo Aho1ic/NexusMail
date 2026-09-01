@@ -19,9 +19,28 @@ import (
 
 // FetchBody retrieves a message body for a waiting caller and takes priority
 // over background prefetch.
+//
+// The event is published here rather than left to the caller because the HTTP
+// handler gives up on this fetch after 3s and answers 202: the body then lands
+// with nobody listening, and the browser was told it would refresh on its own.
+// Only the prefetch worker used to announce a body, so a foreground fetch that
+// overran the handler budget stayed invisible until the message was reopened —
+// permanently so for a body over the prefetch size cap, which is never a
+// candidate and therefore never gets a second announcement from the worker.
+// Published after fetchBody returned, so the command connection is already
+// released and the new-mail latency budget is not charged for this.
 func (s *Supervisor) FetchBody(ctx context.Context, messageID int64) error {
-	_, err := s.fetchBody(ctx, messageID, false)
-	return err
+	otp, err := s.fetchBody(ctx, messageID, false)
+	if err != nil {
+		return err
+	}
+	data := map[string]any{"message_id": messageID}
+	if otp.Code != "" {
+		data["otp_code"] = otp.Code
+		data["otp_subject"] = otp.Subject
+	}
+	s.events.Publish(ports.Event{Type: "MESSAGE_UPDATED", Data: data})
+	return nil
 }
 
 // otpNotice carries what a verification-code notification needs. The subject
@@ -36,11 +55,26 @@ type otpNotice struct {
 // it, because this runs while holding the account's command connection and the
 // new-mail latency budget leaves no room for extra work under that lock.
 func (s *Supervisor) fetchBody(ctx context.Context, messageID int64, background bool) (otp otpNotice, resultErr error) {
-	select {
-	case s.bodySlots <- struct{}{}:
-		defer func() { <-s.bodySlots }()
-	case <-ctx.Done():
-		return otpNotice{}, ctx.Err()
+	// Only the foreground takes a slot. The slot bounds how many whole bodies are
+	// held in memory at once, and the prefetch is already bounded by its worker
+	// count — a worker fetches one body at a time, so the pool cannot exceed it.
+	//
+	// Sharing one semaphore sized to the worker count inverted the priority it was
+	// supposed to protect: the four workers held every slot, and a foreground fetch
+	// blocked here *before* rt.lock() had raised urgent, so it neither preempted
+	// the prefetch nor was counted as waiting. It paid one background fetch to get
+	// a slot and a second to get the connection — measured at 60ms/command, 126ms
+	// then 126ms, and on a real provider's per-body latency enough to overrun the
+	// handler's 3s budget on every open. TestForegroundNeverQueuesBehindPrefetch
+	// missed it by raising urgent and locking cmdMu directly, which is the one path
+	// that skips this semaphore.
+	if !background {
+		select {
+		case s.bodySlots <- struct{}{}:
+			defer func() { <-s.bodySlots }()
+		case <-ctx.Done():
+			return otpNotice{}, ctx.Err()
+		}
 	}
 	message, _, err := s.repo.GetMessage(ctx, messageID)
 	if err != nil {

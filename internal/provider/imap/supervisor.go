@@ -26,15 +26,19 @@ type TokenProvider interface {
 }
 
 type Supervisor struct {
-	repo         ports.Repository
-	blobs        ports.BlobStore
-	accounts     *accountservice.Service
-	tokens       TokenProvider
-	events       ports.Publisher
-	mu           sync.RWMutex
-	runtimes     map[int64]*runtime
-	wg           sync.WaitGroup
-	bodyQueue    chan int64
+	repo      ports.Repository
+	blobs     ports.BlobStore
+	accounts  *accountservice.Service
+	tokens    TokenProvider
+	events    ports.Publisher
+	mu        sync.RWMutex
+	runtimes  map[int64]*runtime
+	wg        sync.WaitGroup
+	bodyQueue chan int64
+	// bodySlots bounds how many bodies foreground callers hold in memory at once.
+	// The prefetch does not take one: its worker count already bounds it, and
+	// sharing this semaphore made a foreground fetch queue behind the workers
+	// before it could raise urgent. See fetchBody.
 	bodySlots    chan struct{}
 	bodySeen     sync.Map
 	workerCancel context.CancelFunc

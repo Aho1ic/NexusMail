@@ -126,22 +126,34 @@ function MailboxApp({ onLogout }: { onLogout: () => void }) {
   // the subject, so a later body pass may carry a better code that should still
   // reach the user, while a repeat of the same code must not notify twice.
   const notifiedCodes = useRef(new Set<string>())
+  // The feed refresh cannot reach the open message: MessageDetail renders the
+  // snapshot taken when it was opened, so a body that arrives afterwards left the
+  // pane on "will refresh automatically" until the message was reopened. Only an
+  // event naming this message re-fetches — the body-prefetch backlog emits these
+  // in bursts, and the rest of them concern mail that is not on screen.
+  const selectedID = selected?.id
+  const refreshOpenMessage = useCallback(async (messageID: number) => {
+    if (messageID !== selectedID) return
+    try { setDetails(await api.message(messageID)) } catch { /* the next event or a reopen retries */ }
+  }, [selectedID])
+
   const handleEvent = useCallback((payload: EventEnvelope) => {
+    const updatedID = typeof payload.data?.message_id === 'number' ? payload.data.message_id : 0
+    if (payload.type === 'MESSAGE_UPDATED' && updatedID) void refreshOpenMessage(updatedID)
     const code = typeof payload.data?.otp_code === 'string' ? payload.data.otp_code : ''
     // The code notification replaces the generic notice rather than adding to it,
     // so switching only the code notification off has to fall back to the generic
     // one instead of leaving the arrival silent.
     if (code && preferences.desktopNotifications && preferences.verificationCodeNotifications) {
-      const messageID = typeof payload.data?.message_id === 'number' ? payload.data.message_id : 0
-      const key = `${messageID}:${code}`
+      const key = `${updatedID}:${code}`
       if (notifiedCodes.current.has(key)) return
       notifiedCodes.current.add(key)
       const subject = typeof payload.data?.otp_subject === 'string' ? payload.data.otp_subject : ''
-      void showOTPNotification(code, subject, messageID)
+      void showOTPNotification(code, subject, updatedID)
       return
     }
     if (payload.type === 'NEW_EMAIL') notify()
-  }, [preferences.desktopNotifications, preferences.verificationCodeNotifications])
+  }, [preferences.desktopNotifications, preferences.verificationCodeNotifications, refreshOpenMessage])
   useRealtime(refreshQuietly, handleEvent)
 
   async function markViewRead() {

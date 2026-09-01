@@ -76,6 +76,15 @@ func (r *recorder) count(kind string) int {
 	return n
 }
 
+// snapshot copies the events published so far, for assertions on payloads rather
+// than counts. A copy, because the recorder keeps appending from the supervisor's
+// goroutines while the caller reads.
+func (r *recorder) snapshot() []ports.Event {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]ports.Event(nil), r.events...)
+}
+
 type literal struct{ *strings.Reader }
 
 func (l literal) Size() int64 { return l.Reader.Size() }
