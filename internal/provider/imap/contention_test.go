@@ -80,6 +80,15 @@ func backloggedAccount(t *testing.T, size int) *harness {
 // TestForegroundNeverQueuesBehindPrefetch is the core invariant. While the body
 // workers drain a backlog, a foreground acquisition must not wait for more than
 // the one fetch already in flight.
+//
+// This covers the lock only. Raising urgent and taking cmdMu here is the one path
+// into the command connection that does not pass the bodySlots semaphore, and a
+// priority inversion lived in that gap unseen: a real foreground body fetch
+// blocked on the semaphore before it could raise urgent, so it waited for a
+// second background fetch that this test cannot observe. The semaphore layer is
+// TestForegroundBodyFetchDoesNotQueueBehindPrefetch and
+// TestPrefetchNeverHoldsAForegroundSlot in bodyarrival_test.go; a change to
+// either layer needs both.
 func TestForegroundNeverQueuesBehindPrefetch(t *testing.T) {
 	h := backloggedAccount(t, 400)
 	rt, err := h.supervisor.runtime(h.account.ID)

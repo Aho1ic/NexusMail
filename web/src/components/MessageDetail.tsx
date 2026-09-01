@@ -47,7 +47,11 @@ export function MessageDetail({ selected, details, autoLoadRemoteImages, onBack,
         <div className="mt-7 flex items-center gap-3 border-b border-black/5 pb-6"><Avatar label={displaySender(message.sender)} /><div className="min-w-0"><div className="truncate font-serif text-lg">{displaySender(message.sender)}</div><div className="truncate text-xs text-black/40">发给 {decodeEncodedWords(message.recipients) || '我'}</div></div></div>
         {otpCode && <button onClick={copyCode} className="card-lift mt-6 flex items-center gap-3 rounded-card bg-sage/60 px-4 py-3 text-left hover:bg-sage" aria-label={`复制验证码 ${otpCode}`}><span className="grid h-9 w-9 place-items-center rounded-2xl bg-white/70 text-pine"><Copy size={16} /></span><span><span className="block font-mono text-lg font-bold tracking-[.18em] text-pine">{otpCode}</span><span className="text-[11px] text-pine/55">检测到验证码，点击复制</span></span></button>}
         {!details && <div className="grid h-52 place-items-center"><LoaderCircle className="animate-spin text-pine/40" /></div>}
-        {details && message.body_state === 'error' && <div className="my-10 max-w-3xl rounded-card bg-amber-50 p-5 text-sm text-amber-800 shadow-lift-1">正文获取失败，下次账号同步时会自动重试。</div>}
+        {/* Not "will retry on the next sync": the prefetch gives up on a body after
+            maxBodyAttempts and stops enqueueing it for the life of the process, so that
+            promise expires. Reopening does retry — the foreground fetch is not capped —
+            and it is the only move left once the prefetch has written this state. */}
+        {details && message.body_state === 'error' && <div className="my-10 max-w-3xl rounded-card bg-amber-50 p-5 text-sm text-amber-800 shadow-lift-1">正文获取失败，重新打开这封邮件可以再试一次。</div>}
         {details && message.body_state !== 'ready' && message.body_state !== 'error' && <div className="my-10 max-w-3xl rounded-card bg-sage/50 p-5 text-sm text-pine shadow-lift-1">正文正在从邮件服务商异步获取，稍后会自动刷新。</div>}
         {details && hasRemoteImages && !loadRemoteImages && <button onClick={() => setLoadRemoteImages(true)} className="card-lift mt-6 rounded-2xl bg-amber-50 px-4 py-2 text-xs font-semibold text-amber-800">本邮件包含已阻止的远程图片，点击临时加载</button>}
         {/* Only the HTML frame takes the full column: the sender controls that layout
