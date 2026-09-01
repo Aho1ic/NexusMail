@@ -14,6 +14,7 @@ import (
 
 	"nexusmail/internal/config"
 	"nexusmail/internal/domain"
+	"nexusmail/internal/provider/auth"
 
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
@@ -115,13 +116,46 @@ func (m *Manager) AccessToken(ctx context.Context, account domain.Account, refre
 	}
 	token, err := oauthConfig.TokenSource(ctx, &oauth2.Token{RefreshToken: refreshToken}).Token()
 	if err != nil {
-		return "", fmt.Errorf("refresh OAuth token: %w", err)
+		return "", classifyRefreshError(err)
 	}
 	if err := verifyMailScope(account.Provider, token); err != nil {
 		return "", err
 	}
 	entry.Token = token
 	return token.AccessToken, nil
+}
+
+// rejectedGrantCodes are the RFC 6749 error codes that mean the stored refresh
+// token or the OAuth client will never work again. Everything else the token
+// endpoint can answer with — 5xx, a throttle, a truncated response — clears on
+// its own and must stay on the caller's retry ladder.
+var rejectedGrantCodes = map[string]bool{
+	"invalid_grant":          true,
+	"invalid_client":         true,
+	"unauthorized_client":    true,
+	"invalid_scope":          true,
+	"unsupported_grant_type": true,
+}
+
+// classifyRefreshError separates a refresh the provider refused from one that
+// merely failed to complete. Only the former is a credential problem: reporting a
+// dropped connection to the token endpoint as "invalid credentials" parks a
+// healthy account and tells the user to re-authorize for no reason.
+func classifyRefreshError(err error) error {
+	var retrieve *oauth2.RetrieveError
+	if errors.As(err, &retrieve) {
+		// A provider that answers 400/401 with no parseable error code has still
+		// refused the grant; Google returns exactly that for a revoked token when
+		// the body is not JSON.
+		status := 0
+		if retrieve.Response != nil {
+			status = retrieve.Response.StatusCode
+		}
+		if rejectedGrantCodes[retrieve.ErrorCode] || ((status == http.StatusBadRequest || status == http.StatusUnauthorized) && retrieve.ErrorCode == "") {
+			return fmt.Errorf("%w: refresh OAuth token: %w", auth.ErrCredentialRejected, err)
+		}
+	}
+	return fmt.Errorf("refresh OAuth token: %w", err)
 }
 
 func (m *Manager) providerConfig(provider string) (*oauth2.Config, error) {
@@ -171,7 +205,10 @@ func verifyMailScope(provider string, token *oauth2.Token) error {
 	if scopeGranted(granted, required) {
 		return nil
 	}
-	return fmt.Errorf("%s granted [%s] but not the required %s scope; enable the provider mail API and add that scope to the OAuth consent screen, then authorize again", provider, strings.Join(strings.Fields(granted), " "), required)
+	// Marked as a credential rejection so the sync loops park the account and ask
+	// the user to authorize again instead of retrying a consent screen that will
+	// keep granting the same insufficient scopes.
+	return fmt.Errorf("%w: %s granted [%s] but not the required %s scope; enable the provider mail API and add that scope to the OAuth consent screen, then authorize again", auth.ErrCredentialRejected, provider, strings.Join(strings.Fields(granted), " "), required)
 }
 
 func scopeGranted(granted, required string) bool {

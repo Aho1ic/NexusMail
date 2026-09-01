@@ -3,6 +3,7 @@ package oauth
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -14,6 +15,7 @@ import (
 
 	"nexusmail/internal/config"
 	"nexusmail/internal/domain"
+	"nexusmail/internal/provider/auth"
 
 	"golang.org/x/oauth2"
 )
@@ -581,8 +583,52 @@ func TestAccessTokenFailsWhenTheRefreshIsRejected(t *testing.T) {
 	}
 }
 
+// TestAccessTokenSeparatesARefusalFromAFailedRefresh is the regression for a real
+// misreport: a dropped TCP connection to oauth2.googleapis.com was surfaced to the
+// user as invalid credentials and parked the account for 15 minutes, because the
+// only signal downstream had was the "refresh OAuth token" prefix this path puts on
+// every failure alike. Whether the credential was refused is knowable only here,
+// where the HTTP response is, so it is stated with a sentinel.
+func TestAccessTokenSeparatesARefusalFromAFailedRefresh(t *testing.T) {
+	for _, testCase := range []struct {
+		name      string
+		transport *stubTransport
+		rejected  bool
+	}{
+		// The provider's final answers: the stored refresh token or the client
+		// registration will not work again, and only re-authorizing fixes either.
+		{"invalid_grant is a refusal", &stubTransport{tokenStatus: http.StatusBadRequest, tokenBody: `{"error":"invalid_grant"}`}, true},
+		{"invalid_client is a refusal", &stubTransport{tokenStatus: http.StatusUnauthorized, tokenBody: `{"error":"invalid_client"}`}, true},
+		{"unauthorized_client is a refusal", &stubTransport{tokenStatus: http.StatusBadRequest, tokenBody: `{"error":"unauthorized_client"}`}, true},
+		// Google answers a revoked token with 400 and a non-JSON body often enough
+		// that the status alone has to count.
+		{"a 400 with no error code is a refusal", &stubTransport{tokenStatus: http.StatusBadRequest, tokenBody: `not json`}, true},
+		// Everything that clears on its own must stay on the caller's ladder.
+		{"a transport failure is not a refusal", &stubTransport{transportErr: errors.New("EOF")}, false},
+		{"a 500 is not a refusal", &stubTransport{tokenStatus: http.StatusInternalServerError, tokenBody: `{"error":"internal_failure"}`}, false},
+		{"a 503 is not a refusal", &stubTransport{tokenStatus: http.StatusServiceUnavailable, tokenBody: ``}, false},
+		{"a throttle is not a refusal", &stubTransport{tokenStatus: http.StatusTooManyRequests, tokenBody: `{"error":"rate_limit_exceeded"}`}, false},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			_, err := configuredManager().AccessToken(stubContext(testCase.transport), oauthAccount(1, "gmail"), "refresh")
+			if err == nil {
+				t.Fatal("a failed refresh produced a token")
+			}
+			if got := errors.Is(err, auth.ErrCredentialRejected); got != testCase.rejected {
+				t.Errorf("errors.Is(%q, ErrCredentialRejected) = %v, want %v", err, got, testCase.rejected)
+			}
+			// The original cause stays reachable either way, so operators still see
+			// what the provider actually said.
+			if !strings.Contains(err.Error(), "refresh OAuth token") {
+				t.Errorf("error lost its context: %q", err)
+			}
+		})
+	}
+}
+
 // A refreshed token that lost the mail scope — because consent was narrowed after
-// the account was added — must be refused rather than used until IMAP fails.
+// the account was added — must be refused rather than used until IMAP fails. It is
+// a credential rejection: retrying cannot widen a consent screen.
 func TestAccessTokenVerifiesTheScopeOnRefresh(t *testing.T) {
 	manager := configuredManager()
 	transport := &stubTransport{tokenBody: tokenJSON("", "openid email", 3600)}
@@ -592,6 +638,9 @@ func TestAccessTokenVerifiesTheScopeOnRefresh(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "https://mail.google.com/") {
 		t.Fatalf("error = %q", err)
+	}
+	if !errors.Is(err, auth.ErrCredentialRejected) {
+		t.Errorf("a missing mail scope was not reported as a credential rejection: %q", err)
 	}
 }
 

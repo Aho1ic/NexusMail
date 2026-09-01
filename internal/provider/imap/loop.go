@@ -20,28 +20,34 @@ func (s *Supervisor) commandLoop(ctx context.Context, rt *runtime) {
 		_ = s.repo.UpdateAccountStatus(ctx, rt.account.ID, "connecting", nil)
 		client, err := s.connect(ctx, rt.account, nil, s.commandStallOrDefault())
 		if err != nil {
-			// Credentials the server already refused will be refused again, so the
-			// account is parked in auth_error with a long delay instead of being
-			// hammered on the connection ladder. A throttled connect likewise
-			// needs the full rateLimitBackoff: reconnecting every second keeps
-			// the throttle engaged. Both live in failureStatus/retryDelay, which
-			// idleLoop shares, so the two loops cannot drift apart on this.
-			status, delay := failureStatus(err), retryDelay(err, backoff)
-			s.setError(ctx, rt.account.ID, status, err)
-			if !waitBackoff(ctx, delay) {
+			// A credential the provider has definitively refused parks the account
+			// in auth_error instead of being hammered on the connection ladder; an
+			// IMAP rejection that only looks like one is retried a few times first,
+			// because Gmail issues those for valid tokens under throttling. A
+			// throttled connect likewise needs the full rateLimitBackoff:
+			// reconnecting every second keeps the throttle engaged. All of it lives
+			// in classifyFailure, which idleLoop shares, so the two loops cannot
+			// drift apart on this.
+			result := s.classifyFailure(rt, err, backoff)
+			s.setError(ctx, rt.account.ID, result, err)
+			if !waitBackoff(ctx, result.delay) {
 				return
 			}
-			if status == "backoff" {
+			// The ladder advances only for the failures it actually governs.
+			if result.ladder {
 				backoff = min(backoff*2, 5*time.Minute)
 			}
 			continue
 		}
+		// Authentication succeeded, so any auth rejections counted against this
+		// account were transient.
+		rt.authSucceeded()
 		rt.client.Store(client)
 		_ = s.repo.UpdateAccountStatus(ctx, rt.account.ID, "syncing", nil)
 		// Refresh the catalog without holding the command lock so the LIST
 		// round-trip and mailbox upserts do not block the new-mail path.
 		if _, listErr := s.refreshMailboxCatalog(ctx, rt, client); listErr != nil {
-			s.setError(ctx, rt.account.ID, "backoff", listErr)
+			s.setError(ctx, rt.account.ID, verdict{status: "backoff", delay: backoff, store: true, ladder: true}, listErr)
 			s.closeCommand(rt, client)
 			if !waitBackoff(ctx, backoff) {
 				return
@@ -61,13 +67,13 @@ func (s *Supervisor) commandLoop(ctx context.Context, rt *runtime) {
 			// from the provider is the same shape of mistake: the 1s ladder
 			// keeps the throttle engaged, so it gets the dedicated
 			// rateLimitBackoff instead.
-			syncStatus, syncDelay := failureStatus(syncErr), retryDelay(syncErr, backoff)
+			syncResult := s.classifyFailure(rt, syncErr, backoff)
 			// A sync that keeps failing used to reconnect with no delay at all,
 			// because the ladder was reset on connect and only the connect path
 			// waited. That is a tight reconnect loop against the provider.
-			s.setError(ctx, rt.account.ID, syncStatus, syncErr)
+			s.setError(ctx, rt.account.ID, syncResult, syncErr)
 			s.closeCommand(rt, client)
-			if !waitBackoff(ctx, syncDelay) {
+			if !waitBackoff(ctx, syncResult.delay) {
 				return
 			}
 			backoff = min(backoff*2, 5*time.Minute)
@@ -212,7 +218,10 @@ func (s *Supervisor) idleLoop(ctx context.Context, rt *runtime) {
 			if client != nil {
 				_ = client.Close()
 			}
-			delay := retryDelay(cause, backoff)
+			// Classified through the same path as the command loop so the auth
+			// evidence both loops gather lands in one counter. This loop only needs
+			// the delay: the command loop owns the account's status and error text.
+			delay := s.classifyFailure(rt, cause, backoff).delay
 			if cause != nil {
 				slog.Debug("mail idle connection retrying", "account_id", rt.account.ID, "delay", delay, "error", cause)
 			}
@@ -228,6 +237,9 @@ func (s *Supervisor) idleLoop(ctx context.Context, rt *runtime) {
 			}
 			continue
 		}
+		// This connection authenticated, which retires any auth rejections counted
+		// against the account by either loop.
+		rt.authSucceeded()
 		inbox, err := s.repo.GetMailboxByRole(ctx, rt.account.ID, "inbox")
 		if err != nil {
 			// The command loop has not recorded mailboxes yet. This is a local

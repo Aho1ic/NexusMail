@@ -117,10 +117,27 @@ func (s *Supervisor) commandRefreshOrDefault() time.Duration {
 // sync to notice the connection is dead.
 const maxProbeFailures = 3
 
-// authBackoff is the retry delay after the provider rejected the credentials.
+// authBackoff is the retry delay once a credential rejection is believed.
 // Reconnecting every second with a password the server already refused is how
 // accounts get locked out, and no amount of retrying will fix it.
 const authBackoff = 15 * time.Minute
+
+// authRetryBackoff is the retry delay for an IMAP auth rejection that nothing has
+// corroborated yet. Gmail returns AUTHENTICATIONFAILED for a valid token when it
+// throttles authentication, so the first rejections are retried rather than
+// believed — but on a window long enough that retrying cannot be what keeps the
+// throttle engaged. With equal jitter this is 30-60s per attempt, so the mail an
+// account was about to sync arrives about a minute late instead of waiting out the
+// 15-minute auth park.
+const authRetryBackoff = time.Minute
+
+// maxAuthFailures is how many consecutive uncorroborated auth rejections are
+// needed before the account is parked and the user is asked to re-authenticate.
+// Three is the same shape of evidence as maxProbeFailures: enough that a single
+// transient rejection is never shown to the user, few enough that genuinely dead
+// credentials are reported within a few minutes. Both loops count into it, so a
+// real rejection usually reaches the threshold in about half that time.
+const maxAuthFailures = 3
 
 // rateLimitBackoff is the retry delay after the provider throttled the account
 // (e.g. QQ's "NO System busy!", 163's "Too many connections"). The 1s→5m
@@ -170,4 +187,14 @@ func (s *Supervisor) commandStallOrDefault() time.Duration {
 		return s.commandStall
 	}
 	return commandStallWindow
+}
+
+// authRetryOrDefault returns the window an uncorroborated auth rejection retries
+// on. Tests override it so the walk to maxAuthFailures takes milliseconds instead
+// of minutes.
+func (s *Supervisor) authRetryOrDefault() time.Duration {
+	if s.authRetry > 0 {
+		return s.authRetry
+	}
+	return authRetryBackoff
 }

@@ -64,6 +64,9 @@ type Supervisor struct {
 	// commandRefresh overrides commandRefreshInterval so a test can drive the
 	// scheduled rebuild without waiting out the production interval.
 	commandRefresh time.Duration
+	// authRetry overrides authRetryBackoff so a test can walk an account to
+	// maxAuthFailures without waiting out the production window.
+	authRetry time.Duration
 	// failProbe makes probeInbox fail without disturbing the socket, so a test can
 	// exercise the dead-but-open connection that client.Closed() never reports.
 	failProbe atomic.Bool

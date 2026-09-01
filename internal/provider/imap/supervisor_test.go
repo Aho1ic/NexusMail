@@ -14,6 +14,7 @@ import (
 
 	"nexusmail/internal/domain"
 	"nexusmail/internal/ports"
+	providerauth "nexusmail/internal/provider/auth"
 
 	goimap "github.com/emersion/go-imap/v2"
 )
@@ -31,7 +32,6 @@ func TestIsAuthFailure(t *testing.T) {
 		errors.New("imap: AUTHENTICATIONFAILED bad user or password"),
 		errors.New("Invalid credentials (Failure)"),
 		errors.New("LOGIN denied"),
-		errors.New("refresh oauth token: invalid_grant"),
 		fmt.Errorf("connect: %w", errors.New("authentication failed")),
 	}
 	for _, err := range authFailures {
@@ -49,77 +49,153 @@ func TestIsAuthFailure(t *testing.T) {
 		&goimap.Error{Code: goimap.ResponseCodeUnavailable, Text: "try later"},
 		&goimap.Error{Code: goimap.ResponseCodeInUse, Text: "mailbox busy"},
 		context.Canceled,
+		// The token path wraps every refresh failure, including a dropped
+		// connection to the provider's token endpoint, in the same prefix. That
+		// prefix used to be on the marker list, so this exact error parked a
+		// healthy account and told the user its credentials were invalid.
+		fmt.Errorf("refresh OAuth token: %w", errors.New(`Post "https://oauth2.googleapis.com/token": EOF`)),
 	}
 	for _, err := range transient {
 		if isAuthFailure(err) {
 			t.Errorf("isAuthFailure(%v) = true, want false", err)
 		}
 	}
+
+	// A refusal the token path attributes to the credential is a verdict, not an
+	// inference, and travels as a sentinel rather than as text.
+	rejected := fmt.Errorf("%w: refresh OAuth token: oauth2 %q", providerauth.ErrCredentialRejected, "invalid_grant")
+	if !credentialsRejected(rejected) {
+		t.Error("credentialsRejected on a wrapped ErrCredentialRejected = false, want true")
+	}
+	for _, err := range transient {
+		if credentialsRejected(err) {
+			t.Errorf("credentialsRejected(%v) = true, want false", err)
+		}
+	}
 }
 
-// TestRetryDelayAndStatusMapping pins what the two classifications above are for.
-// Both loops route every post-connect failure through these, so this is where the
-// invariant lives: a failure that happened *after* the greeting must never come back
-// on the 1s network ladder if it was an auth rejection or a throttle. Reaching the
-// greeting proves the socket works, not that the account can be read, and retrying a
-// refused credential or an engaged throttle every second is what kept a real account
-// locked out for hours.
+// TestRetryDelayAndStatusMapping pins what the classifications above are for.
+// Both loops route every post-connect failure through classifyFailure, so this is
+// where the invariant lives: a failure that happened *after* the greeting must never
+// come back on the 1s network ladder if it was an auth rejection or a throttle.
+// Reaching the greeting proves the socket works, not that the account can be read,
+// and retrying a refused credential or an engaged throttle every second is what kept
+// a real account locked out for hours.
 //
-// The delay mapping had no test before, and dropping both branches from retryDelay
-// left the whole package green — so the arithmetic is asserted directly here rather
-// than only through the loops that consume it.
+// The delay mapping had no test before, and dropping a branch from it left the whole
+// package green — so the arithmetic is asserted directly here rather than only
+// through the loops that consume it.
 func TestRetryDelayAndStatusMapping(t *testing.T) {
-	// A short ladder value, distinguishable from the two long windows.
+	// A short ladder value, distinguishable from the long windows.
 	const ladder = 2 * time.Second
+	supervisor := &Supervisor{}
 
 	for _, testCase := range []struct {
-		name   string
-		err    error
-		delay  time.Duration
-		status string
+		name string
+		err  error
+		want verdict
 	}{
-		{"auth failure parks for the auth window", errors.New("imap: AUTHENTICATIONFAILED bad password"), authBackoff, "auth_error"},
-		{"expired credentials park the same way", &goimap.Error{Code: goimap.ResponseCodeExpired, Text: "expired"}, authBackoff, "auth_error"},
+		// A single IMAP rejection is not yet believed: it retries on the short auth
+		// window and is not shown to the user. Gmail issues these for valid tokens.
+		{"an auth rejection retries before it is believed", errors.New("imap: AUTHENTICATIONFAILED bad password"),
+			verdict{status: "backoff", delay: authRetryBackoff}},
+		{"expired credentials retry the same way", &goimap.Error{Code: goimap.ResponseCodeExpired, Text: "expired"},
+			verdict{status: "backoff", delay: authRetryBackoff}},
+		// A verdict from the token path needs no corroboration.
+		{"a rejected credential parks immediately", fmt.Errorf("%w: refresh OAuth token: oauth2 %q", providerauth.ErrCredentialRejected, "invalid_grant"),
+			verdict{status: "auth_error", delay: authBackoff, store: true}},
 		// A throttle is retryable, so the account stays in backoff rather than
 		// asking the user to fix credentials that are fine.
-		{"a throttle waits out the rate-limit window", errors.New("imap: NO System busy!"), rateLimitBackoff, "backoff"},
-		{"too many connections is a throttle", errors.New("imap: BYE Too many concurrent connections"), rateLimitBackoff, "backoff"},
-		{"try later is a throttle", &goimap.Error{Code: goimap.ResponseCodeUnavailable, Text: "try later"}, rateLimitBackoff, "backoff"},
+		{"a throttle waits out the rate-limit window", errors.New("imap: NO System busy!"),
+			verdict{status: "backoff", delay: rateLimitBackoff}},
+		{"too many connections is a throttle", errors.New("imap: BYE Too many concurrent connections"),
+			verdict{status: "backoff", delay: rateLimitBackoff}},
+		{"try later is a throttle", &goimap.Error{Code: goimap.ResponseCodeUnavailable, Text: "try later"},
+			verdict{status: "backoff", delay: rateLimitBackoff}},
 		// Ordinary network faults are what the ladder exists for: they clear on
-		// their own and retrying quickly is the right thing to do.
-		{"a network fault keeps the ladder", errors.New("dial tcp: i/o timeout"), ladder, "backoff"},
-		{"EOF keeps the ladder", errors.New("EOF"), ladder, "backoff"},
-		{"a server bug keeps the ladder", errors.New("imap: SERVERBUG internal error"), ladder, "backoff"},
-		{"no error keeps the ladder", nil, ladder, "backoff"},
+		// their own and retrying quickly is the right thing to do. Only these
+		// advance it — the fixed windows must not double underneath the caller.
+		{"a network fault keeps the ladder", errors.New("dial tcp: i/o timeout"),
+			verdict{status: "backoff", delay: ladder, store: true, ladder: true}},
+		{"EOF keeps the ladder", errors.New("EOF"),
+			verdict{status: "backoff", delay: ladder, store: true, ladder: true}},
+		{"a server bug keeps the ladder", errors.New("imap: SERVERBUG internal error"),
+			verdict{status: "backoff", delay: ladder, store: true, ladder: true}},
+		{"no error keeps the ladder", nil,
+			verdict{status: "backoff", delay: ladder, store: true, ladder: true}},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
-			if delay := retryDelay(testCase.err, ladder); delay != testCase.delay {
-				t.Errorf("retryDelay = %v, want %v", delay, testCase.delay)
-			}
-			if status := failureStatus(testCase.err); status != testCase.status {
-				t.Errorf("failureStatus = %q, want %q", status, testCase.status)
+			// A fresh runtime per case: the auth counter is per account and carrying
+			// it between cases would make the order significant.
+			if result := supervisor.classifyFailure(&runtime{}, testCase.err, ladder); result != testCase.want {
+				t.Errorf("classifyFailure = %+v, want %+v", result, testCase.want)
 			}
 		})
 	}
 
 	// Auth is checked before throttling, so an error that reads as both is treated
-	// as the one a retry cannot fix. Getting this order wrong would park a genuinely
-	// bad credential in backoff, where it retries silently instead of telling the
-	// user to re-authenticate.
+	// as the one a retry cannot fix. Getting this order wrong would put a genuinely
+	// bad credential on the throttle window, where it retries silently forever
+	// instead of ever telling the user to re-authenticate.
 	both := errors.New("imap: NO authentication failed, too many attempts")
-	if delay := retryDelay(both, ladder); delay != authBackoff {
-		t.Errorf("retryDelay on an auth+throttle error = %v, want the auth window %v", delay, authBackoff)
+	rt := &runtime{}
+	for range maxAuthFailures - 1 {
+		if result := supervisor.classifyFailure(rt, both, ladder); result.status != "backoff" {
+			t.Fatalf("auth+throttle error status = %q before the threshold, want backoff", result.status)
+		}
 	}
-	if status := failureStatus(both); status != "auth_error" {
-		t.Errorf("failureStatus on an auth+throttle error = %q, want auth_error", status)
+	if result := supervisor.classifyFailure(rt, both, ladder); result.delay != authBackoff || result.status != "auth_error" {
+		t.Errorf("auth+throttle error at the threshold = %v/%q, want %v/auth_error", result.delay, result.status, authBackoff)
 	}
 
 	// The ladder is passed through rather than clamped, which is what lets the
 	// caller's 1s→5m progression survive this mapping.
 	for _, value := range []time.Duration{0, time.Second, 5 * time.Minute} {
-		if delay := retryDelay(errors.New("EOF"), value); delay != value {
-			t.Errorf("retryDelay passed ladder %v through as %v", value, delay)
+		if result := supervisor.classifyFailure(&runtime{}, errors.New("EOF"), value); result.delay != value {
+			t.Errorf("classifyFailure passed ladder %v through as %v", value, result.delay)
 		}
+	}
+}
+
+// TestAuthFailureNeedsCorroboration is the regression for the report that started
+// this: a Gmail account that synced fine before and after showed the user
+// "同步失败：imap: NO [AUTHENTICATIONFAILED] Invalid credentials (Failure)" and
+// stopped syncing for 15 minutes, 11 times over 6 days. Gmail returns that for a
+// valid OAuth token when it throttles authentication, so a lone rejection must
+// retry on the short window with nothing stored, and a successful authentication in
+// between must clear the evidence rather than letting unrelated rejections hours
+// apart accumulate into a park.
+func TestAuthFailureNeedsCorroboration(t *testing.T) {
+	const ladder = 2 * time.Second
+	supervisor := &Supervisor{}
+	gmail := errors.New("imap: NO [AUTHENTICATIONFAILED] Invalid credentials (Failure)")
+	rt := &runtime{}
+
+	for attempt := 1; attempt < maxAuthFailures; attempt++ {
+		result := supervisor.classifyFailure(rt, gmail, ladder)
+		if result.status != "backoff" || result.store {
+			t.Fatalf("rejection %d = %q store=%v, want backoff with nothing stored", attempt, result.status, result.store)
+		}
+		if result.delay != authRetryBackoff {
+			t.Fatalf("rejection %d delay = %v, want %v", attempt, result.delay, authRetryBackoff)
+		}
+	}
+
+	// Authenticating retires the count, so the next isolated rejection starts over
+	// instead of being the one that parks the account.
+	rt.authSucceeded()
+	if result := supervisor.classifyFailure(rt, gmail, ladder); result.status != "backoff" || result.store {
+		t.Errorf("rejection after a successful auth = %q store=%v, want backoff with nothing stored", result.status, result.store)
+	}
+
+	// Sustained rejection is a real credential problem and must reach the user.
+	rt.authSucceeded()
+	var final verdict
+	for range maxAuthFailures {
+		final = supervisor.classifyFailure(rt, gmail, ladder)
+	}
+	if final.status != "auth_error" || !final.store || final.delay != authBackoff {
+		t.Errorf("sustained rejection = %q store=%v delay=%v, want auth_error stored on %v", final.status, final.store, final.delay, authBackoff)
 	}
 }
 
@@ -306,10 +382,19 @@ func attempts(t *testing.T, supervisor *Supervisor, id int64) int {
 // credentials used to be indistinguishable from a network fault, so the loop retried
 // on the 1s ladder and hammered the provider with failing logins — which is how an
 // account gets locked out. The account now reports auth_error and waits.
+//
+// A rejection the provider might have issued transiently is corroborated first (see
+// TestAuthFailureNeedsCorroboration), so this drives the loop through the whole walk
+// to maxAuthFailures on a shortened window: a password that is genuinely wrong is
+// refused every time and must still end up parked with a message for the user.
 func TestCommandLoopMarksAuthError(t *testing.T) {
 	h := newHarness(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	// Short enough that the corroboration walk fits inside the deadline below,
+	// long enough to stay a real wait rather than a spin.
+	h.supervisor.authRetry = 200 * time.Millisecond
 
 	// Second account, same mailbox, deliberately wrong password.
 	wrong, err := h.accounts.AddPassword(ctx, "qq", "other@example.com", "Wrong", "mail@example.com", "not-the-password")

@@ -23,7 +23,17 @@ type runtime struct {
 	// backlog of body fetches.
 	urgent atomic.Int32
 	client atomic.Pointer[imapclient.Client]
+	// authFailures counts consecutive IMAP auth rejections that no token-level
+	// verdict corroborates, so one transient rejection cannot park the account.
+	// Both loops write it: an account whose credentials are genuinely dead fails
+	// on both, which reaches the threshold sooner, and either loop authenticating
+	// successfully clears it. Reset via authSucceeded, never assigned directly.
+	authFailures atomic.Int32
 }
+
+// authSucceeded records that this account authenticated, retiring any unconfirmed
+// auth rejections counted against it.
+func (rt *runtime) authSucceeded() { rt.authFailures.Store(0) }
 
 // lock claims the command connection for sync or user-facing work.
 func (rt *runtime) lock() {
