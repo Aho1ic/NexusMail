@@ -206,9 +206,11 @@ function MailboxApp({ onLogout }: { onLogout: () => void }) {
     <div aria-hidden className="pointer-events-none absolute -left-16 -top-24 hidden h-[26rem] w-[26rem] rounded-full bg-sage/70 blur-[110px] md:block" />
     <div aria-hidden className="pointer-events-none absolute -bottom-28 -right-20 hidden h-[30rem] w-[30rem] rounded-full bg-coral/20 blur-[120px] md:block" />
     <div aria-hidden className="pointer-events-none absolute -top-32 right-1/4 hidden h-[22rem] w-[22rem] rounded-full bg-pine/10 blur-[130px] lg:block" />
-    {/* No width cap: the shell fills the viewport. The old max-w-[1680px] was the
-        real source of the empty margin — on a 2560px screen it left 440px unused on
-        each side, against 36px from the padding. Wide screens are safe because the
+    {/* No width cap: the shell fills the viewport. The old 1680px cap was the real
+        source of the empty margin — on a 2560px screen it left 440px unused on each
+        side, against 36px from the padding. (Written without the bracket syntax on
+        purpose: Tailwind scans comments too, and spelling the class out here made it
+        emit the dead rule this change removes.) Wide screens are safe because the
         reading pane caps its own text at max-w-3xl, so the extra width becomes
         margin around the article rather than 200-character lines.
         The frosted frame is only visible in the padding that starts at lg — at md the
