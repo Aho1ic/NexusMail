@@ -126,8 +126,18 @@ func TestForegroundBodyFetchDoesNotQueueBehindPrefetch(t *testing.T) {
 		t.Fatalf("only %d unfetched messages available to open", len(targets))
 	}
 
-	worst := 0
-	for _, id := range targets {
+	// The first call is warm-up and is measured but not asserted on. FetchBody does
+	// four database round-trips — the slot, GetMessage, the 'fetching' write and
+	// MessageLocation — before rt.lock() raises urgent, and on the first call those
+	// statements are still being prepared and the pool is cold. Background workers
+	// legitimately keep finishing during that window, so under -race or a loaded
+	// machine the first sample can reach 2 with the priority lock working perfectly.
+	//
+	// Discarding it costs the assertion nothing: the inversion this test exists for
+	// charged every foreground fetch one background fetch for a slot and another for
+	// the connection, so it shows 2 on every call, not only the first.
+	worst, worstID := 0, int64(0)
+	for index, id := range targets {
 		before := ready()
 		if err := h.supervisor.FetchBody(ctx, id); err != nil {
 			t.Fatalf("FetchBody(%d): %v", id, err)
@@ -137,12 +147,15 @@ func TestForegroundBodyFetchDoesNotQueueBehindPrefetch(t *testing.T) {
 		if during < 0 {
 			during = 0
 		}
-		if during > worst {
-			worst = during
-		}
 		t.Logf("FetchBody(%d): %d background fetches completed during the call", id, during)
+		if index == 0 {
+			continue
+		}
+		if during > worst {
+			worst, worstID = during, id
+		}
 	}
 	if worst > 1 {
-		t.Errorf("a foreground fetch waited for %d background fetches, want at most 1", worst)
+		t.Errorf("the foreground fetch of message %d waited for %d background fetches, want at most 1", worstID, worst)
 	}
 }
