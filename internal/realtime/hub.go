@@ -3,6 +3,7 @@ package realtime
 import (
 	"context"
 	"encoding/json"
+	"log/slog"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -51,6 +52,13 @@ func (h *Hub) Publish(event ports.Event) {
 		select {
 		case c.send <- payload:
 		default:
+			// A client that cannot take an event within a 64-deep buffer is not
+			// reading, so it is dropped rather than allowed to block every other
+			// subscriber behind it. Logged because the browser sees this as a
+			// socket that closed for no stated reason and reconnects, and without
+			// a line here there is nothing on the server that says why.
+			slog.Warn("realtime client dropped: send buffer full",
+				"buffer", cap(c.send), "event_type", event.Type, "sequence", event.Sequence)
 			c.stop()
 		}
 	}
