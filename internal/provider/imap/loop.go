@@ -25,9 +25,11 @@ func (s *Supervisor) commandLoop(ctx context.Context, rt *runtime) {
 			// IMAP rejection that only looks like one is retried a few times first,
 			// because Gmail issues those for valid tokens under throttling. A
 			// throttled connect likewise needs the full rateLimitBackoff:
-			// reconnecting every second keeps the throttle engaged. All of it lives
-			// in classifyFailure, which idleLoop shares, so the two loops cannot
-			// drift apart on this.
+			// reconnecting every second keeps the throttle engaged. A refusal that
+			// could be either — QQ names its login-frequency limit as one of five
+			// causes for the same message — is corroborated on that same long
+			// window. All of it lives in classifyFailure, which idleLoop shares, so
+			// the two loops cannot drift apart on this.
 			result := s.classifyFailure(rt, err, backoff)
 			s.setError(ctx, rt.account.ID, result, err)
 			if !waitBackoff(ctx, result.delay) {

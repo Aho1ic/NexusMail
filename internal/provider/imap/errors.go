@@ -49,6 +49,35 @@ func credentialsRejected(err error) bool {
 	return err != nil && errors.Is(err, providerauth.ErrCredentialRejected)
 }
 
+// isAmbiguousLoginRejection reports whether the provider refused the login
+// without saying why. QQ answers a failed LOGIN with a single message that lists
+// every cause it could be — "Login fail. Account is abnormal, service is not
+// open, password is incorrect, login frequency limited, or system is busy" — so
+// the text is evidence that the login was refused and nothing beyond that. Two
+// of those causes need the user (the password is wrong, IMAP is not enabled) and
+// two clear on their own (the frequency limit, the busy server), and the string
+// is byte-identical either way.
+//
+// It is matched ahead of isAuthFailure and isRateLimited rather than folded into
+// either, because it is honestly both and the handling it needs is neither: the
+// corroboration an inferred auth failure gets before the user is told, on the
+// long window a throttle gets so that retrying cannot be what keeps the account
+// refused. Note that isRateLimited does not match this message ("system is busy"
+// is not its "system busy" marker) and must not be widened until it does — that
+// would route a wrong password onto a window that retries silently forever.
+//
+// The match is deliberately just "login fail" and not the full list. QQ appends a
+// help URL and has reworded the causes before, and the two failure modes are not
+// symmetric: matching too widely costs another provider's definitive rejection
+// some reporting latency, while matching too narrowly drops this message back on
+// the 1s ladder, which is the fault being fixed.
+func isAmbiguousLoginRejection(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "login fail")
+}
+
 // isRateLimited reports whether the provider is throttling the account. These
 // errors are retryable but on a longer schedule than the network-error ladder:
 // a 1-second reconnect against QQ/163 just keeps the throttle engaged, so the
@@ -148,7 +177,9 @@ type verdict struct {
 // after maxAuthFailures consecutive rejections — across both loops, since neither
 // alone proves much — is the account parked and the user told. A rejection the
 // token path attributes to the credential itself needs no corroboration: an
-// invalid_grant is already the provider's final answer.
+// invalid_grant is already the provider's final answer. A rejection that names its
+// own possible causes and includes a throttle among them (QQ's "Login fail") takes
+// the same corroboration on a longer window — see isAmbiguousLoginRejection.
 // The evidence it weighs is per account — two accounts on the same provider fail
 // independently — so the counter lives on the runtime while the window it retries
 // on comes from the Supervisor, alongside the other tunable timings.
@@ -156,13 +187,16 @@ func (s *Supervisor) classifyFailure(rt *runtime, err error, ladder time.Duratio
 	switch {
 	case credentialsRejected(err):
 		return verdict{status: "auth_error", delay: authBackoff, store: true}
+	case isAmbiguousLoginRejection(err):
+		// A refusal that is its own possible cause: it may be the credential, and
+		// it may be the login-frequency limit that our own retries would keep
+		// engaged. Corroborated like an auth failure so the user is only told once
+		// it persists, but waited out on the throttle window, because at
+		// authRetryBackoff both loops would sustain ~2 logins a minute against
+		// exactly the limit the message names.
+		return s.corroborateAuth(rt, rateLimitBackoff)
 	case isAuthFailure(err):
-		if rt.authFailures.Add(1) >= maxAuthFailures {
-			return verdict{status: "auth_error", delay: authBackoff, store: true}
-		}
-		// Not yet believed. Reported as backoff with no stored message so a
-		// transient rejection is invisible to the user, exactly like a throttle.
-		return verdict{status: "backoff", delay: s.authRetryOrDefault(), store: false}
+		return s.corroborateAuth(rt, s.authRetryOrDefault())
 	case isRateLimited(err):
 		// A rate-limit error is self-healing: the loop waits rateLimitBackoff and
 		// retries on its own. Storing the raw "imap: NO System busy!" string would
@@ -172,6 +206,19 @@ func (s *Supervisor) classifyFailure(rt *runtime, err error, ladder time.Duratio
 		return verdict{status: "backoff", delay: rateLimitBackoff, store: false}
 	}
 	return verdict{status: "backoff", delay: ladder, store: true, ladder: true}
+}
+
+// corroborateAuth counts one rejection against the account and decides whether it
+// is believed yet. Below the threshold the account backs off for retry with no
+// stored message, so a rejection the provider issued transiently never reaches the
+// user; at the threshold it is parked in auth_error with the text, because by then
+// only the user can fix it. retry is how long an unbelieved rejection waits, which
+// differs by how much the message itself could be a throttle.
+func (s *Supervisor) corroborateAuth(rt *runtime, retry time.Duration) verdict {
+	if rt.authFailures.Add(1) >= maxAuthFailures {
+		return verdict{status: "auth_error", delay: authBackoff, store: true}
+	}
+	return verdict{status: "backoff", delay: retry, store: false}
 }
 
 func waitBackoff(ctx context.Context, delay time.Duration) bool {

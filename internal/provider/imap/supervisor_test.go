@@ -74,6 +74,98 @@ func TestIsAuthFailure(t *testing.T) {
 	}
 }
 
+// qqLoginFail is QQ's reply to a refused LOGIN, verbatim as it reaches the loops.
+// It is one string for five different causes, two of which need the user and two of
+// which clear on their own, which is what makes it its own classification.
+const qqLoginFail = "imap: NO Login fail. Account is abnormal, service is not open, " +
+	"password is incorrect, login frequency limited, or system is busy. " +
+	"More information at https://help.mail.qq.com/detail/108/1023"
+
+// TestIsAmbiguousLoginRejection guards the gap this message fell through. It carries
+// no response code and matches neither marker list — isAuthFailure has "login denied"
+// but not "login fail", and isRateLimited has "system busy" but not "system is busy"
+// — so it reached the default branch and was treated as a network fault: retried on
+// the 1s ladder, which is what produces the "login frequency limited" it names, with
+// the raw text shown to the user on the first try.
+func TestIsAmbiguousLoginRejection(t *testing.T) {
+	qq := errors.New(qqLoginFail)
+	if !isAmbiguousLoginRejection(qq) {
+		t.Error("isAmbiguousLoginRejection on QQ's login refusal = false, want true")
+	}
+	// The premise of the dedicated branch: neither existing classifier claims it, so
+	// without this it lands on the ladder. If a later widening makes one of them
+	// match, the branch order still has to keep this message off the ladder and off
+	// the silent-forever throttle window.
+	if isAuthFailure(qq) || isRateLimited(qq) {
+		t.Errorf("QQ login refusal now matches isAuthFailure=%v isRateLimited=%v; check the branch order in classifyFailure",
+			isAuthFailure(qq), isRateLimited(qq))
+	}
+	if isAmbiguousLoginRejection(fmt.Errorf("connect: %w", qq)) == false {
+		t.Error("isAmbiguousLoginRejection does not see through a wrapped error")
+	}
+
+	unambiguous := []error{
+		nil,
+		errors.New("EOF"),
+		errors.New("dial tcp 1.2.3.4:993: i/o timeout"),
+		// A provider that says which one it is keeps its own classification and the
+		// shorter reporting window that goes with it.
+		errors.New("imap: NO [AUTHENTICATIONFAILED] Invalid credentials (Failure)"),
+		errors.New("imap: NO System busy!"),
+	}
+	for _, err := range unambiguous {
+		if isAmbiguousLoginRejection(err) {
+			t.Errorf("isAmbiguousLoginRejection(%v) = true, want false", err)
+		}
+	}
+}
+
+// TestAmbiguousLoginRejectionCorroborated is the regression for the report: an
+// account showed "同步失败：imap: NO Login fail. …" and kept reconnecting on the 1s
+// ladder. Because the message can be QQ's login-frequency limit, an isolated one must
+// be silent and must wait out the throttle window — retrying it on authRetryBackoff
+// would leave both loops logging in ~2×/minute against that limit. Because it can
+// equally be a wrong password or IMAP left switched off, sustained rejection must
+// still reach the user with the text, which names the settings to check.
+func TestAmbiguousLoginRejectionCorroborated(t *testing.T) {
+	const ladder = 2 * time.Second
+	supervisor := &Supervisor{authRetry: 50 * time.Millisecond}
+	qq := errors.New(qqLoginFail)
+	rt := &runtime{}
+
+	for attempt := 1; attempt < maxAuthFailures; attempt++ {
+		result := supervisor.classifyFailure(rt, qq, ladder)
+		if result.status != "backoff" || result.store {
+			t.Fatalf("rejection %d = %q store=%v, want backoff with nothing stored", attempt, result.status, result.store)
+		}
+		// Not the ladder, and not the short auth window either: the message names a
+		// frequency limit, so the unbelieved retry has to be the throttle-shaped one.
+		if result.delay != rateLimitBackoff {
+			t.Fatalf("rejection %d delay = %v, want %v", attempt, result.delay, rateLimitBackoff)
+		}
+		if result.ladder {
+			t.Fatalf("rejection %d advanced the network ladder", attempt)
+		}
+	}
+
+	// A login that succeeds in between retires the evidence, so a refusal seen once
+	// an hour never accumulates into a park.
+	rt.authSucceeded()
+	if result := supervisor.classifyFailure(rt, qq, ladder); result.store {
+		t.Error("a rejection after a successful auth was stored, want nothing shown to the user")
+	}
+
+	rt.authSucceeded()
+	var final verdict
+	for range maxAuthFailures {
+		final = supervisor.classifyFailure(rt, qq, ladder)
+	}
+	if final.status != "auth_error" || !final.store || final.delay != authBackoff {
+		t.Errorf("sustained rejection = %q store=%v delay=%v, want auth_error stored on %v",
+			final.status, final.store, final.delay, authBackoff)
+	}
+}
+
 // TestRetryDelayAndStatusMapping pins what the classifications above are for.
 // Both loops route every post-connect failure through classifyFailure, so this is
 // where the invariant lives: a failure that happened *after* the greeting must never
@@ -111,6 +203,11 @@ func TestRetryDelayAndStatusMapping(t *testing.T) {
 		{"too many connections is a throttle", errors.New("imap: BYE Too many concurrent connections"),
 			verdict{status: "backoff", delay: rateLimitBackoff}},
 		{"try later is a throttle", &goimap.Error{Code: goimap.ResponseCodeUnavailable, Text: "try later"},
+			verdict{status: "backoff", delay: rateLimitBackoff}},
+		// A refusal that might be the throttle it names starts on the throttle window
+		// too, and only becomes auth_error if it keeps happening. Deliberately not the
+		// ladder: the ladder is what triggers the limit in the message.
+		{"an ambiguous login refusal waits out the throttle window first", errors.New(qqLoginFail),
 			verdict{status: "backoff", delay: rateLimitBackoff}},
 		// Ordinary network faults are what the ladder exists for: they clear on
 		// their own and retrying quickly is the right thing to do. Only these
