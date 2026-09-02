@@ -2,7 +2,6 @@ package sqlite
 
 import (
 	"context"
-	"crypto/sha256"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -365,9 +364,4 @@ func (s *Store) CreateSentMessage(ctx context.Context, message *domain.Message, 
 		}
 		return tx.Model(&domain.Draft{}).Where("id = ?", draftID).Update("sent_message_id", message.ID).Error
 	})
-}
-
-func HashBytes(value []byte) []byte {
-	sum := sha256.Sum256(value)
-	return sum[:]
 }

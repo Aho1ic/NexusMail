@@ -1,7 +1,6 @@
 package sqlite
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"testing"
@@ -10,6 +9,15 @@ import (
 	"nexusmail/internal/domain"
 	"nexusmail/internal/ports"
 )
+
+// tokenHash builds a session digest the way the session service does. The store takes
+// digests already hashed, so it needs no hasher of its own; that the stored column is
+// really sha256 of the token is pinned in internal/service/session, against the code
+// that actually writes it.
+func tokenHash(token string) []byte {
+	digest := sha256.Sum256([]byte(token))
+	return digest[:]
+}
 
 // sessionRows counts stored rows for one token digest. ValidateSession cannot answer
 // this: it rejects an expired row and a missing row identically, so on its own it
@@ -153,8 +161,8 @@ func TestDeleteExpiredSessionsHonoursBothDeadlines(t *testing.T) {
 	hour := time.Hour.Milliseconds()
 
 	create := func(token string, expiresAt, absoluteExpiresAt int64) []byte {
-		hash := HashBytes([]byte(token))
-		if err := store.CreateSession(ctx, hash, HashBytes([]byte(token+"-csrf")), expiresAt, absoluteExpiresAt); err != nil {
+		hash := tokenHash(token)
+		if err := store.CreateSession(ctx, hash, tokenHash(token+"-csrf"), expiresAt, absoluteExpiresAt); err != nil {
 			t.Fatalf("create session %s: %v", token, err)
 		}
 		return hash
@@ -188,8 +196,8 @@ func TestDeleteExpiredSessionsIsBoundaryInclusive(t *testing.T) {
 	ctx := context.Background()
 	now := time.Now().UnixMilli()
 
-	hash := HashBytes([]byte("exactly-now"))
-	if err := store.CreateSession(ctx, hash, HashBytes([]byte("csrf")), now, now+24*time.Hour.Milliseconds()); err != nil {
+	hash := tokenHash("exactly-now")
+	if err := store.CreateSession(ctx, hash, tokenHash("csrf"), now, now+24*time.Hour.Milliseconds()); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.DeleteExpiredSessions(ctx, now); err != nil {
@@ -207,28 +215,5 @@ func TestDeleteExpiredSessionsLeavesAnEmptyTableAlone(t *testing.T) {
 	store := openTestStore(t)
 	if err := store.DeleteExpiredSessions(context.Background(), time.Now().UnixMilli()); err != nil {
 		t.Errorf("sweeping an empty table failed: %v", err)
-	}
-}
-
-// TestHashBytesIsSHA256 pins what the column stores. Session tokens are looked up by
-// this digest and never stored in the clear, so the algorithm is part of the on-disk
-// format: changing it invalidates every stored session at once.
-func TestHashBytesIsSHA256(t *testing.T) {
-	value := []byte("token-material")
-	want := sha256.Sum256(value)
-	got := HashBytes(value)
-	if !bytes.Equal(got, want[:]) {
-		t.Errorf("HashBytes = %x, want the sha256 digest %x", got, want)
-	}
-	if len(got) != sha256.Size {
-		t.Errorf("digest length = %d, want %d", len(got), sha256.Size)
-	}
-	if bytes.Equal(HashBytes([]byte("a")), HashBytes([]byte("b"))) {
-		t.Error("two different tokens hashed to the same digest")
-	}
-	// Hashing no bytes still yields a full-width digest, so an empty token cannot
-	// match a row stored with a zero-length hash.
-	if len(HashBytes(nil)) != sha256.Size {
-		t.Error("hashing no bytes did not produce a full-width digest")
 	}
 }

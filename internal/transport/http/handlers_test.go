@@ -450,7 +450,7 @@ func TestCreateAccountValidation(t *testing.T) {
 }
 
 // An internal failure must not leak its text: only the four classified sentinels
-// reach the client verbatim. "Google OAuth is not configured" is unclassified, so
+// reach the client verbatim. The missing-OAuth-credentials error is unclassified, so
 // it is a deployment detail the client must not be told.
 func TestUnclassifiedErrorIsRedacted(t *testing.T) {
 	h := newHarness(t)
