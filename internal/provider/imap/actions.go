@@ -15,7 +15,21 @@ import (
 
 // User-initiated operations on existing mail: flags, archive, and bulk mark-read.
 
-func (s *Supervisor) SetFlags(ctx context.Context, messageID int64, isRead, isStarred *bool) error {
+// onMessageConn runs fn against the command connection of whichever account owns
+// messageID, holding the foreground lock for the duration.
+//
+// The lock is not a parameter. Every operation on the command connection has to
+// choose between rt.lock() and rt.lockBackground(), and a user action waiting on a
+// keypress is always the foreground one — picking the background lock here would
+// queue the click behind the body-prefetch backlog, which is the minutes-long
+// stall this codebase already paid for once. Baking the choice in is what stops a
+// new action from getting it wrong.
+//
+// The two callers that do not use this need something it cannot express:
+// fetchBody chooses its lock at runtime from its background flag, and
+// FetchAttachment parses the part ID between resolving the runtime and taking the
+// lock so a malformed ID fails without touching the connection.
+func (s *Supervisor) onMessageConn(ctx context.Context, messageID int64, fn func(*runtime, *imapclient.Client, ports.MessageLocation) error) error {
 	location, err := s.repo.MessageLocation(ctx, messageID)
 	if err != nil {
 		return err
@@ -30,50 +44,48 @@ func (s *Supervisor) SetFlags(ctx context.Context, messageID int64, isRead, isSt
 	if client == nil {
 		return ports.Unavailablef("account is offline")
 	}
-	if _, err := client.Select(location.Mailbox.RemoteName, nil).Wait(); err != nil {
-		return err
-	}
-	uidSet := goimap.UIDSetNum(goimap.UID(location.UID))
-	// Ordered on purpose: a map range would emit the two STOREs in a random order,
-	// so a provider that only reports the last one, or a test asserting the wire
-	// sequence, would see different behaviour run to run.
-	for _, update := range []struct {
-		flag  goimap.Flag
-		value *bool
-	}{
-		{goimap.FlagSeen, isRead},
-		{goimap.FlagFlagged, isStarred},
-	} {
-		flag, value := update.flag, update.value
-		if value == nil {
-			continue
-		}
-		op := goimap.StoreFlagsDel
-		if *value {
-			op = goimap.StoreFlagsAdd
-		}
-		if _, err := client.Store(uidSet, &goimap.StoreFlags{Op: op, Silent: true, Flags: []goimap.Flag{flag}}, nil).Collect(); err != nil {
+	return fn(rt, client, location)
+}
+
+func (s *Supervisor) SetFlags(ctx context.Context, messageID int64, isRead, isStarred *bool) error {
+	return s.onMessageConn(ctx, messageID, func(_ *runtime, client *imapclient.Client, location ports.MessageLocation) error {
+		if _, err := client.Select(location.Mailbox.RemoteName, nil).Wait(); err != nil {
 			return err
 		}
-	}
-	return nil
+		uidSet := goimap.UIDSetNum(goimap.UID(location.UID))
+		// Ordered on purpose: a map range would emit the two STOREs in a random order,
+		// so a provider that only reports the last one, or a test asserting the wire
+		// sequence, would see different behaviour run to run.
+		for _, update := range []struct {
+			flag  goimap.Flag
+			value *bool
+		}{
+			{goimap.FlagSeen, isRead},
+			{goimap.FlagFlagged, isStarred},
+		} {
+			flag, value := update.flag, update.value
+			if value == nil {
+				continue
+			}
+			op := goimap.StoreFlagsDel
+			if *value {
+				op = goimap.StoreFlagsAdd
+			}
+			if _, err := client.Store(uidSet, &goimap.StoreFlags{Op: op, Silent: true, Flags: []goimap.Flag{flag}}, nil).Collect(); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 }
 
 func (s *Supervisor) Archive(ctx context.Context, messageID int64) error {
-	location, err := s.repo.MessageLocation(ctx, messageID)
-	if err != nil {
-		return err
-	}
-	rt, err := s.runtime(location.Account.ID)
-	if err != nil {
-		return err
-	}
-	rt.lock()
-	defer rt.unlock()
-	client := rt.client.Load()
-	if client == nil {
-		return ports.Unavailablef("account is offline")
-	}
+	return s.onMessageConn(ctx, messageID, func(rt *runtime, client *imapclient.Client, location ports.MessageLocation) error {
+		return s.archiveOn(ctx, rt, client, messageID, location)
+	})
+}
+
+func (s *Supervisor) archiveOn(ctx context.Context, rt *runtime, client *imapclient.Client, messageID int64, location ports.MessageLocation) error {
 	destination, err := s.ensureArchiveMailbox(ctx, rt, client)
 	if err != nil {
 		return err
