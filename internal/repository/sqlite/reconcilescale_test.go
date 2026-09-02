@@ -87,25 +87,50 @@ func TestReconcileScaleCost(t *testing.T) {
 	t.Logf("ListMailboxUIDs (%d rows) took %s", total, time.Since(start))
 
 	start = time.Now()
-	changed, err := store.ReconcileMailboxFlags(ctx, mailbox.ID, states)
+	changed := 0
+	counter := countSQL(t, store, func() {
+		changed, err = store.ReconcileMailboxFlags(ctx, mailbox.ID, states)
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	elapsed := time.Since(start)
-	t.Logf("ReconcileMailboxFlags (%d states, none differ) took %s, changed=%d", total, elapsed, changed)
-	// Generous next to the ~80ms this measures, but it fails loudly if the pass ever
-	// grows a per-row query or drops the chunking: writeMu is held throughout, so
-	// this duration is time a newly arrived message cannot be inserted.
-	if elapsed > 3*time.Second {
-		t.Errorf("reconciling %d unchanged rows held writeMu for %s", total, elapsed)
+	t.Logf("ReconcileMailboxFlags (%d states) took %s, changed=%d, sql: %s",
+		total, time.Since(start), changed, counter.summary())
+	// writeMu is held for the whole pass, so its cost lands directly on the latency
+	// of a message arriving at the same moment. What keeps it affordable is that it
+	// reads in chunks, and that is a statement count, not a duration: the same pass
+	// measures 4.9s under the race detector and 97ms without, so no wall-clock bound
+	// is both stable and tight enough to notice the chunking going away. Reading
+	// per row would issue one SELECT per state instead of one per chunk.
+	chunks := (total + sqliteParameterChunk - 1) / sqliteParameterChunk
+	if selects := counter.count("SELECT"); selects > chunks {
+		t.Errorf("reconciling %d rows issued %d SELECTs, want at most %d (one per %d-row chunk)",
+			total, selects, chunks, sqliteParameterChunk)
 	}
 
+	// The second pass is the one every 5-minute tick actually runs: the provider
+	// reports what the local rows already say. It has to be free of writes. Only
+	// this pass can carry that assertion — the first one legitimately rewrites all
+	// 20000 flags_json values, because bulkSeed stores nil flags as `null` and these
+	// states marshal an empty slice to `[]`.
 	start = time.Now()
-	changed, err = store.ReconcileMailboxFlags(ctx, mailbox.ID, states)
+	counter = countSQL(t, store, func() {
+		changed, err = store.ReconcileMailboxFlags(ctx, mailbox.ID, states)
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Logf("ReconcileMailboxFlags identical second pass took %s, changed=%d", time.Since(start), changed)
+	t.Logf("ReconcileMailboxFlags identical second pass took %s, changed=%d, sql: %s",
+		time.Since(start), changed, counter.summary())
+	if writes := counter.count("UPDATE"); writes != 0 {
+		t.Errorf("reconciling %d unchanged rows issued %d UPDATEs, want 0", total, writes)
+	}
+	if selects := counter.count("SELECT"); selects > chunks {
+		t.Errorf("second pass issued %d SELECTs, want at most %d", selects, chunks)
+	}
+	if changed != 0 {
+		t.Errorf("changed = %d on a pass where no flag differs, want 0", changed)
+	}
 
 	// One stale UID is enough to trigger the orphan sweep, which is the expensive
 	// part of the delete path rather than the chunked DELETE itself.
@@ -114,18 +139,15 @@ func TestReconcileScaleCost(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	elapsed = time.Since(start)
-	t.Logf("DeleteMailboxUIDs with 1 stale UID took %s, removed=%d", elapsed, removed)
+	t.Logf("DeleteMailboxUIDs with 1 stale UID took %s, removed=%d", time.Since(start), removed)
 	if removed != 1 {
 		t.Fatalf("removed = %d, want 1", removed)
 	}
-	// writeMu is held for the whole call, so this is time no newly arrived message
-	// can be inserted. The sweep used to be `id NOT IN (SELECT message_id FROM
-	// mailbox_messages)` across the whole table, which cost the same whether one
-	// UID or ten thousand were expunged.
-	if elapsed > time.Second {
-		t.Errorf("expunging 1 uid out of %d held writeMu for %s", total, elapsed)
-	}
+	// The cost that matters here is the sweep's shape, not this duration: the sweep
+	// used to be `id NOT IN (SELECT message_id FROM mailbox_messages)` across the
+	// whole table, which costs the same whether one UID or ten thousand are
+	// expunged. TestOrphanSweepIsIndexed asserts that shape against the query plan,
+	// which a timing bound at test scale cannot do.
 }
 
 // TestOrphanSweepIsIndexed asserts the plan rather than the clock: a full scan of
