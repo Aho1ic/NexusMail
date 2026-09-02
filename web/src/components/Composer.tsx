@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { LoaderCircle, Paperclip, Send, X } from 'lucide-react'
 import { api } from '../lib/api'
+import { Dialog } from './shared'
 import { decodeAddressList, messageOf, splitEmails } from '../lib/format'
 import type { Account, Draft, DraftInput, Message } from '../types'
 
@@ -78,7 +79,7 @@ export function Composer({ accounts, replyTo, initialDraft, onClose, onSent }: P
       await api.uploadAttachment(saved.id, file); setStatus(`已添加 ${file.name}`)
     } catch (err) { setStatus(messageOf(err)) }
   }
-  return <div className="modal-backdrop"><div className="flex h-[min(92vh,760px)] w-[min(94vw,760px)] flex-col overflow-hidden rounded-panel bg-white shadow-glass-high">
+  return <Dialog label="新邮件" onClose={onClose} className="flex h-[min(92vh,760px)] w-[min(94vw,760px)] flex-col overflow-hidden rounded-panel bg-white shadow-glass-high">
     <header className="flex items-center justify-between border-b border-black/5 px-5 py-4"><div><h2 className="font-serif text-2xl">新邮件</h2><p className="text-[10px] text-black/35">{status}</p></div><button onClick={onClose} aria-label="关闭" className="icon-button"><X size={19} /></button></header>
     <div className="flex-1 overflow-y-auto p-5">
       <select value={accountID} disabled={Boolean(draft)} onChange={event => setAccountID(Number(event.target.value))} className="input mb-2 disabled:opacity-60">{accounts.map(account => <option key={account.id} value={account.id}>{account.display_name || account.email}</option>)}</select>
@@ -88,7 +89,7 @@ export function Composer({ accounts, replyTo, initialDraft, onClose, onSent }: P
       <textarea value={body} onChange={event => setBody(event.target.value)} className="mt-3 min-h-[320px] w-full resize-none rounded-card border border-black/5 bg-paper/50 p-4 text-sm leading-6 outline-none focus:ring-2 focus:ring-pine/20" placeholder="写点什么…" />
     </div>
     <footer className="flex items-center justify-between border-t border-black/5 px-5 py-4"><label className="icon-button cursor-pointer"><Paperclip size={18} /><input type="file" aria-label="添加附件" className="hidden" onChange={event => attach(event.target.files?.[0])} /></label><button disabled={busy || !accountID || !to.trim()} onClick={send} className="button-primary">{busy ? <LoaderCircle className="animate-spin" size={17} /> : <Send size={17} />}发送</button></footer>
-  </div></div>
+  </Dialog>
 }
 
 function ComposerField({ label, value, onChange, placeholder = '' }: { label: string; value: string; onChange: (value: string) => void; placeholder?: string }) { return <label className="mt-2 flex items-center border-b border-black/5 py-2"><span className="w-16 text-xs font-semibold text-black/40">{label}</span><input value={value} onChange={event => onChange(event.target.value)} placeholder={placeholder} className="min-w-0 flex-1 bg-transparent py-1 text-sm outline-none" /></label> }

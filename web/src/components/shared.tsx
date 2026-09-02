@@ -1,4 +1,27 @@
+import { useEffect } from 'react'
 import { Archive, AtSign, Circle, Inbox, Mail, Send } from 'lucide-react'
+
+// Dialog is the one place the four modals agree on: the backdrop, Escape, and the
+// role that makes a screen reader announce them as dialogs. They had drifted —
+// Escape closed the settings panel and nothing else, and only that panel carried
+// role="dialog" — so the same gesture worked or did nothing depending on which
+// modal was open. The panel itself stays with each caller, because their shapes
+// genuinely differ: two are scroll containers with a header and footer, one is a
+// form, one is a fixed-width card.
+//
+// Escape is safe for all four. The composer is the only one holding unsaved input
+// and it autosaves every two seconds, so closing it parks a draft rather than
+// discarding one.
+export function Dialog({ label, onClose, className, children }: { label: string; onClose: () => void; className: string; children: React.ReactNode }) {
+  useEffect(() => {
+    const handler = (event: KeyboardEvent) => { if (event.key === 'Escape') onClose() }
+    addEventListener('keydown', handler)
+    return () => removeEventListener('keydown', handler)
+  }, [onClose])
+  return <div className="modal-backdrop">
+    <div role="dialog" aria-modal="true" aria-label={label} className={className}>{children}</div>
+  </div>
+}
 
 export function NavItem({ active, icon, label, sublabel, count, onClick }: { active: boolean; icon: React.ReactNode; label: string; sublabel?: string; count?: number; onClick: () => void }) { return <button onClick={onClick} className={`mt-1 flex w-full items-center gap-3 rounded-2xl px-3 py-3 text-left transition ${active ? 'bg-white/12 text-white shadow-lift-1' : 'text-white/65 hover:bg-white/5 hover:text-white'}`}><span className="grid w-5 place-items-center">{icon}</span><span className="min-w-0 flex-1"><span className="block truncate text-sm font-semibold">{label}</span>{sublabel && <span className="block truncate text-[9px] text-white/35">{sublabel}</span>}</span>{Boolean(count) && <span className="rounded-full bg-coral px-2 py-0.5 text-[9px] font-bold text-white">{count}</span>}</button> }
 export function FolderIcon({ role }: { role: string }) { if (role === 'inbox') return <Inbox size={13} />; if (role === 'sent') return <Send size={13} />; if (role === 'archive') return <Archive size={13} />; return <Mail size={13} /> }

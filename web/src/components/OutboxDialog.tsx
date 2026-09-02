@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react'
 import { Bell, RefreshCw, X } from 'lucide-react'
 import { api } from '../lib/api'
+import { Dialog } from './shared'
 import { decodeAddressList, formatFullDate, messageOf } from '../lib/format'
 import type { Draft } from '../types'
 
@@ -15,7 +16,7 @@ export function OutboxDialog({ onClose, onEdit }: { onClose: () => void; onEdit:
   useEffect(() => { load() }, [load])
   async function retry(id: number) { try { await api.retryDraft(id); await load() } catch (err) { setError(messageOf(err)) } }
   async function remove(id: number) { try { await api.deleteDraft(id); await load() } catch (err) { setError(messageOf(err)) } }
-  return <div className="modal-backdrop"><div className="flex h-[min(86vh,680px)] w-[min(94vw,680px)] flex-col overflow-hidden rounded-panel bg-white shadow-glass-high">
+  return <Dialog label="草稿与发件箱" onClose={onClose} className="flex h-[min(86vh,680px)] w-[min(94vw,680px)] flex-col overflow-hidden rounded-panel bg-white shadow-glass-high">
     <header className="flex items-center justify-between border-b border-black/5 px-6 py-5"><div><p className="text-[10px] font-bold uppercase tracking-[.2em] text-pine/40">Delivery</p><h2 className="font-serif text-3xl">草稿与发件箱</h2></div><div className="flex gap-1"><button onClick={load} aria-label="刷新" className="icon-button"><RefreshCw className={loading ? 'animate-spin' : ''} size={18} /></button><button onClick={onClose} aria-label="关闭" className="icon-button"><X size={19} /></button></div></header>
     <div className="flex-1 overflow-y-auto p-4">
       {error && <p className="m-2 rounded-card bg-red-50 p-3 text-xs text-red-700">{error}</p>}
@@ -26,7 +27,7 @@ export function OutboxDialog({ onClose, onEdit }: { onClose: () => void; onEdit:
         <div className="mt-3 flex items-center justify-between text-[10px] text-black/35"><time>{formatFullDate(draft.updated_at)}</time><div className="flex gap-2">{['failed', 'unknown'].includes(draft.status) && <button onClick={() => retry(draft.id)} className="font-semibold text-coral">确认重试</button>}{['draft', 'failed', 'unknown'].includes(draft.status) && <button onClick={() => onEdit(draft)} className="font-semibold text-pine">编辑</button>}{!['queued', 'sending'].includes(draft.status) && <button onClick={() => remove(draft.id)} className="font-semibold text-black/40">删除</button>}</div></div>
       </div>)}
     </div>
-  </div></div>
+  </Dialog>
 }
 
 function StatusPill({ status, remote }: { status: string; remote: string }) {

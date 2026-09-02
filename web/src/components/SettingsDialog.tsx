@@ -1,5 +1,6 @@
-import { useEffect, useState } from 'react'
+import { useState } from 'react'
 import { AtSign, Bell, Image, Keyboard, LogOut, Plus, X } from 'lucide-react'
+import { Dialog } from './shared'
 import { accountStatusLabel, formatFullDate } from '../lib/format'
 import { notificationPermission, requestNotificationPermission, type Preferences } from '../lib/preferences'
 import type { Account } from '../types'
@@ -9,10 +10,8 @@ type Props = { preferences: Preferences; accounts: Account[]; onChange: (patch: 
 export function SettingsDialog({ preferences, accounts, onChange, onClose, onAddAccount, onLogout }: Props) {
   const [permission, setPermission] = useState(notificationPermission)
   const [asking, setAsking] = useState(false)
-  useEffect(() => { const handler = (event: KeyboardEvent) => { if (event.key === 'Escape') onClose() }; addEventListener('keydown', handler); return () => removeEventListener('keydown', handler) }, [onClose])
   async function askPermission() { setAsking(true); try { setPermission(await requestNotificationPermission()) } finally { setAsking(false) } }
-  return <div className="modal-backdrop">
-    <div role="dialog" aria-modal="true" aria-label="设置" className="flex max-h-[min(88vh,780px)] w-[min(94vw,540px)] flex-col overflow-hidden rounded-panel bg-white shadow-glass-high">
+  return <Dialog label="设置" onClose={onClose} className="flex max-h-[min(88vh,780px)] w-[min(94vw,540px)] flex-col overflow-hidden rounded-panel bg-white shadow-glass-high">
       <header className="flex shrink-0 items-center justify-between border-b border-black/5 px-7 py-6"><div><p className="text-[10px] font-bold uppercase tracking-[.2em] text-pine/40">Preferences</p><h2 className="font-serif text-3xl">设置</h2></div><button onClick={onClose} className="icon-button" aria-label="关闭设置"><X size={19} /></button></header>
       <div className="flex-1 overflow-y-auto px-7 py-2">
         <SettingsSection icon={<Bell size={14} />} title="通知">
@@ -49,8 +48,7 @@ export function SettingsDialog({ preferences, accounts, onChange, onClose, onAdd
         </SettingsSection>
       </div>
       <footer className="flex shrink-0 items-center justify-between gap-3 border-t border-black/5 px-7 py-5"><button onClick={onLogout} className="flex items-center gap-2 text-xs font-semibold text-red-600 hover:text-red-700"><LogOut size={15} />退出登录</button><button onClick={onClose} className="button-primary">完成</button></footer>
-    </div>
-  </div>
+  </Dialog>
 }
 
 function SettingsSection({ icon, title, children }: { icon: React.ReactNode; title: string; children: React.ReactNode }) {
