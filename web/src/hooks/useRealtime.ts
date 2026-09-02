@@ -34,7 +34,17 @@ export function useRealtime(onChange: () => void, onEvent: (payload: EventEnvelo
       socket.onopen = () => { delay = 250; schedule() }
       // The payload is forwarded verbatim: only the caller knows whether the event
       // carries a verification code worth notifying about.
-      socket.onmessage = event => { const payload = JSON.parse(event.data) as EventEnvelope; if (realtimeEvents.includes(payload.type)) { schedule(); events.current(payload) } }
+      //
+      // Parsed defensively for the same reason notify() is: the server only ever
+      // writes json.Marshal output and the keepalive is a ping frame the browser
+      // answers without surfacing it here, so a frame that is not JSON should not
+      // arrive — but an unhandled throw in this handler drops the schedule() that
+      // was about to resync, and a proxy that injects a text frame would do it.
+      socket.onmessage = event => {
+        let payload: EventEnvelope
+        try { payload = JSON.parse(event.data) as EventEnvelope } catch { return }
+        if (realtimeEvents.includes(payload?.type)) { schedule(); events.current(payload) }
+      }
       socket.onclose = () => { if (!stopped) { timer = window.setTimeout(connect, delay); delay = Math.min(delay * 2, 10000) } }
     }
     connect()
