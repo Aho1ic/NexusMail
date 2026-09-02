@@ -41,6 +41,12 @@ type Store interface {
 // uploaded one per keystroke.
 const syncDebounce = 5 * time.Second
 
+// remotePushTimeout bounds one debounced push. A push is an APPEND of the whole
+// draft plus a delete of the previous copy, and it queues behind whatever the
+// account's command connection is already doing, so the ceiling is generous
+// rather than tight.
+const remotePushTimeout = 45 * time.Second
+
 type Service struct {
 	repo   Store
 	events ports.Publisher
@@ -48,8 +54,14 @@ type Service struct {
 	// syncDelay is syncDebounce outside tests; it exists so a test can assert the
 	// debounce without waiting for it.
 	syncDelay time.Duration
-	mu        sync.Mutex
-	timers    map[int64]*time.Timer
+	// baseCtx is the parent of every debounced push. Close cancels it, which is the
+	// only way to reach a push that has already left its timer: Stop reports false
+	// for a fired timer and cannot interrupt the 45s IMAP APPEND it started, so
+	// without this the call outlives the supervisor it talks to.
+	baseCtx context.Context
+	stop    context.CancelFunc
+	mu      sync.Mutex
+	timers  map[int64]*time.Timer
 }
 
 type RemoteSyncer interface {
@@ -58,13 +70,19 @@ type RemoteSyncer interface {
 }
 
 func New(repo Store, events ports.Publisher, remote RemoteSyncer) *Service {
-	return &Service{repo: repo, events: events, remote: remote, syncDelay: syncDebounce, timers: make(map[int64]*time.Timer)}
+	ctx, stop := context.WithCancel(context.Background())
+	return &Service{
+		repo: repo, events: events, remote: remote, syncDelay: syncDebounce,
+		baseCtx: ctx, stop: stop, timers: make(map[int64]*time.Timer),
+	}
 }
 
 // Close stops every pending push. The timers are the one piece of background work
 // in this package, and without this they can fire after the supervisor they call
-// into has already been stopped.
+// into has already been stopped. Cancelling baseCtx covers the other half: a push
+// already in flight when Close arrives, which no timer can reach.
 func (s *Service) Close() {
+	s.stop()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for id, timer := range s.timers {
@@ -146,7 +164,7 @@ func (s *Service) schedule(id int64) {
 		timer.Stop()
 	}
 	s.timers[id] = time.AfterFunc(s.syncDelay, func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+		ctx, cancel := context.WithTimeout(s.baseCtx, remotePushTimeout)
 		defer cancel()
 		_ = s.remote.SyncDraft(ctx, id)
 		s.mu.Lock()

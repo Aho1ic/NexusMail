@@ -45,154 +45,219 @@ func (s *Supervisor) commandLoop(ctx context.Context, rt *runtime) {
 		// account were transient.
 		rt.authSucceeded()
 		rt.client.Store(client)
-		_ = s.repo.UpdateAccountStatus(ctx, rt.account.ID, "syncing", nil)
-		// Refresh the catalog without holding the command lock so the LIST
-		// round-trip and mailbox upserts do not block the new-mail path.
-		if _, listErr := s.refreshMailboxCatalog(ctx, rt, client); listErr != nil {
-			s.setError(ctx, rt.account.ID, verdict{status: "backoff", delay: backoff, store: true, ladder: true}, listErr)
-			s.closeCommand(rt, client)
-			if !waitBackoff(ctx, backoff) {
-				return
-			}
-			backoff = min(backoff*2, 5*time.Minute)
+		result, sessionErr := s.runSession(ctx, rt, client, backoff)
+		s.closeCommand(rt, client)
+		if sessionErr == nil {
+			// The ladder is reset only once a sync has actually succeeded:
+			// reaching the greeting proves nothing about whether the account can
+			// be read. A session that got that far and then ended — a scheduled
+			// refresh, a socket the provider closed — is not a failure, so it
+			// waits for nothing before reconnecting.
+			backoff = time.Second
 			continue
 		}
-		rt.lock()
-		syncErr := s.syncAllMailboxes(ctx, rt, client)
-		rt.unlock()
-		if syncErr != nil {
-			// OAuth tokens can expire mid-session: the connect succeeded but a
-			// later IMAP command now returns ResponseCodeAuthenticationFailed.
-			// Without this re-check the error flows into the 1s-5m ladder and
-			// hammers the provider, bypassing the auth_error park that exists
-			// on the connect path. A "System busy" / "Too many connections"
-			// from the provider is the same shape of mistake: the 1s ladder
-			// keeps the throttle engaged, so it gets the dedicated
-			// rateLimitBackoff instead.
-			syncResult := s.classifyFailure(rt, syncErr, backoff)
-			// A sync that keeps failing used to reconnect with no delay at all,
-			// because the ladder was reset on connect and only the connect path
-			// waited. That is a tight reconnect loop against the provider.
-			s.setError(ctx, rt.account.ID, syncResult, syncErr)
-			s.closeCommand(rt, client)
-			if !waitBackoff(ctx, syncResult.delay) {
-				return
-			}
+		s.setError(ctx, rt.account.ID, result, sessionErr)
+		if !waitBackoff(ctx, result.delay) {
+			return
+		}
+		// As on the connect path, the ladder advances only for the failures it
+		// governs: an expired token or a throttle caught by the opening sync
+		// serves its own fixed delay, and letting it double this counter too
+		// would charge a later network error a wait it did not earn.
+		if result.ladder {
 			backoff = min(backoff*2, 5*time.Minute)
-			continue
 		}
-		// The ladder is reset only once a sync has actually succeeded: reaching the
-		// greeting proves nothing about whether the account can be read.
-		backoff = time.Second
-		s.enqueueBodyCandidates(ctx, rt.account.ID)
-		_ = s.repo.UpdateAccountStatus(ctx, rt.account.ID, "connected", nil)
-		ticker := time.NewTicker(periodicSyncInterval)
-		// The command connection owns sync and is always alive, so the safety
-		// net lives here rather than inside the IDLE state.
-		probe := time.NewTicker(realtimePollInterval)
-		// Rebuild the command connection periodically. A long-lived connection to
-		// QQ stops reflecting new mail: neither the 5-second STATUS probe nor the
-		// 5-minute SELECT sees it, so mail sat unnoticed for tens of minutes and
-		// then arrived in one batch the moment the connection was replaced —
-		// measured on this account as four messages spanning 41 minutes of
-		// arrivals all stored in the same second, and a 42-minute delay that
-		// resolved 6 seconds after an unrelated reconnect. The IDLE connection
-		// already refreshes on its own timer for the same reason; the command
-		// connection had no equivalent and could stay stale indefinitely.
-		refresh := time.NewTimer(s.commandRefreshOrDefault())
-		// probeFailures counts consecutive probe errors on this connection. A
-		// probe is one STATUS on a connection that just authenticated, so
-		// repeated failures mean the connection is no longer usable even when
-		// go-imap has not noticed it closed — a socket the host's sleep or a NAT
-		// dropped without an RST fails instantly and forever, and the old code
-		// only logged that at Debug and waited for client.Closed().
-		probeFailures := 0
-		connected := true
-		for connected {
-			select {
-			case <-ctx.Done():
-				connected = false
-			case <-probe.C:
-				rt.lock()
-				probeErr := s.probeInbox(ctx, rt, client)
-				rt.unlock()
-				if probeErr == nil {
-					probeFailures = 0
-					s.enqueueBodyCandidates(ctx, rt.account.ID)
-				} else if isRateLimited(probeErr) {
-					// A probe that hits the throttle must not be followed by
-					// another one 5 seconds later: each STATUS in the throttle
-					// window extends the provider's lockout. Drop out of the
-					// inner loop so the connect path applies rateLimitBackoff
-					// instead of running the probe ticker through the window.
-					slog.Debug("mail inbox probe rate-limited, backing off", "account_id", rt.account.ID, "error", probeErr)
-					connected = false
-				} else {
-					// A single failure must not tear down the connection: a
-					// missing or misclassified inbox is a local problem that
-					// reconnecting cannot fix. Sustained failure is different —
-					// it is the signature of a connection that is dead without
-					// being closed, and the only way out is a reconnect.
-					probeFailures++
-					slog.Debug("mail inbox probe failed", "account_id", rt.account.ID, "failures", probeFailures, "error", probeErr)
-					if probeFailures >= maxProbeFailures {
-						slog.Warn("mail inbox probe failing repeatedly, reconnecting",
-							"account_id", rt.account.ID, "failures", probeFailures, "error", probeErr)
-						connected = false
-					}
-				}
-			case mailboxID := <-rt.syncReq:
-				rt.lock()
-				// servicePending, not a copy of its rules: it resolves the zero
-				// sentinel to the inbox and refuses a mailbox belonging to another
-				// account. Anything else queued behind it is drained in the same lock
-				// acquisition rather than one request per pass through this select.
-				err := s.servicePending(ctx, rt, client, mailboxID)
-				if err == nil {
-					err = s.drainPending(ctx, rt, client)
-				}
-				rt.unlock()
-				if err == nil {
-					s.enqueueBodyCandidates(ctx, rt.account.ID)
-				}
-				if err != nil {
-					connected = false
-				}
-			case <-ticker.C:
-				// Refresh the catalog without holding the command lock so a
-				// slow LIST cannot stall the new-mail probe for the whole
-				// 5-minute interval.
-				if _, listErr := s.refreshMailboxCatalog(ctx, rt, client); listErr != nil {
-					slog.Debug("mailbox catalog refresh failed", "account_id", rt.account.ID, "error", listErr)
-				}
-				rt.lock()
-				err := s.syncAllMailboxes(ctx, rt, client)
-				rt.unlock()
-				if err == nil {
-					s.enqueueBodyCandidates(ctx, rt.account.ID)
-				}
-				if err != nil {
-					connected = false
-				}
-			case <-refresh.C:
-				// A scheduled rebuild, not a failure: leave the ladder and the
-				// account status alone so this never looks like an outage.
-				slog.Debug("refreshing command connection", "account_id", rt.account.ID)
-				connected = false
-			case <-client.Closed():
-				connected = false
-			}
-		}
-		ticker.Stop()
-		probe.Stop()
+	}
+}
+
+// runSession takes a freshly authenticated connection through the catalog
+// refresh, the opening sync, and then the connected loop.
+//
+// Only the two opening steps can return an error: they run before the account is
+// declared connected, so a failure there means this connection never became
+// usable and the caller must back off. Once serveConnected is entered the session
+// is considered to have done its job however it ends, and the caller reconnects
+// immediately — the verdict is empty and the error nil. ladder is the caller's
+// current rung, used for the failures that have no delay of their own.
+func (s *Supervisor) runSession(ctx context.Context, rt *runtime, client *imapclient.Client, ladder time.Duration) (verdict, error) {
+	_ = s.repo.UpdateAccountStatus(ctx, rt.account.ID, "syncing", nil)
+	// Refresh the catalog without holding the command lock so the LIST
+	// round-trip and mailbox upserts do not block the new-mail path.
+	if _, listErr := s.refreshMailboxCatalog(ctx, rt, client); listErr != nil {
+		return verdict{status: "backoff", delay: ladder, store: true, ladder: true}, listErr
+	}
+	rt.lock()
+	syncErr := s.syncAllMailboxes(ctx, rt, client)
+	rt.unlock()
+	if syncErr != nil {
+		// OAuth tokens can expire mid-session: the connect succeeded but a
+		// later IMAP command now returns ResponseCodeAuthenticationFailed.
+		// Without this re-check the error flows into the 1s-5m ladder and
+		// hammers the provider, bypassing the auth_error park that exists
+		// on the connect path. A "System busy" / "Too many connections"
+		// from the provider is the same shape of mistake: the 1s ladder
+		// keeps the throttle engaged, so it gets the dedicated
+		// rateLimitBackoff instead.
+		//
+		// A sync that keeps failing used to reconnect with no delay at all,
+		// because the ladder was reset on connect and only the connect path
+		// waited. That is a tight reconnect loop against the provider.
+		return s.classifyFailure(rt, syncErr, ladder), syncErr
+	}
+	s.enqueueBodyCandidates(ctx, rt.account.ID)
+	_ = s.repo.UpdateAccountStatus(ctx, rt.account.ID, "connected", nil)
+	if err := s.serveConnected(ctx, rt, client); err != nil {
+		// Reported as a session that ended, not as a classified failure: the
+		// reconnect is immediate and it is the connect that decides whether this
+		// account is actually in trouble. See serveConnected.
+		slog.Debug("command session ended on error, reconnecting", "account_id", rt.account.ID, "error", err)
+	}
+	return verdict{}, nil
+}
+
+// serveConnected runs the connected phase: the three timers and the four events
+// that can end a session. Every branch that gives up returns rather than setting
+// a flag, so the reason a session ended is visible at the point it is decided.
+//
+// It never classifies its own failures. A command that fails on an established
+// connection ends the session and the reconnect decides what the error was —
+// deliberately, because classifying here would count the error against the
+// account's auth-failure evidence a second time and could park a healthy account
+// in auth_error on one mid-session hiccup. The reconnect either succeeds, proving
+// the error transient, or fails and is classified once on the connect path.
+func (s *Supervisor) serveConnected(ctx context.Context, rt *runtime, client *imapclient.Client) error {
+	ticker := time.NewTicker(periodicSyncInterval)
+	defer ticker.Stop()
+	// The command connection owns sync and is always alive, so the safety
+	// net lives here rather than inside the IDLE state.
+	probe := time.NewTicker(realtimePollInterval)
+	defer probe.Stop()
+	// Rebuild the command connection periodically. A long-lived connection to
+	// QQ stops reflecting new mail: neither the 5-second STATUS probe nor the
+	// 5-minute SELECT sees it, so mail sat unnoticed for tens of minutes and
+	// then arrived in one batch the moment the connection was replaced —
+	// measured on this account as four messages spanning 41 minutes of
+	// arrivals all stored in the same second, and a 42-minute delay that
+	// resolved 6 seconds after an unrelated reconnect. The IDLE connection
+	// already refreshes on its own timer for the same reason; the command
+	// connection had no equivalent and could stay stale indefinitely.
+	refresh := time.NewTimer(s.commandRefreshOrDefault())
+	defer func() {
 		if !refresh.Stop() {
 			select {
 			case <-refresh.C:
 			default:
 			}
 		}
-		s.closeCommand(rt, client)
+	}()
+	// probeFailures counts consecutive probe errors on this connection. A
+	// probe is one STATUS on a connection that just authenticated, so
+	// repeated failures mean the connection is no longer usable even when
+	// go-imap has not noticed it closed — a socket the host's sleep or a NAT
+	// dropped without an RST fails instantly and forever, and the old code
+	// only logged that at Debug and waited for client.Closed().
+	probeFailures := 0
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-probe.C:
+			probeErr := s.runProbe(ctx, rt, client)
+			if probeErr == nil {
+				probeFailures = 0
+				continue
+			}
+			if isRateLimited(probeErr) {
+				// A probe that hits the throttle must not be followed by
+				// another one 5 seconds later: each STATUS in the throttle
+				// window extends the provider's lockout. End the session so the
+				// connect path applies rateLimitBackoff instead of running the
+				// probe ticker through the window.
+				slog.Debug("mail inbox probe rate-limited, backing off", "account_id", rt.account.ID, "error", probeErr)
+				return probeErr
+			}
+			// A single failure must not tear down the connection: a
+			// missing or misclassified inbox is a local problem that
+			// reconnecting cannot fix. Sustained failure is different —
+			// it is the signature of a connection that is dead without
+			// being closed, and the only way out is a reconnect.
+			probeFailures++
+			slog.Debug("mail inbox probe failed", "account_id", rt.account.ID, "failures", probeFailures, "error", probeErr)
+			if probeFailures >= maxProbeFailures {
+				slog.Warn("mail inbox probe failing repeatedly, reconnecting",
+					"account_id", rt.account.ID, "failures", probeFailures, "error", probeErr)
+				return probeErr
+			}
+		case mailboxID := <-rt.syncReq:
+			if err := s.serviceSyncRequest(ctx, rt, client, mailboxID); err != nil {
+				return err
+			}
+		case <-ticker.C:
+			if err := s.periodicSync(ctx, rt, client); err != nil {
+				return err
+			}
+		case <-refresh.C:
+			// A scheduled rebuild, not a failure: leave the ladder and the
+			// account status alone so this never looks like an outage.
+			slog.Debug("refreshing command connection", "account_id", rt.account.ID)
+			return nil
+		case <-client.Closed():
+			return nil
+		}
 	}
+}
+
+// runProbe takes the command lock for one inbox probe and queues whatever bodies
+// it turned up.
+func (s *Supervisor) runProbe(ctx context.Context, rt *runtime, client *imapclient.Client) error {
+	rt.lock()
+	err := s.probeInbox(ctx, rt, client)
+	rt.unlock()
+	if err != nil {
+		return err
+	}
+	s.enqueueBodyCandidates(ctx, rt.account.ID)
+	return nil
+}
+
+// serviceSyncRequest answers one queued sync request and everything queued behind
+// it, in a single lock acquisition.
+func (s *Supervisor) serviceSyncRequest(ctx context.Context, rt *runtime, client *imapclient.Client, mailboxID int64) error {
+	rt.lock()
+	// servicePending, not a copy of its rules: it resolves the zero
+	// sentinel to the inbox and refuses a mailbox belonging to another
+	// account. Anything else queued behind it is drained in the same lock
+	// acquisition rather than one request per pass through the select.
+	err := s.servicePending(ctx, rt, client, mailboxID)
+	if err == nil {
+		err = s.drainPending(ctx, rt, client)
+	}
+	rt.unlock()
+	if err != nil {
+		return err
+	}
+	s.enqueueBodyCandidates(ctx, rt.account.ID)
+	return nil
+}
+
+// periodicSync is the 5-minute full pass. A failed catalog refresh is logged and
+// tolerated: the mailbox list rarely changes, and the sync that follows is the
+// part that matters.
+func (s *Supervisor) periodicSync(ctx context.Context, rt *runtime, client *imapclient.Client) error {
+	// Refresh the catalog without holding the command lock so a
+	// slow LIST cannot stall the new-mail probe for the whole
+	// 5-minute interval.
+	if _, listErr := s.refreshMailboxCatalog(ctx, rt, client); listErr != nil {
+		slog.Debug("mailbox catalog refresh failed", "account_id", rt.account.ID, "error", listErr)
+	}
+	rt.lock()
+	err := s.syncAllMailboxes(ctx, rt, client)
+	rt.unlock()
+	if err != nil {
+		return err
+	}
+	s.enqueueBodyCandidates(ctx, rt.account.ID)
+	return nil
 }
 
 func (s *Supervisor) idleLoop(ctx context.Context, rt *runtime) {

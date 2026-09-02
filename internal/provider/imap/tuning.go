@@ -78,6 +78,13 @@ func observe(phase string, accountID int64, attrs ...any) func() {
 // the life of the process, taking the command connection each time.
 const maxBodyAttempts = 3
 
+// rollbackGrace bounds a body_state write that undoes a fetch after the caller's
+// context is already done. It is the only write here allowed to outlive its
+// parent, so it is sized for one uncontended UPDATE on the write mutex rather
+// than for a fetch: two seconds is far past the ~1ms that takes, and is what a
+// shutdown pays in the worst case per in-flight fetch.
+const rollbackGrace = 2 * time.Second
+
 // commandRefreshInterval bounds how long one command connection is trusted.
 // It exists because a stale connection is silent rather than broken: QQ stopped
 // reporting new mail on a long-lived connection through both STATUS and SELECT,

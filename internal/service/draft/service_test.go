@@ -388,6 +388,55 @@ func TestCloseStopsPendingPushes(t *testing.T) {
 	}
 }
 
+// Close has to reach a push that has already left its timer, which is the case
+// Stop cannot cover: it reports false for a fired timer and cannot interrupt the
+// IMAP APPEND it started. Before Close cancelled the push context, that call held
+// a 45s budget off context.Background() and could still be talking to the
+// supervisor it was shut down alongside.
+func TestCloseCancelsAnInFlightPush(t *testing.T) {
+	entered := make(chan struct{})
+	observed := make(chan error, 1)
+	remote := &blockingRemote{entered: entered, observed: observed}
+	service := New(&fakeStore{}, &recorder{}, remote)
+	service.syncDelay = time.Millisecond
+
+	if _, err := service.Create(context.Background(), Input{AccountID: 1}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the debounced push never started")
+	}
+
+	service.Close()
+	select {
+	case err := <-observed:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("in-flight push saw %v, want context.Canceled", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close did not cancel the in-flight push: it can outlive the supervisor it calls")
+	}
+}
+
+// blockingRemote parks inside SyncDraft until its context ends, then reports what
+// ended it.
+type blockingRemote struct {
+	entered  chan struct{}
+	observed chan error
+	once     sync.Once
+}
+
+func (b *blockingRemote) SyncDraft(ctx context.Context, _ int64) error {
+	b.once.Do(func() { close(b.entered) })
+	<-ctx.Done()
+	b.observed <- ctx.Err()
+	return ctx.Err()
+}
+
+func (b *blockingRemote) DeleteRemoteDraft(context.Context, int64) error { return nil }
+
 func TestScheduleIsSkippedWithoutARemote(t *testing.T) {
 	service := New(&fakeStore{}, &recorder{}, nil)
 	if _, err := service.Create(context.Background(), Input{AccountID: 1}); err != nil {

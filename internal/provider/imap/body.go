@@ -51,6 +51,24 @@ type otpNotice struct {
 	Subject string
 }
 
+// rollbackCtx returns a context fit for a body_state write that undoes a fetch
+// which has just failed. The caller's context is reused while it is still live so
+// the write inherits its cancellation; once it is done — the common case, since a
+// fetch that overran its 45s budget is the usual reason to roll back — a write on
+// it cannot land at all, and 'fetching' would be left behind. That state renders
+// as "will refresh automatically" in the reading pane, so losing the write
+// promises the user a retry the prefetch has already given up on.
+//
+// The replacement is deliberately short-lived: it is off the process ctx, so it
+// is the one write that can outlive shutdown, and rollbackGrace is what that
+// costs in the worst case.
+func rollbackCtx(ctx context.Context) (context.Context, context.CancelFunc) {
+	if ctx.Err() == nil {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(context.WithoutCancel(ctx), rollbackGrace)
+}
+
 // fetchBody returns any verification code the body carries instead of publishing
 // it, because this runs while holding the account's command connection and the
 // new-mail latency budget leaves no room for extra work under that lock.
@@ -88,7 +106,9 @@ func (s *Supervisor) fetchBody(ctx context.Context, messageID int64, background 
 	}
 	defer func() {
 		if resultErr != nil {
-			_ = s.repo.SetMessageBodyState(context.Background(), messageID, "error")
+			undoCtx, cancel := rollbackCtx(ctx)
+			defer cancel()
+			_ = s.repo.SetMessageBodyState(undoCtx, messageID, "error")
 		}
 	}()
 	location, err := s.repo.MessageLocation(ctx, messageID)
@@ -181,19 +201,27 @@ func (s *Supervisor) enqueueBodyCandidates(ctx context.Context, accountID int64)
 		}
 		return
 	}
+	// A candidate that does not make it onto the queue goes back to 'metadata' so
+	// the next probe reconsiders it; leaving it 'queued' costs nothing but is a
+	// lie about work that is not scheduled.
 	for _, id := range candidates {
 		select {
 		case s.bodyQueue <- id:
 		case <-ctx.Done():
-			s.bodySeen.Delete(id)
-			_ = s.repo.SetMessageBodyState(context.Background(), id, "metadata")
+			s.releaseCandidate(ctx, id)
 			return
 		default:
-			s.bodySeen.Delete(id)
-			_ = s.repo.SetMessageBodyState(context.Background(), id, "metadata")
+			s.releaseCandidate(ctx, id)
 			return
 		}
 	}
+}
+
+func (s *Supervisor) releaseCandidate(ctx context.Context, id int64) {
+	s.bodySeen.Delete(id)
+	undoCtx, cancel := rollbackCtx(ctx)
+	defer cancel()
+	_ = s.repo.SetMessageBodyState(undoCtx, id, "metadata")
 }
 
 func (s *Supervisor) bodyWorker(ctx context.Context) {
