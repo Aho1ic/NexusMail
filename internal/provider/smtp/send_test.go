@@ -10,6 +10,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"io"
 	"math/big"
 	"net"
@@ -612,5 +613,45 @@ func TestDeliveryErrorTextNamesThePhaseAndHidesTheCredential(t *testing.T) {
 	}
 	if strings.Contains(text, "secret") {
 		t.Fatalf("the credential leaked into %q", text)
+	}
+}
+
+// Unwrap is the only way errors.Is reaches under the SMTP envelope. Every delivery
+// failure is wrapped in a *DeliveryError to carry the phase and the retry verdict, so
+// without Unwrap the transport cause becomes unreachable: a caller asking whether a
+// send died of a cancelled context, an expired deadline, or a closed connection would
+// get false for all three and treat a local shutdown as a server rejection.
+func TestDeliveryErrorUnwrapsToItsTransportCause(t *testing.T) {
+	for name, cause := range map[string]error{
+		"cancellation":      context.Canceled,
+		"deadline":          context.DeadlineExceeded,
+		"closed connection": io.EOF,
+		"unexpected close":  io.ErrUnexpectedEOF,
+		"network operation": &net.OpError{Op: "dial", Err: io.EOF},
+	} {
+		t.Run(name, func(t *testing.T) {
+			err := error(&DeliveryError{Stage: "data", Temporary: true, Err: cause})
+			if !errors.Is(err, cause) {
+				t.Errorf("errors.Is could not see %v through the envelope", cause)
+			}
+			// The wrapper stays visible too, so the phase and verdict a caller
+			// classifies on are not lost to satisfy the unwrap.
+			var delivery *DeliveryError
+			if !errors.As(err, &delivery) || delivery.Stage != "data" {
+				t.Error("the envelope stopped being reachable as *DeliveryError")
+			}
+		})
+	}
+
+	// A wrapped DeliveryError still unwraps, which is the case that matters when the
+	// send worker annotates a failure before storing it on the draft.
+	inner := &DeliveryError{Stage: "rcpt", Err: io.EOF}
+	if !errors.Is(fmt.Errorf("queue draft 7: %w", inner), io.EOF) {
+		t.Error("a DeliveryError nested one level deeper lost its cause")
+	}
+
+	// Nothing to unwrap must not be reported as a match for an unrelated error.
+	if errors.Is(&DeliveryError{Stage: "size", Err: nil}, io.EOF) {
+		t.Error("an envelope with no cause claimed to wrap io.EOF")
 	}
 }
