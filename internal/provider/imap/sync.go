@@ -218,22 +218,9 @@ func (s *Supervisor) syncMailbox(ctx context.Context, client *imapclient.Client,
 		mailbox.LastUID = 0
 	}
 	mailbox.UIDValidity = selected.UIDValidity
-	criteria := &goimap.SearchCriteria{}
-	var uids []goimap.UID
-	if mailbox.LastUID == 0 {
-		criteria.Since = time.Now().AddDate(0, 0, -30)
-		search, err := client.UIDSearch(criteria, nil).Wait()
-		if err != nil {
-			return fmt.Errorf("uid search: %w", err)
-		}
-		uids = search.AllUIDs()
-	} else if set, search := incrementalUIDRange(mailbox.LastUID, selected.UIDNext); search {
-		criteria.UID = []goimap.UIDSet{set}
-		result, err := client.UIDSearch(criteria, nil).Wait()
-		if err != nil {
-			return fmt.Errorf("uid search: %w", err)
-		}
-		uids = result.AllUIDs()
+	uids, err := searchNewUIDs(client, mailbox.LastUID, selected.UIDNext)
+	if err != nil {
+		return err
 	}
 	lastUID := mailbox.LastUID
 	// pending collects a chunk of built messages so the flush at the end of the
@@ -251,31 +238,13 @@ func (s *Supervisor) syncMailbox(ctx context.Context, client *imapclient.Client,
 			return fmt.Errorf("fetch envelopes: %w", err)
 		}
 		for _, fetched := range messages {
+			// Drafts are not messages: they land in the draft table via their own
+			// importer and never join the pending batch. The cursor advances either
+			// way, which is why this runs before the lastUID update rather than
+			// carrying its own.
 			if mailbox.Role == "drafts" {
-				var raw []byte
-				if fetched.RFC822Size > 0 && fetched.RFC822Size <= maxInlineDraftImportBytes {
-					section := &goimap.FetchItemBodySection{Peek: true}
-					bodies, fetchErr := client.Fetch(goimap.UIDSetNum(fetched.UID), &goimap.FetchOptions{UID: true, BodySection: []*goimap.FetchItemBodySection{section}}).Collect()
-					if fetchErr == nil && len(bodies) > 0 {
-						raw = bodies[0].FindBodySection(section)
-					}
-				}
-				changed, draftID, err := s.storeRemoteDraft(ctx, mailbox, fetched, raw)
-				if err != nil {
-					if ctx.Err() != nil {
-						return err
-					}
-					// Failing the whole mailbox here would abort before the cursor
-					// advances, so one unstorable draft would stall every sync for
-					// the account, including the inbox. Skip just this message.
-					slog.Error("remote draft import failed", "account_id", mailbox.AccountID, "mailbox_id", mailbox.ID, "uid", fetched.UID, "error", err)
-					if uint32(fetched.UID) > lastUID {
-						lastUID = uint32(fetched.UID)
-					}
-					continue
-				}
-				if changed {
-					s.events.Publish(ports.Event{Type: "DRAFT_UPDATED", Data: map[string]any{"draft_id": draftID, "account_id": mailbox.AccountID, "remote": true}})
+				if err := s.importRemoteDraft(ctx, client, mailbox, fetched); err != nil {
+					return err
 				}
 				if uint32(fetched.UID) > lastUID {
 					lastUID = uint32(fetched.UID)
@@ -316,6 +285,58 @@ func (s *Supervisor) syncMailbox(ctx context.Context, client *imapclient.Client,
 	uidNext := uint32(selected.UIDNext)
 	highest := selected.HighestModSeq
 	return s.repo.UpdateMailboxCursor(ctx, mailbox.ID, selected.UIDValidity, lastUID, &uidNext, &highest)
+}
+
+// searchNewUIDs asks which UIDs this pass has to fetch. A mailbox with no cursor
+// is seeded from the last 30 days rather than from everything it holds; one with a
+// cursor asks only for the range above it, and asks nothing at all when
+// incrementalUIDRange reports the range is empty.
+func searchNewUIDs(client *imapclient.Client, lastUID uint32, uidNext goimap.UID) ([]goimap.UID, error) {
+	criteria := &goimap.SearchCriteria{}
+	if lastUID == 0 {
+		criteria.Since = time.Now().AddDate(0, 0, -30)
+	} else {
+		set, search := incrementalUIDRange(lastUID, uidNext)
+		if !search {
+			return nil, nil
+		}
+		criteria.UID = []goimap.UIDSet{set}
+	}
+	result, err := client.UIDSearch(criteria, nil).Wait()
+	if err != nil {
+		return nil, fmt.Errorf("uid search: %w", err)
+	}
+	return result.AllUIDs(), nil
+}
+
+// importRemoteDraft stores one draft the provider holds and announces it if it
+// changed. The body is fetched inline only under the size cap, because this runs
+// on the command connection under the foreground lock.
+//
+// It reports an error only when the context ended. An unstorable draft is logged
+// and skipped instead: failing the mailbox would abort before the cursor advances,
+// so one bad draft would stall every sync for the account — including the inbox.
+func (s *Supervisor) importRemoteDraft(ctx context.Context, client *imapclient.Client, mailbox domain.Mailbox, fetched *imapclient.FetchMessageBuffer) error {
+	var raw []byte
+	if fetched.RFC822Size > 0 && fetched.RFC822Size <= maxInlineDraftImportBytes {
+		section := &goimap.FetchItemBodySection{Peek: true}
+		bodies, fetchErr := client.Fetch(goimap.UIDSetNum(fetched.UID), &goimap.FetchOptions{UID: true, BodySection: []*goimap.FetchItemBodySection{section}}).Collect()
+		if fetchErr == nil && len(bodies) > 0 {
+			raw = bodies[0].FindBodySection(section)
+		}
+	}
+	changed, draftID, err := s.storeRemoteDraft(ctx, mailbox, fetched, raw)
+	if err != nil {
+		if ctx.Err() != nil {
+			return err
+		}
+		slog.Error("remote draft import failed", "account_id", mailbox.AccountID, "mailbox_id", mailbox.ID, "uid", fetched.UID, "error", err)
+		return nil
+	}
+	if changed {
+		s.events.Publish(ports.Event{Type: "DRAFT_UPDATED", Data: map[string]any{"draft_id": draftID, "account_id": mailbox.AccountID, "remote": true}})
+	}
+	return nil
 }
 
 // reconcileMailbox brings local rows back in line with the provider for changes

@@ -314,44 +314,9 @@ func (s *Store) BatchCreateOrUpdateMessages(ctx context.Context, items []ports.M
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		// One SELECT IN (...) instead of N First() lookups. GORM's IN (?) does not
-		// flatten [][]byte, so the placeholders are expanded by hand. SQLite's
-		// parameter cap (500) comfortably fits a chunk.
-		//
-		// Each key is wrapped in blobArg, which is a driver.Valuer. Without that,
-		// GORM expands any slice bound to a `?` that sits immediately after `(`
-		// into one placeholder per element — so `IN (?,?)` with two 32-byte keys
-		// became `IN (158,182,32,…,"<binary>")`: the first key was compared as 32
-		// separate integers and never matched. Every batch therefore failed to
-		// dedupe its first item, and if that message already existed the INSERT hit
-		// the (account_id, dedupe_key) unique index and rolled the whole batch back,
-		// stalling the mailbox. A driver.Valuer is checked before the slice branch,
-		// which is what makes each key stay one bound blob.
-		placeholders := make([]byte, 0, len(items)*2)
-		args := make([]any, 0, len(items)+1)
-		args = append(args, items[0].Message.AccountID)
-		for i, item := range items {
-			if i > 0 {
-				placeholders = append(placeholders, ',')
-			}
-			placeholders = append(placeholders, '?')
-			args = append(args, blobArg(item.Message.DedupeKey))
-		}
-		type keyRow struct {
-			ID        int64
-			DedupeKey []byte
-		}
-		var existingRows []keyRow
-		query := "SELECT id, dedupe_key FROM messages WHERE account_id = ? AND dedupe_key IN (" + string(placeholders) + ")"
-		if err := tx.Raw(query, args...).Scan(&existingRows).Error; err != nil {
+		byKey, err := lookupByDedupeKey(tx, items)
+		if err != nil {
 			return err
-		}
-		if len(existingRows) > 0 {
-			slog.Debug("batch dedupe lookup", "account_id", items[0].Message.AccountID, "hits", len(existingRows), "batch", len(items))
-		}
-		byKey := make(map[string]int64, len(existingRows))
-		for _, row := range existingRows {
-			byKey[string(row.DedupeKey)] = row.ID
 		}
 		for i, item := range items {
 			if existingID, ok := byKey[string(item.Message.DedupeKey)]; ok {
@@ -383,6 +348,52 @@ func (s *Store) BatchCreateOrUpdateMessages(ctx context.Context, items []ports.M
 		return nil
 	})
 	return ids, created, err
+}
+
+// lookupByDedupeKey resolves which of this batch the account already holds, as
+// one SELECT IN (...) instead of N First() lookups. The caller must have checked
+// that the batch is single-account: the scope comes from items[0].
+//
+// The placeholders are expanded by hand because GORM's IN (?) does not flatten
+// [][]byte. SQLite's parameter cap (500) comfortably fits a chunk.
+//
+// Each key is wrapped in blobArg, which is a driver.Valuer. Without that, GORM
+// expands any slice bound to a `?` that sits immediately after `(` into one
+// placeholder per element — so `IN (?,?)` with two 32-byte keys became
+// `IN (158,182,32,…,"<binary>")`: the first key was compared as 32 separate
+// integers and never matched. Every batch therefore failed to dedupe its first
+// item, and if that message already existed the INSERT hit the
+// (account_id, dedupe_key) unique index and rolled the whole batch back, stalling
+// the mailbox. A driver.Valuer is checked before the slice branch, which is what
+// makes each key stay one bound blob.
+func lookupByDedupeKey(tx *gorm.DB, items []ports.MessageInput) (map[string]int64, error) {
+	placeholders := make([]byte, 0, len(items)*2)
+	args := make([]any, 0, len(items)+1)
+	args = append(args, items[0].Message.AccountID)
+	for i, item := range items {
+		if i > 0 {
+			placeholders = append(placeholders, ',')
+		}
+		placeholders = append(placeholders, '?')
+		args = append(args, blobArg(item.Message.DedupeKey))
+	}
+	type keyRow struct {
+		ID        int64
+		DedupeKey []byte
+	}
+	var existingRows []keyRow
+	query := "SELECT id, dedupe_key FROM messages WHERE account_id = ? AND dedupe_key IN (" + string(placeholders) + ")"
+	if err := tx.Raw(query, args...).Scan(&existingRows).Error; err != nil {
+		return nil, err
+	}
+	if len(existingRows) > 0 {
+		slog.Debug("batch dedupe lookup", "account_id", items[0].Message.AccountID, "hits", len(existingRows), "batch", len(items))
+	}
+	byKey := make(map[string]int64, len(existingRows))
+	for _, row := range existingRows {
+		byKey[string(row.DedupeKey)] = row.ID
+	}
+	return byKey, nil
 }
 
 type cursorValue struct {
