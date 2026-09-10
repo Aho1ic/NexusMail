@@ -128,6 +128,20 @@ func (s *Server) getMessage(c *gin.Context) {
 	c.JSON(status, body)
 }
 
+// patchMessage applies a flag change or an archive to one message.
+//
+// The work is deliberately charged to the app context rather than to the
+// request's. Marking a message read is the one mutation the browser fires without
+// waiting for it: App.tsx flips the row locally and lets the PATCH run in the
+// background, so the request is routinely still in flight when the user refreshes,
+// navigates, or closes the tab. On the request context that cancellation reached
+// SetFlags, the provider STORE was abandoned and the local row was never written —
+// the message came back unread on the next feed load, having looked read the whole
+// time. The user's intent does not expire because the connection did.
+//
+// The timeout matches the body fetch in getMessage: long enough for the command
+// connection to be handed over under contention, short enough that a hung provider
+// cannot pin the write forever.
 func (s *Server) patchMessage(c *gin.Context) {
 	id, ok := idParam(c, "id")
 	if !ok {
@@ -142,7 +156,9 @@ func (s *Server) patchMessage(c *gin.Context) {
 		fail(c, 400, "invalid_request", err.Error(), nil)
 		return
 	}
-	message, err := s.messages.Patch(c.Request.Context(), id, ports.MessagePatch{IsRead: input.IsRead, IsStarred: input.IsStarred}, input.Archive)
+	ctx, cancel := context.WithTimeout(s.appCtx, 30*time.Second)
+	defer cancel()
+	message, err := s.messages.Patch(ctx, id, ports.MessagePatch{IsRead: input.IsRead, IsStarred: input.IsStarred}, input.Archive)
 	if err != nil {
 		writeError(c, err)
 		return

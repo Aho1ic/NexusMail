@@ -4,30 +4,48 @@ import (
 	"errors"
 	"io"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"golang.org/x/net/html"
 )
 
 const (
-	maxOTPScanBytes = 4096
+	maxOTPScanBytes = 16 * 1024
 	// A code normally follows its keyword ("验证码：123456"), but a few templates
 	// lead with it ("123456 is your verification code"), so both sides are scanned
-	// with the trailing side given a much larger window.
-	otpWindowAfter   = 64
-	otpWindowBefore  = 40
+	// with the trailing side given a much larger window. Provider HTML often
+	// inserts a table of spacers between the phrase and the digits, so the
+	// trailing window has to outrun a few dozen block-tag newlines.
+	otpWindowAfter   = 200
+	otpWindowBefore  = 64
 	otpBeforePenalty = 100
 )
 
 // otpKeywords anchor the search. ASCII entries are matched on word boundaries so
-// "pin code" cannot fire on "shipping" and "otp" cannot fire mid-word. Bare
-// "code" is deliberately absent: promo, coupon, discount and QR codes are far
-// more common in mail than one-time passwords.
+// "pin code" cannot fire on "shipping" and "otp" cannot fire mid-word. Multi-word
+// phrases allow any whitespace — including the newlines htmlToText inserts at
+// block tags — between their words, so "Here is your<br>code" still matches.
+//
+// Bare "code" is deliberately absent: promo, coupon, discount and QR codes are
+// far more common in mail than one-time passwords. Provider templates that only
+// say "code" almost always qualify it ("your code", "reset code", "enter this
+// code"); those phrases are listed instead.
 var otpKeywords = []string{
 	"验证码", "校验码", "验证代码", "动态密码", "动态口令", "短信码", "验证碼", "驗證碼",
+	"登录码", "登陆码", "确认码", "安全码", "校验代码", "你的代码", "此代码", "该代码",
 	"verification code", "verify code", "confirmation code", "security code",
 	"login code", "access code", "auth code", "authentication code",
 	"one-time password", "one time password", "one-time code", "one time code",
 	"passcode", "pin code", "otp",
+	// Microsoft, Adobe and similar identity mails lead with "Here is your code:"
+	// and never say "verification code". "your code" is the smallest phrase that
+	// catches those without also matching "discount code" / "promo code".
+	"your code", "reset code", "recovery code",
+	"sign-in code", "signin code", "sign in code",
+	"enter this code", "enter the code", "enter code",
+	"secret code", "temporary code", "backup code",
+	"sms code", "email code", "2fa code", "totp",
 }
 
 // DetectOTP reports the one-time code a message carries, if any.
@@ -67,9 +85,9 @@ func detectOTPInSegment(segment string) (string, bool) {
 	}
 	best, bestRank := "", 0
 	for _, keyword := range otpKeywords {
-		for _, position := range indexAllKeyword(segment, keyword) {
+		for _, match := range indexAllKeyword(segment, keyword) {
 			for _, run := range runs {
-				distance, near := keywordDistance(run, position, position+len(keyword))
+				distance, near := keywordDistance(run, match.start, match.end)
 				if !near {
 					continue
 				}
@@ -196,26 +214,103 @@ func alnumRuns(input string) []alnumRun {
 	return runs
 }
 
+type keywordSpan struct {
+	start int
+	end   int
+}
+
 // indexAllKeyword finds every case-insensitive occurrence of keyword while
 // keeping offsets in the original string, and requires a non-alphanumeric
 // neighbour on any ASCII edge so keywords cannot match inside a longer word.
-func indexAllKeyword(haystack, keyword string) []int {
-	var positions []int
+// Multi-word keywords accept any Unicode whitespace between their words so a
+// phrase split across HTML blocks still counts as one hit.
+func indexAllKeyword(haystack, keyword string) []keywordSpan {
+	parts := strings.Fields(keyword)
+	if len(parts) == 0 {
+		return nil
+	}
+	if len(parts) == 1 {
+		return indexAllKeywordExact(haystack, parts[0])
+	}
+	return indexAllKeywordFlexible(haystack, parts)
+}
+
+func indexAllKeywordExact(haystack, keyword string) []keywordSpan {
+	var positions []keywordSpan
 	for offset := 0; offset+len(keyword) <= len(haystack); offset++ {
-		if !strings.EqualFold(haystack[offset:offset+len(keyword)], keyword) {
+		end := offset + len(keyword)
+		if !strings.EqualFold(haystack[offset:end], keyword) {
 			continue
 		}
-		if offset > 0 && isASCIIAlnum(keyword[0]) && isASCIIAlnum(haystack[offset-1]) {
+		if !asciiKeywordBoundary(haystack, offset, end, keyword[0], keyword[len(keyword)-1]) {
 			continue
 		}
-		tail := offset + len(keyword)
-		if tail < len(haystack) && isASCIIAlnum(keyword[len(keyword)-1]) && isASCIIAlnum(haystack[tail]) {
-			continue
-		}
-		positions = append(positions, offset)
-		offset += len(keyword) - 1
+		positions = append(positions, keywordSpan{start: offset, end: end})
+		offset = end - 1
 	}
 	return positions
+}
+
+func indexAllKeywordFlexible(haystack string, parts []string) []keywordSpan {
+	var positions []keywordSpan
+	first := parts[0]
+	for offset := 0; offset+len(first) <= len(haystack); offset++ {
+		if !strings.EqualFold(haystack[offset:offset+len(first)], first) {
+			continue
+		}
+		if !asciiKeywordBoundaryLeft(haystack, offset, first[0]) {
+			continue
+		}
+		end, ok := matchKeywordParts(haystack, offset, parts)
+		if !ok {
+			continue
+		}
+		positions = append(positions, keywordSpan{start: offset, end: end})
+		offset = end - 1
+	}
+	return positions
+}
+
+func matchKeywordParts(haystack string, start int, parts []string) (int, bool) {
+	cursor := start + len(parts[0])
+	for _, part := range parts[1:] {
+		gap := skipKeywordGap(haystack, cursor)
+		if gap == cursor {
+			return 0, false
+		}
+		if gap+len(part) > len(haystack) || !strings.EqualFold(haystack[gap:gap+len(part)], part) {
+			return 0, false
+		}
+		cursor = gap + len(part)
+	}
+	if !asciiKeywordBoundaryRight(haystack, cursor, parts[len(parts)-1][len(parts[len(parts)-1])-1]) {
+		return 0, false
+	}
+	return cursor, true
+}
+
+func skipKeywordGap(input string, offset int) int {
+	cursor := offset
+	for cursor < len(input) {
+		r, size := utf8.DecodeRuneInString(input[cursor:])
+		if !unicode.IsSpace(r) && r != '-' {
+			break
+		}
+		cursor += size
+	}
+	return cursor
+}
+
+func asciiKeywordBoundary(haystack string, start, end int, first, last byte) bool {
+	return asciiKeywordBoundaryLeft(haystack, start, first) && asciiKeywordBoundaryRight(haystack, end, last)
+}
+
+func asciiKeywordBoundaryLeft(haystack string, start int, first byte) bool {
+	return start == 0 || !isASCIIAlnum(first) || !isASCIIAlnum(haystack[start-1])
+}
+
+func asciiKeywordBoundaryRight(haystack string, end int, last byte) bool {
+	return end == len(haystack) || !isASCIIAlnum(last) || !isASCIIAlnum(haystack[end])
 }
 
 func isASCIIAlnum(value byte) bool {

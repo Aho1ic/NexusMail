@@ -1,7 +1,9 @@
+import { useEffect, useRef } from 'react'
 import { CheckCheck, LoaderCircle, Menu, Paperclip, RefreshCw, Search, Star, X } from 'lucide-react'
 import { displaySender, formatDate } from '../lib/format'
 import type { Account, Message } from '../types'
 import { EmptyState } from './shared'
+import { providerLabel } from './providers'
 
 type Props = {
   visible: boolean
@@ -21,9 +23,10 @@ type Props = {
   onQueryChange: (value: string) => void
   onOpen: (message: Message) => void
   onLoadMore: () => void
+  revealID: number | null
 }
 
-export function MessageList({ visible, title, messages, accountMap, selected, unreadCount, markingRead, loading, error, query, cursor, onOpenNav, onMarkViewRead, onRefresh, onQueryChange, onOpen, onLoadMore }: Props) {
+export function MessageList({ visible, title, messages, accountMap, selected, unreadCount, markingRead, loading, error, query, cursor, onOpenNav, onMarkViewRead, onRefresh, onQueryChange, onOpen, onLoadMore, revealID }: Props) {
   // The divider only exists while the panes are flush; from lg they are separate
   // cards and the gap does that job. The background stays opaque — a translucent
   // one here would force the shell's blur to repaint on every scrolled row.
@@ -35,20 +38,34 @@ export function MessageList({ visible, title, messages, accountMap, selected, un
     <div className="flex-1 overflow-y-auto p-2" aria-label="邮件列表">
       {error && <div className="m-3 rounded-card bg-red-50 p-3 text-xs text-red-700 shadow-lift-1">{error}</div>}
       {!loading && messages.length === 0 && <EmptyState />}
-      {messages.map(message => <MessageRow key={message.id} message={message} account={accountMap.get(message.account_id)} active={selected?.id === message.id} onClick={() => onOpen(message)} />)}
+      {messages.map(message => <MessageRow key={message.id} message={message} account={accountMap.get(message.account_id)} active={selected?.id === message.id} revealed={revealID === message.id} onClick={() => onOpen(message)} />)}
       {cursor && <button disabled={loading} onClick={onLoadMore} className="my-3 w-full rounded-2xl py-3 text-xs font-semibold text-pine/60 transition hover:bg-sage/40">{loading ? '加载中…' : '加载更多'}</button>}
     </div>
   </section>
 }
 
-function MessageRow({ message, account, active, onClick }: { message: Message; account?: Account; active: boolean; onClick: () => void }) {
+function MessageRow({ message, account, active, revealed, onClick }: { message: Message; account?: Account; active: boolean; revealed: boolean; onClick: () => void }) {
+  const node = useRef<HTMLButtonElement>(null)
+  // The revealed row is the one the user was sent here to find, and it is normally
+  // below the fold — jumping to it is the whole point of the trip, so it happens on
+  // render rather than waiting for a scroll the user has no reason to make.
+  useEffect(() => {
+    if (!revealed) return
+    // jsdom has no scrollIntoView. Optional-call the method so unit tests do not
+    // crash; Playwright is what proves the row actually moves into view.
+    node.current?.scrollIntoView?.({ block: 'center', inline: 'nearest' })
+  }, [revealed])
   // The lift is only offered to inactive rows: the selected row already sits at a
   // fixed higher elevation, and .row-lift's hover shadow would drop it back down.
-  return <button onClick={onClick} style={{ contentVisibility: 'auto', containIntrinsicSize: '144px' }} className={`group relative mb-1 w-full rounded-card p-4 text-left ${active ? 'bg-sage shadow-lift-2 transition' : 'row-lift hover:bg-white'} ${!message.is_read ? 'bg-white' : ''}`}>
-    {!message.is_read && <span className="absolute left-1.5 top-6 h-1.5 w-1.5 rounded-full bg-coral" />}
-    <div className="flex items-start justify-between gap-3"><div className={`truncate text-sm ${!message.is_read ? 'font-bold' : 'font-medium text-black/65'}`}>{displaySender(message.sender)}</div><time className="shrink-0 text-[10px] text-black/35">{formatDate(message.received_at)}</time></div>
+  return <button ref={node} onClick={onClick} data-revealed={revealed ? '' : undefined} style={{ contentVisibility: 'auto', containIntrinsicSize: '144px' }} className={`group relative mb-1 w-full rounded-card p-4 text-left ${active ? 'bg-sage shadow-lift-2 transition' : 'row-lift hover:bg-white'} ${!message.is_read ? 'bg-white' : ''} ${revealed ? 'ring-2 ring-coral' : ''}`}>
+    {/* The dot rides beside the timestamp instead of the row's left edge: at the edge
+        it read as list furniture, and the elevation difference alone was too quiet to
+        find one unread row among forty. The span is always laid out, invisible when
+        read, so timestamps stay in one column. */}
+    <div className="flex items-start justify-between gap-3"><div className={`truncate text-sm ${!message.is_read ? 'font-bold' : 'font-medium text-black/65'}`}>{displaySender(message.sender)}</div><div className="flex shrink-0 items-center gap-1.5"><time className="text-[10px] text-black/35">{formatDate(message.received_at)}</time><span className={`h-2 w-2 rounded-full ${message.is_read ? 'invisible' : 'bg-coral'}`} aria-hidden /></div></div>
+    {!message.is_read && <span className="sr-only">未读</span>}
     <div className={`mt-1 truncate text-sm ${!message.is_read ? 'font-semibold' : 'text-black/55'}`}>{message.subject || '（无主题）'}</div>
     <p className="mt-1.5 line-clamp-2 text-xs leading-5 text-black/40">{message.snippet || '正文尚未同步'}</p>
-    <div className="mt-3 flex items-center justify-between"><span className="rounded-full bg-black/[.04] px-2 py-1 text-[9px] font-bold uppercase tracking-wide text-black/35">{account?.display_name || account?.provider || 'Mail'}</span><div className="flex gap-2 text-black/25">{message.has_attachments && <Paperclip size={13} />}{message.is_starred && <Star size={13} className="fill-amber-400 text-amber-400" />}</div></div>
+    <div className="mt-3 flex items-center justify-between"><span className="rounded-full bg-black/[.04] px-2 py-1 text-[9px] font-bold tracking-wide text-black/35">{account?.display_name || (account ? providerLabel(account.provider) : 'Mail')}</span><div className="flex gap-2 text-black/25">{message.has_attachments && <Paperclip size={13} />}{message.is_starred && <Star size={13} className="fill-amber-400 text-amber-400" />}</div></div>
   </button>
 }

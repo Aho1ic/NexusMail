@@ -64,7 +64,7 @@ describe('login', () => {
     expect(String(url)).not.toContain(validKey)
     expect(JSON.parse(String((init as RequestInit).body))).toEqual({ api_key: validKey })
     // The CSRF token has to be stored, or every later write is rejected.
-    expect(sessionStorage.getItem('nexusmail.csrf')).toBe('csrf-value')
+    expect(localStorage.getItem('nexusmail.csrf')).toBe('csrf-value')
   })
 
   it('shows the reason the server gave and does not report authentication', async () => {
@@ -77,7 +77,7 @@ describe('login', () => {
 
     expect(await screen.findByText('too many login attempts')).toBeInTheDocument()
     expect(onAuthenticated).not.toHaveBeenCalled()
-    expect(sessionStorage.getItem('nexusmail.csrf')).toBeNull()
+    expect(localStorage.getItem('nexusmail.csrf')).toBeNull()
     // Still on the form, with the field intact so the key can be corrected.
     expect(screen.getByLabelText('API Key')).toHaveValue(validKey)
   })
@@ -169,7 +169,8 @@ describe('login', () => {
     await waitFor(() => expect(screen.queryByLabelText('API Key')).not.toBeInTheDocument())
     first.unmount()
 
-    // Same token still in sessionStorage: straight into the mailbox.
+    // Same shared token: straight into the mailbox, even in a fresh tab.
+    sessionStorage.clear()
     render(<App />)
     expect(screen.queryByLabelText('API Key')).not.toBeInTheDocument()
   })

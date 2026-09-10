@@ -135,9 +135,11 @@ func TestOAuthCallbackReplayCreatesNoSecondAccount(t *testing.T) {
 	}
 	countAfterFirst := len(listAccountEmails(t, h))
 
+	// Every outcome is a redirect now, so a replay is told apart by where it lands:
+	// the error path, never `oauth=success`.
 	second := callbackWith(h, transport, target)
-	if second.Code == http.StatusFound {
-		t.Error("a replayed callback succeeded, so one consent can create two accounts")
+	if location := second.Header().Get("Location"); !strings.Contains(location, "oauth=error") {
+		t.Errorf("replayed callback Location = %q, want the error path: one consent must not create two accounts", location)
 	}
 	if after := len(listAccountEmails(t, h)); after != countAfterFirst {
 		t.Errorf("accounts went from %d to %d on a replay", countAfterFirst, after)

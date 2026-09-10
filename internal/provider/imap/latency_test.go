@@ -124,9 +124,12 @@ type harness struct {
 	// dbPath lets a test reach the database file directly. Only the full-stack test
 	// needs it, to repoint the account's SMTP endpoint at a loopback server: the
 	// endpoint comes from the compiled-in provider preset and has no setter.
-	dbPath   string
-	account  domain.Account
-	accounts *accountservice.Service
+	dbPath string
+	// serverAddr is where the in-memory IMAP server listens, for a test that splices
+	// a proxy in front of it to shape a reply the memory server cannot produce.
+	serverAddr string
+	account    domain.Account
+	accounts   *accountservice.Service
 }
 
 func (h *harness) deliver(t *testing.T, subject string) {
@@ -214,7 +217,7 @@ func newHarness(t *testing.T, options ...harnessOption) *harness {
 		}
 		return countingConn{conn}, nil
 	}
-	return &harness{supervisor: supervisor, user: user, events: events, repo: repo, account: account, accounts: accounts, dbPath: databasePath}
+	return &harness{supervisor: supervisor, user: user, events: events, repo: repo, account: account, accounts: accounts, dbPath: databasePath, serverAddr: listener.Addr().String()}
 }
 
 // TestNewMailLatency measures the delay between a message landing on the IMAP

@@ -58,6 +58,7 @@ type fakeProvider struct {
 
 	flagCalls    []int64
 	flagErr      error
+	flagDelay    time.Duration
 	seenBulk     []int64
 	seenAccept   []int64
 	seenErr      error
@@ -109,11 +110,24 @@ func (f *fakeProvider) FetchAttachment(_ context.Context, messageID, attachmentI
 	return f.attachBlob, f.attachMeta, f.attachErr
 }
 
-func (f *fakeProvider) SetFlags(_ context.Context, id int64, _, _ *bool) error {
+// SetFlags optionally waits before answering, and honours the context while it
+// does. A real STORE waits for the account's command connection, which the 5s
+// inbox probe and the periodic sync hold for seconds at a time; that wait is where
+// a cancelled context decides whether the flag is stored or dropped, so it cannot
+// be modelled by a function that ignores ctx.
+func (f *fakeProvider) SetFlags(ctx context.Context, id int64, _, _ *bool) error {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.flagCalls = append(f.flagCalls, id)
-	return f.flagErr
+	delay, err := f.flagDelay, f.flagErr
+	f.mu.Unlock()
+	if delay > 0 {
+		select {
+		case <-time.After(delay):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return err
 }
 
 func (f *fakeProvider) SetSeenBulk(_ context.Context, ids []int64) ([]int64, error) {
@@ -571,9 +585,26 @@ func TestOAuthCallbackReportsProviderError(t *testing.T) {
 	}
 }
 
-func TestOAuthCallbackRejectsAnUnknownState(t *testing.T) {
+// A forged or expired state used to answer with a JSON 400. The browser that lands
+// here is the consent popup the SPA is waiting on, and a JSON body strands it on a
+// page it cannot close itself — so every outcome redirects, and the SPA reads the
+// reason. State expires after ten minutes and is single-use, so this is a path real
+// users reach.
+func TestOAuthCallbackRedirectsOnAnUnknownState(t *testing.T) {
 	h := newHarness(t)
-	h.expectError(h.plain(http.MethodGet, "/api/v1/oauth/gmail/callback?state=forged&code=x"), 400, "oauth_failed")
+	response := h.plain(http.MethodGet, "/api/v1/oauth/gmail/callback?state=forged&code=x")
+	if response.Code != http.StatusFound {
+		t.Fatalf("status = %d, want 302: body = %s", response.Code, response.Body.String())
+	}
+	location := response.Header().Get("Location")
+	if !strings.Contains(location, "oauth=error") || !strings.Contains(location, "exchange_failed") {
+		t.Fatalf("Location = %q", location)
+	}
+	// The state value and the exchange's internal detail must not travel in a URL
+	// the user can read off the address bar and paste into a bug report.
+	if strings.Contains(location, "forged") {
+		t.Errorf("Location = %q leaks the state parameter", location)
+	}
 }
 
 // The callback sits outside the authenticated group on purpose — the provider

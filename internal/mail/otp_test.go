@@ -84,6 +84,37 @@ func TestDetectOTP(t *testing.T) {
 			text: "YOUR VERIFICATION CODE IS 707070",
 			want: "707070",
 		},
+		{
+			name:    "microsoft password reset your code",
+			subject: "Personal Microsoft account password reset",
+			text:    "We received a request to reset the password for your Microsoft account.\r\n\r\nHere is your code: 862329\r\n\r\nIf you didn't request a password reset, you can ignore this message.",
+			want:    "862329",
+		},
+		{
+			name: "microsoft html splits your code across blocks",
+			html: `<p>Here is your</p><table><tr><td>code:</td></tr><tr><td><strong>862329</strong></td></tr></table>`,
+			want: "862329",
+		},
+		{
+			name: "reset code phrase",
+			text: "Use this reset code to continue: 441920",
+			want: "441920",
+		},
+		{
+			name: "sign-in code with hyphenated keyword",
+			text: "Your sign-in code is 550918. It expires in 10 minutes.",
+			want: "550918",
+		},
+		{
+			name: "enter this code",
+			text: "Enter this code to verify your identity 773310",
+			want: "773310",
+		},
+		{
+			name: "chinese 你的代码",
+			text: "你的代码是 690214，请在 10 分钟内使用。",
+			want: "690214",
+		},
 	}
 	for _, testCase := range cases {
 		t.Run(testCase.name, func(t *testing.T) {
@@ -115,6 +146,11 @@ func TestDetectOTPRejects(t *testing.T) {
 			name: "coupon code keyword is not matched",
 			text: "Use discount code 445566 at checkout for 10% off.",
 			// "discount code" is not in the keyword list; a bare "code" must not fire.
+			// "your code" must also stay a two-word phrase, so "your discount code" is not a hit.
+		},
+		{
+			name: "promo your discount code is not an otp",
+			text: "Here is your discount code: 445566. Enjoy 10% off.",
 		},
 		{
 			name: "keyword inside a longer word does not fire",

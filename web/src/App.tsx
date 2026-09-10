@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { APIError, api, isAuthenticated } from './lib/api'
+import { APIError, api, isAuthenticated, onSessionInvalidated } from './lib/api'
 import { listenForCopyRequests, registerServiceWorker, showOTPNotification } from './lib/notifications'
 import { loadPreferences, savePreferences, type Preferences } from './lib/preferences'
 import { messageOf } from './lib/format'
@@ -19,7 +19,8 @@ import type { Account, Draft, EventEnvelope, Mailbox, Message, MessageDetails } 
 type Pane = 'nav' | 'list' | 'detail'
 
 export default function App() {
-  const [authenticated, setAuthenticated] = useState(isAuthenticated())
+  const [authenticated, setAuthenticated] = useState(isAuthenticated)
+  useEffect(() => onSessionInvalidated(() => setAuthenticated(false)), [])
   if (!authenticated) return <Login onAuthenticated={() => setAuthenticated(true)} />
   return <MailboxApp onLogout={() => setAuthenticated(false)} />
 }
@@ -29,6 +30,7 @@ function MailboxApp({ onLogout }: { onLogout: () => void }) {
   const [mailboxes, setMailboxes] = useState<Mailbox[]>([])
   const [selectedAccount, setSelectedAccount] = useState<number | null>(null)
   const [selectedMailbox, setSelectedMailbox] = useState<number | null>(null)
+  const [foldersCollapsed, setFoldersCollapsed] = useState(false)
   const [messages, setMessages] = useState<Message[]>([])
   const [selected, setSelected] = useState<Message | null>(null)
   const [details, setDetails] = useState<MessageDetails | null>(null)
@@ -36,6 +38,7 @@ function MailboxApp({ onLogout }: { onLogout: () => void }) {
   const [debouncedQuery, setDebouncedQuery] = useState('')
   const [cursor, setCursor] = useState<string | undefined>()
   const [unreadTotal, setUnreadTotal] = useState(0)
+  const [revealID, setRevealID] = useState<number | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
   const [pane, setPane] = useState<Pane>('list')
@@ -85,27 +88,44 @@ function MailboxApp({ onLogout }: { onLogout: () => void }) {
 
   const loadAccounts = useCallback(async () => {
     try { const result = await api.accounts(); setAccounts(result.items) }
-    catch (err) { if (err instanceof APIError && err.status === 401) onLogout(); else setError(messageOf(err)) }
-  }, [onLogout])
+    catch (err) { setError(messageOf(err)) }
+  }, [])
 
   const loadMailboxes = useCallback(async (accountID: number | null) => {
     if (!accountID) { setMailboxes([]); return }
     try { setMailboxes((await api.mailboxes(accountID)).items) } catch (err) { setError(messageOf(err)) }
   }, [])
 
+  // Set by the All Inboxes press, consumed by the next non-append load. A ref, not
+  // state: the effect-driven load must see it in the same tick it was set, and a
+  // state update would arrive one render too late.
+  const pendingReveal = useRef(false)
+
   const loadMessages = useCallback(async (append = false, nextCursor?: string, quiet = false) => {
     if (!quiet) setLoading(true)
     setError('')
     const params = viewParams()
-    params.set('limit', '40')
+    // The reveal load asks for the server's maximum page. The unread mail the badge
+    // counts is regularly past row 40 — the reported case sat at row 69 — so a
+    // default page could not contain the row it was sent to find.
+    const revealing = !append && pendingReveal.current
+    pendingReveal.current = false
+    params.set('limit', revealing ? '100' : '40')
     if (nextCursor) params.set('cursor', nextCursor)
     try {
       const page = await api.messages(params)
       setMessages(current => append ? [...current, ...page.items.filter(item => !current.some(existing => existing.id === item.id))] : page.items)
       setCursor(page.next_cursor)
       setUnreadTotal(page.unread_total ?? 0)
+      if (revealing) {
+        // Same predicate as the badge's server-side count, so the row picked here is
+        // one the badge is actually counting.
+        const target = page.items.find(item => !item.is_read && item.direction === 'incoming')
+        setRevealID(target?.id ?? null)
+        if (!target && (page.unread_total ?? 0) > 0) announce('未读邮件不在最近 100 封内，可继续向下加载')
+      }
     } catch (err) { setError(messageOf(err)) } finally { setLoading(false) }
-  }, [viewParams])
+  }, [viewParams, announce])
 
   useEffect(() => { loadAccounts() }, [loadAccounts])
   // Only the folder list is loaded here. Clearing the selected mailbox belongs to
@@ -171,13 +191,29 @@ function MailboxApp({ onLogout }: { onLogout: () => void }) {
   }
 
   async function openMessage(message: Message) {
-    setSelected(message); setPane('detail'); setDetails(null)
+    // The highlight has served its purpose once the row is opened; leaving it on
+    // would keep ringing a row the user is already reading.
+    setSelected(message); setPane('detail'); setDetails(null); setRevealID(null)
     if (!message.is_read) {
       setMessages(items => items.map(item => item.id === message.id ? { ...item, is_read: true } : item))
       // The badge tracks the server total, so opening a message has to draw it down
       // here as well; otherwise the count only moves on the next feed load.
       setUnreadTotal(total => Math.max(total - 1, 0))
-      api.patchMessage(message.id, { is_read: true }).catch(() => undefined)
+      // The failure is rolled back rather than swallowed. The row is drawn read
+      // before the server has agreed, so a discarded error left the UI claiming
+      // read while the message was still unread everywhere else — and the user only
+      // found out on the next feed load, which is what "it went unread again after
+      // refreshing" looks like. Undoing it puts the truth back on screen at once.
+      api.patchMessage(message.id, { is_read: true }).catch(err => {
+        setMessages(items => items.map(item => item.id === message.id ? { ...item, is_read: false } : item))
+        setUnreadTotal(total => total + 1)
+        // A 401 is not a mark-read failure. The session lapsed, the transport has
+        // already cleared it and the app is on its way to the login screen, so
+        // blaming this action - in the server's own English, at that - described the
+        // wrong problem to the one user who cannot act on it.
+        if (err instanceof APIError && err.status === 401) return
+        announce(`标记已读失败：${messageOf(err)}`)
+      })
     }
     try { setDetails(await api.message(message.id)) } catch (err) { setError(messageOf(err)) }
   }
@@ -207,6 +243,35 @@ function MailboxApp({ onLogout }: { onLogout: () => void }) {
     ? mailboxes.find(box => box.id === selectedMailbox)?.display_name
     : selectedAccount ? accountMap.get(selectedAccount)?.display_name || accountMap.get(selectedAccount)?.email : 'All Inboxes'
 
+  // Pressing All Inboxes when the badge shows unread mail is a request to be taken
+  // to that mail, not just to the top of the list. Leaving another view changes
+  // viewParams and the existing effect issues the load, so the flag alone redirects
+  // it; standing on All Inboxes already changes nothing, so the load is explicit.
+  function selectAll() {
+    const already = selectedAccount === null && selectedMailbox === null
+    setSelectedAccount(null)
+    setSelectedMailbox(null)
+    setPane('list')
+    if (already && unreadCount === 0) return
+    pendingReveal.current = true
+    if (already) void loadMessages()
+  }
+
+  // Pressing the account row toggles its folder tree. The collapse branch is only
+  // reachable once the row already stands for the current view — account selected,
+  // no folder under it — so the first press out of a folder still does what it always
+  // did and releases the mailbox scope. Collapsing leaves the scope alone: it hides
+  // the folder list, it does not change which mail is listed, so no feed request.
+  // The pane is left alone too, or on a narrow screen the collapse would be hidden
+  // behind the feed the moment it happened.
+  function selectAccount(id: number) {
+    if (selectedAccount === id && !selectedMailbox) { setFoldersCollapsed(current => !current); return }
+    setSelectedAccount(id)
+    setSelectedMailbox(null)
+    setFoldersCollapsed(false)
+    setPane('list')
+  }
+
   // Three stacked layers: the lit stage, the frosted shell floating on it, and the
   // panes floating inside the shell. The orbs sit behind the shell and are decorative
   // only — they are hidden below md, where the shell is full-bleed and no gutter shows.
@@ -229,17 +294,17 @@ function MailboxApp({ onLogout }: { onLogout: () => void }) {
         panes cover the shell edge to edge, so the blur is composited there for
         nothing. Hence the glass is an lg treatment and md stays opaque. */}
     <div className="relative flex h-full w-full overflow-hidden bg-white md:rounded-shell md:border md:border-white/60 md:shadow-stage lg:gap-2.5 lg:bg-white/55 lg:p-2.5 lg:backdrop-blur-2xl">
-      <MailboxNav visible={pane === 'nav'} accounts={accounts} mailboxes={mailboxes} selectedAccount={selectedAccount} selectedMailbox={selectedMailbox} unreadCount={unreadCount}
+      <MailboxNav visible={pane === 'nav'} accounts={accounts} mailboxes={mailboxes} selectedAccount={selectedAccount} selectedMailbox={selectedMailbox} unreadCount={unreadCount} foldersCollapsed={foldersCollapsed}
         onCompose={() => compose()}
-        onSelectAll={() => { setSelectedAccount(null); setSelectedMailbox(null); setPane('list') }}
-        onSelectAccount={id => { setSelectedAccount(id); setSelectedMailbox(null); setPane('list') }}
+        onSelectAll={selectAll}
+        onSelectAccount={selectAccount}
         onSelectMailbox={id => { setSelectedMailbox(id); setPane('list') }}
         onShowOutbox={() => setShowOutbox(true)} onShowAccounts={() => setShowAccounts(true)} onShowSettings={() => setShowSettings(true)} onLogout={logout} />
 
       <MessageList visible={pane === 'list'} title={listTitle} messages={messages} accountMap={accountMap} selected={selected} unreadCount={unreadCount}
         markingRead={markingRead} loading={loading} error={error} query={query} cursor={cursor}
         onOpenNav={() => setPane('nav')} onMarkViewRead={markViewRead} onRefresh={refresh} onQueryChange={setQuery}
-        onOpen={openMessage} onLoadMore={() => loadMessages(true, cursor)} />
+        onOpen={openMessage} onLoadMore={() => loadMessages(true, cursor)} revealID={revealID} />
 
       {/* The reading pane is the top layer: pure white and the strongest shadow of
           the three. The radius and shadow are inline rather than via .pane-light so

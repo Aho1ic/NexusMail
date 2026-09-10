@@ -74,13 +74,20 @@ paths:
     get:
       security: []
       summary: Complete Google or Microsoft OAuth authorization
+      description: >
+        Always redirects to the SPA, never returns a body: the browser that lands
+        here is the consent popup the client is waiting on, and it reads the outcome
+        from the query string before closing itself. Success redirects to
+        `/?oauth=success`. Every failure redirects to `/?oauth=error&reason=<cause>`,
+        where the cause is the provider's own error code, `exchange_failed` when the
+        state is unknown or expired or the code exchange fails, or
+        `account_rejected` when the address is already connected.
       parameters:
         - { $ref: '#/components/parameters/Provider' }
         - { in: query, name: state, required: true, schema: { type: string } }
         - { in: query, name: code, required: true, schema: { type: string } }
       responses:
-        '302': { description: Redirect to the SPA }
-        '400': { $ref: '#/components/responses/Error' }
+        '302': { description: Redirect to the SPA carrying the outcome }
   /api/v1/accounts/{id}/mailboxes:
     get:
       summary: List account mailboxes

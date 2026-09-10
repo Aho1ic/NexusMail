@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import { AtSign, Bell, Image, Keyboard, LogOut, Plus, X } from 'lucide-react'
 import { Dialog } from './shared'
+import { providerLabel } from './providers'
 import { accountStatusLabel, formatFullDate } from '../lib/format'
 import { notificationPermission, requestNotificationPermission, type Preferences } from '../lib/preferences'
 import type { Account } from '../types'
@@ -39,7 +40,7 @@ export function SettingsDialog({ preferences, accounts, onChange, onClose, onAdd
             <div className="flex items-center gap-2.5">
               <span className={`h-2 w-2 shrink-0 rounded-full ${account.status === 'connected' ? 'bg-emerald-500' : account.status === 'backoff' ? 'bg-amber-500' : 'bg-black/20'}`} />
               <span className="min-w-0 flex-1"><span className="block truncate text-sm font-semibold">{account.display_name || account.email}</span><span className="block truncate text-[11px] text-black/40">{account.email}</span></span>
-              <span className="shrink-0 rounded-full bg-black/[.05] px-2 py-0.5 text-[9px] font-bold uppercase tracking-wide text-black/45">{account.provider}</span>
+              <span className="shrink-0 rounded-full bg-black/[.05] px-2 py-0.5 text-[9px] font-bold tracking-wide text-black/45">{providerLabel(account.provider)}</span>
             </div>
             <p className="mt-2 text-[11px] text-black/35">{accountStatusLabel(account.status)}{account.last_connected_at ? ` · 最近连接 ${formatFullDate(account.last_connected_at)}` : ''}</p>
             {account.last_error && <p className="mt-2 break-words rounded-xl bg-red-50 px-2.5 py-2 text-[11px] leading-4 text-red-700" role="alert">{account.last_error}</p>}

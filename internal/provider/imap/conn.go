@@ -149,15 +149,3 @@ func (s *Supervisor) connect(ctx context.Context, account domain.Account, handle
 	guard.window.Store(int64(stall))
 	return client, nil
 }
-
-// refreshMailboxCatalog lists the provider's mailboxes and upserts the
-// classification. The LIST call is a one-shot round trip and the database writes
-// are independent of any other IMAP state, so the sync callers deliberately run
-// it *without* the command lock, keeping it off the new-mail path; it is also
-// safe to call while holding the lock, which ensureArchiveMailbox does because it
-// must not race another writer between LIST and CREATE. The sync path is expected
-// to invoke it before syncAllMailboxes so the latter sees a complete catalog.
-//
-// It returns the LIST entries, because the mailbox attributes are not persisted
-// and a caller that needs them — ensureArchiveMailbox looks for \Noselect
-// containers — would otherwise have to LIST a second time.

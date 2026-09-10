@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 
 	"nexusmail/internal/domain"
 	"nexusmail/internal/ports"
@@ -244,6 +245,17 @@ func archiveCreateOptions(client *imapclient.Client) *goimap.CreateOptions {
 	return &goimap.CreateOptions{SpecialUse: []goimap.MailboxAttr{goimap.MailboxAttrArchive}}
 }
 
+// isNoselect reports whether the provider declared this LIST entry unselectable,
+// meaning it names a container for other mailboxes and holds no mail of its own.
+//
+// Two callers depend on the same answer for opposite reasons: refreshMailboxCatalog
+// refuses to store one as a mailbox, and archivePaths looks for one to nest a
+// created archive folder under. Sharing the predicate is what keeps those two from
+// disagreeing about what a container is.
+func isNoselect(item *goimap.ListData) bool {
+	return slices.Contains(item.Attrs, goimap.MailboxAttrNoSelect)
+}
+
 // archivePaths returns where to try creating an archive folder called name: at
 // the root first, then under each \Noselect container the provider exposes.
 //
@@ -256,17 +268,9 @@ func archiveCreateOptions(client *imapclient.Client) *goimap.CreateOptions {
 func archivePaths(name string, items []*goimap.ListData) []string {
 	paths := []string{name}
 	for _, item := range items {
-		if item.Delim == 0 {
-			continue
-		}
-		noselect := false
-		for _, attr := range item.Attrs {
-			if attr == goimap.MailboxAttrNoSelect {
-				noselect = true
-				break
-			}
-		}
-		if !noselect {
+		// No delimiter means the server exposes no hierarchy under this name, so
+		// there is no child path to build even though it is a container.
+		if item.Delim == 0 || !isNoselect(item) {
 			continue
 		}
 		paths = append(paths, item.Mailbox+string(item.Delim)+name)

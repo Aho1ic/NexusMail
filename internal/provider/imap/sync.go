@@ -25,9 +25,18 @@ import (
 // must not race another writer between LIST and CREATE. The sync path is expected
 // to invoke it before syncAllMailboxes so the latter sees a complete catalog.
 //
-// It returns the LIST entries, because the mailbox attributes are not persisted
-// and a caller that needs them — ensureArchiveMailbox looks for \Noselect
-// containers — would otherwise have to LIST a second time.
+// \Noselect entries are listed but never stored. They are the provider's own
+// statement that a name holds only children and cannot be SELECTed — QQ's
+// "其他文件夹" and Gmail's "[Gmail]" are the two this codebase meets. Storing them
+// as mailboxes made every path that resolves one fail against the server: the
+// folder appeared in the sidebar and answered "NO Folder not exist!" when opened,
+// and MessageLocation could hand one to SetFlags, so marking such a message read
+// failed with a 500 forever while the UI had already drawn it read.
+//
+// It returns every LIST entry, filtered or not, because the mailbox attributes are
+// not persisted and a caller that needs them — ensureArchiveMailbox looks for
+// exactly these \Noselect containers to nest an archive under — would otherwise
+// have to LIST a second time.
 func (s *Supervisor) refreshMailboxCatalog(ctx context.Context, rt *runtime, client *imapclient.Client) ([]*goimap.ListData, error) {
 	items, err := client.List("", "*", nil).Collect()
 	if err != nil {
@@ -35,6 +44,9 @@ func (s *Supervisor) refreshMailboxCatalog(ctx context.Context, rt *runtime, cli
 	}
 	now := time.Now().UnixMilli()
 	for _, item := range items {
+		if isNoselect(item) {
+			continue
+		}
 		attrs := make([]string, len(item.Attrs))
 		for i, attr := range item.Attrs {
 			attrs[i] = string(attr)

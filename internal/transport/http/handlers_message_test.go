@@ -459,6 +459,49 @@ func TestPatchMessageDoesNotWriteLocallyWhenTheProviderFails(t *testing.T) {
 	}
 }
 
+// TestPatchMessageSurvivesAClientDisconnect is the regression for the reported
+// defect: mail that had been read came back unread after a refresh.
+//
+// Marking read is the one mutation the browser does not await — App.tsx draws the
+// row read and lets the PATCH run in the background — so the request is routinely
+// still in flight when the user refreshes, navigates, or closes the tab. On the
+// request context that cancellation reached SetFlags: the provider STORE was
+// abandoned, the local row was never written, and the next feed load served the
+// message as unread even though the UI had shown it read the whole time.
+//
+// The write therefore has to be charged to the app context. The delay here stands
+// in for the wait on the account's command connection, which is what makes the
+// window wide enough to lose in practice — measured at ~1s against a live provider.
+func TestPatchMessageSurvivesAClientDisconnect(t *testing.T) {
+	h := newHarness(t)
+	fixture := h.seedFeed(1)
+	id := fixture.ids[0]
+	h.provider.set(func(f *fakeProvider) { f.flagDelay = 300 * time.Millisecond })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	request := newJSONRequest(http.MethodPatch, fmt.Sprintf("/api/v1/messages/%d", id), `{"is_read":true}`)
+	request = request.WithContext(ctx)
+	// The browser goes away while the STORE is still in flight.
+	go func() { time.Sleep(50 * time.Millisecond); cancel() }()
+	h.doRaw(request)
+
+	stored, _, err := h.repo.GetMessage(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !stored.IsRead {
+		t.Fatal("the flag was dropped when the client disconnected, so the message reads as unread on the next feed load")
+	}
+	// The provider is still the source of truth for the local write: it was asked,
+	// and it agreed, before the row was touched.
+	h.provider.mu.Lock()
+	flagCalls := len(h.provider.flagCalls)
+	h.provider.mu.Unlock()
+	if flagCalls != 1 {
+		t.Fatalf("SetFlags called %d times, want 1", flagCalls)
+	}
+}
+
 // An empty patch is the caller's mistake, so it gets a 400 that says so rather
 // than a redacted 500.
 func TestPatchMessageRejectsAnEmptyPatch(t *testing.T) {

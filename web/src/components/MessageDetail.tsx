@@ -42,8 +42,12 @@ export function MessageDetail({ selected, details, autoLoadRemoteImages, onBack,
           provides. The cap is raised past any width real mail uses; prose that needs a
           readable measure is capped individually below, since a 1600px line is not
           readable. Anything wider than this still scrolls in place rather than
-          dragging the whole pane sideways. */}
-      <div className="mx-auto w-full max-w-[1600px]"><p className="text-[10px] font-bold uppercase tracking-[.2em] text-pine/40">{formatFullDate(message.received_at)}</p><h1 className="mt-3 max-w-4xl font-serif text-3xl leading-tight lg:text-4xl">{message.subject || '（无主题）'}</h1>
+          dragging the whole pane sideways.
+          It is also a full-height flex column, which is what lets the body frame below
+          claim the height the header and attachments do not use. min-h-full rather than
+          h-full: mail taller than the pane still grows the column and scrolls the
+          article, exactly as before. */}
+      <div className="mx-auto flex min-h-full w-full max-w-[1600px] flex-col"><p className="text-[10px] font-bold uppercase tracking-[.2em] text-pine/40">{formatFullDate(message.received_at)}</p><h1 className="mt-3 max-w-4xl font-serif text-3xl leading-tight lg:text-4xl">{message.subject || '（无主题）'}</h1>
         <div className="mt-7 flex items-center gap-3 border-b border-black/5 pb-6"><Avatar label={displaySender(message.sender)} /><div className="min-w-0"><div className="truncate font-serif text-lg">{displaySender(message.sender)}</div><div className="truncate text-xs text-black/40">发给 {decodeEncodedWords(message.recipients) || '我'}</div></div></div>
         {otpCode && <button onClick={copyCode} className="card-lift mt-6 flex items-center gap-3 rounded-card bg-sage/60 px-4 py-3 text-left hover:bg-sage" aria-label={`复制验证码 ${otpCode}`}><span className="grid h-9 w-9 place-items-center rounded-2xl bg-white/70 text-pine"><Copy size={16} /></span><span><span className="block font-mono text-lg font-bold tracking-[.18em] text-pine">{otpCode}</span><span className="text-[11px] text-pine/55">检测到验证码，点击复制</span></span></button>}
         {!details && <div className="grid h-52 place-items-center"><LoaderCircle className="animate-spin text-pine/40" /></div>}
@@ -56,8 +60,21 @@ export function MessageDetail({ selected, details, autoLoadRemoteImages, onBack,
         {details && hasRemoteImages && !loadRemoteImages && <button onClick={() => setLoadRemoteImages(true)} className="card-lift mt-6 rounded-2xl bg-amber-50 px-4 py-2 text-xs font-semibold text-amber-800">本邮件包含已阻止的远程图片，点击临时加载</button>}
         {/* Only the HTML frame takes the full column: the sender controls that layout
             and needs the room. Plain text wraps to whatever it is given, so it keeps a
-            measure of its own — inheriting the column would set 1600px lines. */}
-        {details && message.body_html ? <iframe title="邮件正文" sandbox="allow-popups allow-popups-to-escape-sandbox" referrerPolicy="no-referrer" srcDoc={messageDocument(renderedHTML)} className="mt-8 min-h-[520px] w-full border-0" /> : details && <pre className="mt-8 max-w-3xl whitespace-pre-wrap font-sans text-[15px] leading-7 text-black/75">{message.body_text || message.snippet}</pre>}
+            measure of its own — inheriting the column would set 1600px lines.
+            flex-1 is what fixes the frame that used to render as a 520px band with the
+            rest of a 1300px pane blank underneath it. The frame cannot size itself to
+            its content — it is a scriptless sandbox, so nothing on either side may
+            measure the document — so it takes the pane's leftover height and scrolls
+            internally.
+            The floor drops at md, where the pane is a column of its own. 520px there
+            was larger than the height a 1440x900 pane has left to give (469px), so the
+            floor pushed the article into an outer scrollbar to honour a minimum the
+            screen could have filled by itself. 200px only guards the degenerate case —
+            a window short enough that the header eats the column and flex-basis 0
+            would otherwise leave the frame nothing. Below md the taller floor stays:
+            a phone scrolls the article, and a frame that scrolls inside a scrolling
+            page is worse on touch than a long page. */}
+        {details && message.body_html ? <iframe title="邮件正文" sandbox="allow-popups allow-popups-to-escape-sandbox" referrerPolicy="no-referrer" srcDoc={messageDocument(renderedHTML)} className="mt-8 min-h-[520px] w-full flex-1 border-0 md:min-h-[200px]" /> : details && <pre className="mt-8 max-w-3xl whitespace-pre-wrap font-sans text-[15px] leading-7 text-black/75">{message.body_text || message.snippet}</pre>}
         {/* The column is wide enough now that two chips would be ~800px each, so the grid
             gains columns instead of stretching the ones it has. */}
         {!!details?.attachments?.length && <div className="mt-10 border-t border-black/5 pt-5"><h2 className="text-xs font-bold uppercase tracking-wider text-black/40">附件</h2><div className="mt-3 grid gap-2 sm:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4">{details.attachments.map(att => <a key={att.id} href={`/api/v1/messages/${message.id}/attachments/${att.id}`} className="card-lift flex items-center gap-3 rounded-card border border-black/5 bg-white p-3 hover:bg-paper"><span className="grid h-9 w-9 place-items-center rounded-xl bg-sage"><File size={17} /></span><span className="min-w-0"><span className="block truncate text-xs font-semibold">{att.filename}</span><span className="text-[10px] text-black/35">{formatBytes(att.size_bytes)}</span></span></a>)}</div></div>}

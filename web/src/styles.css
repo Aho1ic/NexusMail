@@ -51,6 +51,11 @@
   .button-secondary { @apply inline-flex items-center gap-2 rounded-2xl border border-black/10 bg-white px-4 py-2 text-xs font-semibold shadow-lift-1 transition hover:-translate-y-px hover:bg-paper hover:shadow-lift-2; }
   .icon-button { @apply inline-grid h-9 w-9 place-items-center rounded-2xl text-black/45 transition hover:bg-sage hover:text-pine; }
   .modal-backdrop { @apply fixed inset-0 z-50 grid place-items-center bg-pine/25 p-3 backdrop-blur-md; }
+
+  /* The global 8px scrollbar is right for panes and wrong for a 40px-tall chip
+     row, where it parks a permanent bar under the labels. */
+  .no-scrollbar { scrollbar-width: none; }
+  .no-scrollbar::-webkit-scrollbar { display: none; }
 }
 
 /* Colour and shadow still carry every state above; only the travel is dropped. */

@@ -1,6 +1,7 @@
 package http
 
 import (
+	"log/slog"
 	"net/http"
 	"net/url"
 	"strings"
@@ -78,12 +79,21 @@ func (s *Server) oauthCallback(c *gin.Context) {
 	}
 	email, displayName, refreshToken, err := s.oauth.Exchange(c.Request.Context(), providerName, c.Query("state"), c.Query("code"))
 	if err != nil {
-		fail(c, 400, "oauth_failed", err.Error(), nil)
+		// Both failure paths redirect, because the browser that lands here is a
+		// popup the SPA is waiting on: a JSON body would strand it on an error page
+		// it cannot close itself. The reason is the machine-readable cause only —
+		// err carries provider and state detail that does not belong in a URL the
+		// user can see and share.
+		c.Redirect(http.StatusFound, "/?oauth=error&reason=exchange_failed")
 		return
 	}
 	account, err := s.accounts.AddOAuth(c.Request.Context(), providerName, email, displayName, refreshToken)
 	if err != nil {
-		writeError(c, err)
+		// Same reasoning as the exchange failure, and the same popup waiting on it.
+		// The usual cause is re-authorizing an address that is already connected,
+		// which the UNIQUE (provider, email) index refuses.
+		slog.Warn("oauth account rejected", "request_id", c.GetString("request_id"), "provider", providerName, "error", err)
+		c.Redirect(http.StatusFound, "/?oauth=error&reason=account_rejected")
 		return
 	}
 	s.sync.StartAccount(s.appCtx, account)

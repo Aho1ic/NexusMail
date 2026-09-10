@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import App from './App'
 
@@ -161,7 +161,65 @@ describe('view scoping', () => {
     await waitFor(() => expect(lastFeed(recorder).get('account_id')).toBeNull())
     expect(lastFeed(recorder).get('mailbox_id')).toBeNull()
     expect(lastFeed(recorder).get('folder')).toBe('inbox')
+    // Leaving another view for All Inboxes is also the reveal path, so it asks for
+    // the wide page even when this stub has nothing unread to find.
+    expect(lastFeed(recorder).get('limit')).toBe('100')
     expect(screen.getByRole('heading', { name: 'All Inboxes' })).toBeInTheDocument()
+  })
+
+  it('marks unread rows so the corner dot is not the only signal', async () => {
+    await boot({ page: () => ({ items: [message(1, '第一封', { is_read: false }), message(2, '第二封')], unread_total: 1 }) })
+    // The dot itself is aria-hidden decoration; this text is what carries the state
+    // to a reader, and it must not appear on rows that are already read.
+    expect(within(screen.getByRole('button', { name: /第一封/ })).getByText('未读')).toBeInTheDocument()
+    expect(within(screen.getByRole('button', { name: /第二封/ })).queryByText('未读')).toBeNull()
+  })
+
+  it('jumps to unread mail that the first page could not reach', async () => {
+    const reads = Array.from({ length: 50 }, (_, index) => message(index + 1, index === 0 ? '第一封' : `已读 ${index + 1}`))
+    const unread = message(51, '深页未读', { is_read: false })
+    const recorder = await boot({
+      page: params => params.get('limit') === '100'
+        ? { items: [...reads, unread], unread_total: 1 }
+        : { items: reads.slice(0, 40), next_cursor: 'cursor-1', unread_total: 1 },
+    })
+    // This is the reported bug: the badge counts mail the list has never loaded.
+    expect(screen.queryByRole('button', { name: /深页未读/ })).toBeNull()
+
+    fireEvent.click(screen.getByRole('button', { name: /All Inboxes/ }))
+    const row = await screen.findByRole('button', { name: /深页未读/ })
+
+    expect(lastFeed(recorder).get('limit')).toBe('100')
+    expect(lastFeed(recorder).get('folder')).toBe('inbox')
+    expect(row).toHaveAttribute('data-revealed')
+    // Found, not opened: a jump that marked it read would destroy the thing the user
+    // was looking for.
+    expect(recorder.writes.filter(write => write.method === 'PATCH')).toHaveLength(0)
+    expect(within(row).getByText('未读')).toBeInTheDocument()
+    expect(screen.queryByRole('status')).toBeNull()
+  })
+
+  it('says so when the unread mail is past even the wide page', async () => {
+    // The wide page is the whole reach of the jump. Beyond it the badge is still
+    // right and the list still cannot show the mail, so the user is told rather than
+    // left pressing a row that appears to do nothing.
+    await boot({ page: () => ({ items: [message(1, '第一封'), message(2, '第二封')], next_cursor: 'cursor-1', unread_total: 1 }) })
+
+    fireEvent.click(screen.getByRole('button', { name: /All Inboxes/ }))
+
+    expect(await screen.findByRole('status')).toHaveTextContent('未读邮件不在最近 100 封内')
+  })
+
+  it('does not reload the unified inbox when there is nothing unread to find', async () => {
+    const recorder = await boot()
+    const before = recorder.feeds.length
+
+    fireEvent.click(screen.getByRole('button', { name: /All Inboxes/ }))
+    await act(async () => {})
+
+    // Already here and the badge is clear: pressing the row again has nowhere to go,
+    // so it must not spend a wide page on it.
+    expect(recorder.feeds.length).toBe(before)
   })
 
   it('releases the mailbox scope when the account changes', async () => {
@@ -200,6 +258,47 @@ describe('view scoping', () => {
 
     fireEvent.click(navAccount('alt@163.com'))
     await waitFor(() => expect(screen.queryByRole('button', { name: '收件箱' })).not.toBeInTheDocument())
+  })
+
+  it('folds the folder tree away when the account row is pressed again', async () => {
+    const recorder = await boot()
+    const row = navAccount('work@qq.com')
+    fireEvent.click(row)
+    expect(await screen.findByRole('button', { name: '收件箱' })).toBeInTheDocument()
+    expect(row).toHaveAttribute('aria-expanded', 'true')
+    const feeds = recorder.all.filter(entry => entry.startsWith('GET /api/v1/messages?')).length
+
+    fireEvent.click(row)
+    await waitFor(() => expect(screen.queryByRole('button', { name: '收件箱' })).not.toBeInTheDocument())
+    expect(row).toHaveAttribute('aria-expanded', 'false')
+    // Folding hides folders, it does not change what is listed: the account scope
+    // stays and no request is spent re-fetching mail the user is already looking at.
+    expect(lastFeed(recorder).get('account_id')).toBe('1')
+    expect(recorder.all.filter(entry => entry.startsWith('GET /api/v1/messages?')).length).toBe(feeds)
+
+    // And a third press brings them back, or the fold would be a one-way trip.
+    fireEvent.click(row)
+    expect(await screen.findByRole('button', { name: '收件箱' })).toBeInTheDocument()
+
+    // Rows without a subtree must not claim one. All Inboxes reporting collapsed
+    // would tell a screen reader there are folders under it to open.
+    expect(screen.getByRole('button', { name: /All Inboxes/ })).not.toHaveAttribute('aria-expanded')
+  })
+
+  it('reopens the folder tree when returning to a folded account', async () => {
+    await boot()
+    const work = navAccount('work@qq.com')
+    fireEvent.click(work)
+    await screen.findByRole('button', { name: '收件箱' })
+    fireEvent.click(work)
+    await waitFor(() => expect(screen.queryByRole('button', { name: '收件箱' })).not.toBeInTheDocument())
+
+    // Leaving for another account and coming back must not restore the folded state,
+    // or the row would look selected with its folders silently withheld.
+    fireEvent.click(navAccount('alt@163.com'))
+    fireEvent.click(work)
+    expect(await screen.findByRole('button', { name: '收件箱' })).toBeInTheDocument()
+    expect(work).toHaveAttribute('aria-expanded', 'true')
   })
 })
 
@@ -581,6 +680,7 @@ describe('dialogs and panes', () => {
     fireEvent.click(screen.getByRole('button', { name: /连接邮箱/ }))
     await screen.findByRole('heading', { name: '连接邮箱' })
 
+    fireEvent.click(screen.getByRole('button', { name: /^QQ\b/ }))
     fireEvent.change(screen.getByLabelText('显示名称'), { target: { value: '新号' } })
     fireEvent.change(screen.getByLabelText('邮箱地址'), { target: { value: 'new@qq.com' } })
     fireEvent.change(screen.getByLabelText('授权码'), { target: { value: 'code' } })
