@@ -16,6 +16,15 @@ type fakeStore struct {
 	createErr error
 	list      []domain.Account
 	listErr   error
+
+	account   domain.Account
+	getErr    error
+	secret    []byte
+	secretID  int64
+	secretErr error
+	deletedID int64
+	deletes   int
+	deleteErr error
 }
 
 func (f *fakeStore) CreateAccount(_ context.Context, account *domain.Account) error {
@@ -29,6 +38,21 @@ func (f *fakeStore) CreateAccount(_ context.Context, account *domain.Account) er
 }
 func (f *fakeStore) ListAccounts(context.Context) ([]domain.Account, error) {
 	return f.list, f.listErr
+}
+func (f *fakeStore) GetAccount(context.Context, int64) (domain.Account, error) {
+	return f.account, f.getErr
+}
+func (f *fakeStore) UpdateAccountSecret(_ context.Context, id int64, ciphertext []byte) error {
+	if f.secretErr != nil {
+		return f.secretErr
+	}
+	f.secretID, f.secret = id, ciphertext
+	return nil
+}
+func (f *fakeStore) DeleteAccount(_ context.Context, id int64) error {
+	f.deletes++
+	f.deletedID = id
+	return f.deleteErr
 }
 
 func newBox(t *testing.T) *cryptobox.Box {
@@ -252,6 +276,76 @@ func TestListPassesThrough(t *testing.T) {
 
 	failing := New(&fakeStore{listErr: errors.New("boom")}, newBox(t))
 	if _, err := failing.List(context.Background()); err == nil {
+		t.Fatal("expected the store error")
+	}
+}
+
+// A rotated refresh token has to survive a restart, so it goes back into the sealed
+// credential rather than living only in the token cache.
+func TestUpdateRefreshTokenReseals(t *testing.T) {
+	box := newBox(t)
+	store := &fakeStore{}
+	service := New(store, box)
+	account, err := service.AddOAuth(context.Background(), "outlook", "a@outlook.com", "", "first-token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.account = account
+
+	if err := service.UpdateRefreshToken(context.Background(), account.ID, "second-token"); err != nil {
+		t.Fatal(err)
+	}
+	if store.secretID != account.ID || store.secret == nil {
+		t.Fatalf("secret written for id=%d (%v)", store.secretID, store.secret)
+	}
+	credential, err := service.Credential(domain.Account{SecretCiphertext: store.secret})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if credential.RefreshToken != "second-token" {
+		t.Fatalf("refresh token = %q, want second-token", credential.RefreshToken)
+	}
+}
+
+// An unchanged token must not cost a write: AccessToken calls this on every refresh
+// and most providers return the same refresh token every time.
+func TestUpdateRefreshTokenSkipsAnUnchangedToken(t *testing.T) {
+	box := newBox(t)
+	store := &fakeStore{}
+	service := New(store, box)
+	account, err := service.AddOAuth(context.Background(), "gmail", "a@gmail.com", "", "same-token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.account = account
+
+	if err := service.UpdateRefreshToken(context.Background(), account.ID, "same-token"); err != nil {
+		t.Fatal(err)
+	}
+	if store.secret != nil {
+		t.Fatal("resealed an unchanged credential")
+	}
+}
+
+func TestUpdateRefreshTokenRequiresAToken(t *testing.T) {
+	service := New(&fakeStore{}, newBox(t))
+	if err := service.UpdateRefreshToken(context.Background(), 1, ""); !errors.Is(err, ports.ErrInvalidInput) {
+		t.Fatalf("err = %v, want ErrInvalidInput", err)
+	}
+}
+
+func TestDeletePassesThrough(t *testing.T) {
+	store := &fakeStore{}
+	service := New(store, newBox(t))
+	if err := service.Delete(context.Background(), 7); err != nil {
+		t.Fatal(err)
+	}
+	if store.deletes != 1 || store.deletedID != 7 {
+		t.Fatalf("delete calls=%d id=%d", store.deletes, store.deletedID)
+	}
+
+	failing := New(&fakeStore{deleteErr: errors.New("busy")}, newBox(t))
+	if err := failing.Delete(context.Background(), 7); err == nil {
 		t.Fatal("expected the store error")
 	}
 }

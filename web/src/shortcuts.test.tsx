@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import App from './App'
 import { useKeyboard } from './hooks/useKeyboard'
 import { notificationsEnabled, notify } from './hooks/useRealtime'
-import { prepareMessageHTML } from './lib/messagehtml'
+import { inlineImageRefs, prepareMessageHTML } from './lib/messagehtml'
 import { copyText } from './lib/notifications'
 import { decodeEncodedWords, displaySender, formatBytes, formatDate, formatFullDate, messageOf, splitEmails } from './lib/format'
 import type { Message } from './types'
@@ -175,12 +175,12 @@ describe('keyboard shortcuts', () => {
 describe('the keyboard hook in isolation', () => {
   afterEach(cleanup)
 
-  function probe(enabled: boolean, selected: ReturnType<typeof message> | null, list = inbox) {
+  function probe(enabled: boolean, selected: Message | null, list = inbox, dialogOpen = false) {
     const open = vi.fn()
     const compose = vi.fn()
     const archive = vi.fn()
     function Probe() {
-      useKeyboard(enabled, list, selected, open, compose, archive)
+      useKeyboard(enabled, dialogOpen, list, selected, open, compose, archive)
       return null
     }
     render(<Probe />)
@@ -220,10 +220,21 @@ describe('the keyboard hook in isolation', () => {
     expect(open).not.toHaveBeenCalled()
   })
 
+  // A dialog renders as a sibling of the still-mounted mailbox, so with focus on a
+  // dialog button 'e' archived the message behind it and 'c' opened a second
+  // composer over the first.
+  it('binds nothing while a dialog owns the screen', () => {
+    const { open, compose, archive } = probe(true, inbox[0], inbox, true)
+    for (const key of ['j', 'k', 'c', 'e']) fireEvent.keyDown(window, { key })
+    expect(open).not.toHaveBeenCalled()
+    expect(compose).not.toHaveBeenCalled()
+    expect(archive).not.toHaveBeenCalled()
+  })
+
   it('unbinds on unmount', () => {
     const archive = vi.fn()
     function Probe() {
-      useKeyboard(true, inbox, inbox[0], () => undefined, () => undefined, archive)
+      useKeyboard(true, false, inbox, inbox[0], () => undefined, () => undefined, archive)
       return null
     }
     render(<Probe />).unmount()
@@ -410,25 +421,57 @@ describe('formatting', () => {
 })
 
 describe('message html preparation', () => {
-  const attachment = (id: number, contentID?: string) => ({
+  const attachment = (id: number, contentID?: string, sizeBytes = 10) => ({
     id, message_id: 1, filename: `f${id}.png`, content_type: 'image/png',
-    content_id: contentID, size_bytes: 10, fetch_state: 'ready',
+    content_id: contentID, size_bytes: sizeBytes, fetch_state: 'ready',
+  })
+  const noSources: Map<string, string> = new Map()
+
+  it('names the attachment endpoint for each cid: image the body references', () => {
+    expect(inlineImageRefs('<img src="cid:logo@x">', [attachment(7, '<logo@x>')], 1))
+      .toEqual([{ contentID: 'logo@x', url: '/api/v1/messages/1/attachments/7' }])
   })
 
-  it('rewrites a cid: image to the attachment it names', () => {
-    const html = prepareMessageHTML('<img src="cid:logo@x">', [attachment(7, '<logo@x>')], 1, false)
-    expect(html).toContain('/api/v1/messages/1/attachments/7')
+  it('asks for one request per content id however often it is referenced', () => {
+    const refs = inlineImageRefs('<img src="cid:logo@x"><img src="cid:logo@x">', [attachment(7, '<logo@x>')], 1)
+    expect(refs).toHaveLength(1)
   })
 
-  it('leaves a cid: image alone when no attachment matches', () => {
-    const html = prepareMessageHTML('<img src="cid:missing@x">', [attachment(7, '<logo@x>')], 1, false)
-    expect(html).toContain('cid:missing@x')
-    expect(html).not.toContain('/attachments/')
+  it('requests nothing when no attachment matches the content id', () => {
+    expect(inlineImageRefs('<img src="cid:missing@x">', [attachment(7, '<logo@x>')], 1)).toEqual([])
   })
 
   it('ignores attachments that carry no content id', () => {
-    const html = prepareMessageHTML('<img src="cid:logo@x">', [attachment(7)], 1, false)
-    expect(html).toContain('cid:logo@x')
+    expect(inlineImageRefs('<img src="cid:logo@x">', [attachment(7)], 1)).toEqual([])
+  })
+
+  // The resolved bytes ride inside srcDoc as text, so one oversized part must not be
+  // inlined; it stays downloadable from the attachment list instead.
+  it('skips a part past the per-part ceiling', () => {
+    expect(inlineImageRefs('<img src="cid:big@x">', [attachment(7, '<big@x>', (1 << 20) + 1)], 1)).toEqual([])
+    expect(inlineImageRefs('<img src="cid:big@x">', [attachment(7, '<big@x>', 1 << 20)], 1)).toHaveLength(1)
+  })
+
+  it('stops inlining once the whole-message budget is spent', () => {
+    const body = Array.from({ length: 6 }, (_, index) => `<img src="cid:p${index}@x">`).join('')
+    const parts = Array.from({ length: 6 }, (_, index) => attachment(index + 1, `<p${index}@x>`, 1 << 20))
+    // Four 1 MiB parts fit the 4 MiB budget; the rest fall back to the placeholder.
+    expect(inlineImageRefs(body, parts, 1)).toHaveLength(4)
+  })
+
+  it('substitutes a resolved inline source into the document', () => {
+    const html = prepareMessageHTML('<img src="cid:logo@x">', new Map([['logo@x', 'data:image/png;base64,AAAA']]), false)
+    expect(html).toContain('src="data:image/png;base64,AAAA"')
+    expect(html).not.toContain('data-nexusmail-blocked')
+  })
+
+  // An unresolved cid: kept its src, which no browser can load: it painted a broken
+  // glyph, and inside the 16-24px boxes mail uses for icons the alt text wrapped one
+  // glyph per line. It gets the same treatment as a blocked remote image.
+  it('blocks a cid: image that has not been resolved instead of leaving it broken', () => {
+    const html = prepareMessageHTML('<img alt="logo" src="cid:missing@x">', noSources, false)
+    expect(html).toContain('data-nexusmail-blocked')
+    expect(html).not.toContain('cid:missing@x')
   })
 
   // The marker attribute ends in "src", so the real src is matched with a boundary
@@ -436,42 +479,42 @@ describe('message html preparation', () => {
   const realSrc = /(^|\s)src="https:\/\/t\.example\/p\.gif"/
 
   it('marks a blocked remote image and restores it on opt-in', () => {
-    const blocked = prepareMessageHTML('<img data-nexusmail-remote-src="https://t.example/p.gif">', [], 1, false)
+    const blocked = prepareMessageHTML('<img data-nexusmail-remote-src="https://t.example/p.gif">', noSources, false)
     expect(blocked).toContain('data-nexusmail-blocked')
     expect(blocked).not.toMatch(realSrc)
 
-    const loaded = prepareMessageHTML('<img data-nexusmail-remote-src="https://t.example/p.gif">', [], 1, true)
+    const loaded = prepareMessageHTML('<img data-nexusmail-remote-src="https://t.example/p.gif">', noSources, true)
     expect(loaded).toMatch(realSrc)
     expect(loaded).not.toContain('data-nexusmail-blocked')
   })
 
-  it('does not mark an element that already carries a src', () => {
-    const html = prepareMessageHTML('<img src="cid:x" data-nexusmail-remote-src="https://t.example/p.gif">', [], 1, false)
+  it('does not mark an element that already carries a loadable src', () => {
+    const html = prepareMessageHTML('<img src="/api/v1/messages/1/attachments/7" data-nexusmail-remote-src="https://t.example/p.gif">', noSources, false)
     expect(html).not.toContain('data-nexusmail-blocked')
   })
 
   it('leaves a remote marker with no value unloaded', () => {
-    const html = prepareMessageHTML('<img data-nexusmail-remote-src="">', [], 1, true)
+    const html = prepareMessageHTML('<img data-nexusmail-remote-src="">', noSources, true)
     // Nothing to load, so it stays a placeholder rather than getting an empty src.
     expect(html).toContain('data-nexusmail-blocked')
   })
 
   it('rules a table with an explicit border and not one without', () => {
-    const ruled = prepareMessageHTML('<table border="1"><tr><td>a</td></tr></table>', [], 1, false)
+    const ruled = prepareMessageHTML('<table border="1"><tr><td>a</td></tr></table>', noSources, false)
     expect(ruled).toContain('nexusmail-data')
     expect(ruled).toContain('nexusmail-cell')
 
-    const plain = prepareMessageHTML('<table><tr><td>a</td></tr></table>', [], 1, false)
+    const plain = prepareMessageHTML('<table><tr><td>a</td></tr></table>', noSources, false)
     expect(plain).not.toContain('nexusmail-data')
   })
 
   it('treats a border of zero as no border', () => {
-    const html = prepareMessageHTML('<table border="0"><tr><td>a</td></tr></table>', [], 1, false)
+    const html = prepareMessageHTML('<table border="0"><tr><td>a</td></tr></table>', noSources, false)
     expect(html).not.toContain('nexusmail-data')
   })
 
   it('wraps only the outermost table in a scroll box', () => {
-    const html = prepareMessageHTML('<table><tr><td><table><tr><td>a</td></tr></table></td></tr></table>', [], 1, false)
+    const html = prepareMessageHTML('<table><tr><td><table><tr><td>a</td></tr></table></td></tr></table>', noSources, false)
     expect(html.match(/nexusmail-scroll/g)).toHaveLength(1)
   })
 })

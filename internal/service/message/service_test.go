@@ -211,6 +211,40 @@ func TestPatchWithoutRemoteStillWritesLocally(t *testing.T) {
 	}
 }
 
+// A locally created Sent row has no mailbox_messages mapping, so every remote
+// mutator would resolve it to not-found and the transport would answer 404 for an
+// id whose GET returns 200. The patch is local only.
+func TestPatchSkipsTheProviderForOutgoingMail(t *testing.T) {
+	store := &fakeStore{message: domain.Message{ID: 12, Direction: "outgoing"}}
+	remote := &fakeRemote{}
+	events := &recorder{}
+	service := New(store, remote, events)
+
+	if _, err := service.Patch(context.Background(), 12, ports.MessagePatch{IsStarred: ptr(true)}, false); err != nil {
+		t.Fatal(err)
+	}
+	if remote.flagCalls != 0 || remote.archiveCalls != 0 {
+		t.Fatalf("provider touched for a sent message: flags=%d archive=%d", remote.flagCalls, remote.archiveCalls)
+	}
+	if store.patchedID != 12 || len(events.events) != 1 {
+		t.Fatalf("store=%d events=%d", store.patchedID, len(events.events))
+	}
+}
+
+// The direction is read from the row, so a message that is genuinely gone still
+// fails here rather than being patched blind.
+func TestPatchPropagatesAMissingMessage(t *testing.T) {
+	store := &fakeStore{getErr: ports.NotFoundf("no such message")}
+	remote := &fakeRemote{}
+	service := New(store, remote, &recorder{})
+	if _, err := service.Patch(context.Background(), 1, ports.MessagePatch{IsRead: ptr(true)}, false); !errors.Is(err, ports.ErrNotFound) {
+		t.Fatalf("err = %v, want ErrNotFound", err)
+	}
+	if remote.flagCalls != 0 {
+		t.Fatal("called the provider for a message that does not exist")
+	}
+}
+
 func TestPatchDoesNotPublishWhenTheWriteFails(t *testing.T) {
 	events := &recorder{}
 	service := New(&fakeStore{patchErr: errors.New("busy")}, nil, events)

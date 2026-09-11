@@ -21,9 +21,15 @@ test-race:
 web-install:
 	cd web && npm ci
 
+# The embed directory is emptied before the copy: vite emits content-hashed
+# filenames, so copying over it accumulates every past build's assets and
+# go:embed compiles all of them into the binary. The tracked placeholder files
+# are kept: placeholder.txt is what keeps `go:embed dist` resolving on a fresh
+# clone (go:embed ignores the dot-prefixed .gitkeep).
 web-build:
 	cd web && npm run build
 	mkdir -p internal/transport/http/static/dist
+	find internal/transport/http/static/dist -mindepth 1 ! -name placeholder.txt ! -name .gitkeep -delete
 	cp -R web/dist/. internal/transport/http/static/dist/
 
 web-test:

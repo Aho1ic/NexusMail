@@ -4,10 +4,12 @@ package sqlite
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
 	"nexusmail/internal/domain"
+	"nexusmail/internal/ports"
 )
 
 // MoveMessageLocation is the local half of archiving: the provider has already
@@ -167,5 +169,33 @@ func TestMoveMessageLocationOverwritesAStaleMappingOnTheSameUID(t *testing.T) {
 	}
 	if uid != 500 {
 		t.Errorf("destination uid = %d, want 500", uid)
+	}
+}
+
+// TestMoveMessageLocationRejectsAMissingSourceMapping covers the zero-rows read.
+// Scan reports no error when the SELECT matches nothing, so the source struct stays
+// zero-valued and flags_json would be inserted as "" — not the JSON array the column
+// promises, which ReconcileMailboxFlags then rewrites on every single pass. The
+// mapping being absent also means the move the caller is mirroring never happened
+// here, so it has to be reported rather than half-applied.
+func TestMoveMessageLocationRejectsAMissingSourceMapping(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+	account, inbox := seedAccountMailbox(t, store)
+	archive := mailboxNamed(t, store, account.ID, "Archive", "archive")
+	// Seeded into the archive, so the inbox holds no mapping for it.
+	messageID := seedMessage(t, store, account.ID, archive, 77, "already elsewhere", "incoming", false, time.Now().UnixMilli())
+
+	destinationUID := uint32(78)
+	err := store.MoveMessageLocation(ctx, messageID, inbox.ID, archive, &destinationUID)
+	if !errors.Is(err, ports.ErrNotFound) {
+		t.Fatalf("MoveMessageLocation error = %v, want ports.ErrNotFound", err)
+	}
+	_, flags, present := mappingOf(t, store, archive, messageID)
+	if !present {
+		t.Fatal("the existing archive mapping was destroyed by the rejected move")
+	}
+	if flags == "" {
+		t.Error("flags_json is empty: the invalid value the guard exists to prevent was written anyway")
 	}
 }

@@ -93,6 +93,15 @@ func (s *Server) addDraftAttachment(c *gin.Context) {
 		fail(c, 400, "invalid_attachment", err.Error(), nil)
 		return
 	}
+	// The draft is resolved before the bytes are stored. Put writes a durable blob,
+	// and CachedBlobs only offers durability='cache' to the evictor, so a POST for a
+	// draft that does not exist used to leave up to MaxOutboundBytes on disk that
+	// nothing can ever reclaim once AddDraftAttachment hit the foreign key. Going
+	// through s.drafts also gives this route the same 404/409 as the rest of them.
+	if _, _, err := s.drafts.Get(c.Request.Context(), id); err != nil {
+		writeError(c, err)
+		return
+	}
 	opened, err := file.Open()
 	if err != nil {
 		writeError(c, err)

@@ -3,12 +3,15 @@
 package http
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -330,6 +333,91 @@ func TestSecurityHeadersOnEveryResponse(t *testing.T) {
 	}
 }
 
+// HSTS is keyed off the PublicURL scheme, the same signal the session cookie's
+// Secure flag uses. Sending it over plain HTTP is ignored at best, and if it ever
+// reached a client it would pin the host to a scheme the deployment does not answer
+// on for a year.
+func TestStrictTransportSecurityFollowsThePublicURLScheme(t *testing.T) {
+	for _, item := range []struct {
+		publicURL string
+		want      string
+	}{
+		{"http://localhost:13737", ""},
+		{"https://mail.example", "max-age=31536000; includeSubDomains"},
+	} {
+		server := newTestServer(t)
+		server.cfg.PublicURL = item.publicURL
+		response := httptest.NewRecorder()
+		server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+		if got := response.Header().Get("Strict-Transport-Security"); got != item.want {
+			t.Errorf("PublicURL %q: Strict-Transport-Security = %q, want %q", item.publicURL, got, item.want)
+		}
+	}
+}
+
+// connect-src must not carry ws:/wss:. A scheme-only source matches every host, so
+// it permits a socket to anywhere; the only socket the app opens is same-origin and
+// 'self' already covers it.
+func TestConnectSrcIsSelfOnly(t *testing.T) {
+	server := newTestServer(t)
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	csp := response.Header().Get("Content-Security-Policy")
+	if !strings.Contains(csp, "connect-src 'self';") {
+		t.Fatalf("CSP = %q, want connect-src 'self'", csp)
+	}
+	if strings.Contains(csp, "ws:") || strings.Contains(csp, "wss:") {
+		t.Errorf("CSP still allows a scheme-only socket source: %q", csp)
+	}
+	// The remote-image valve is deliberate and must survive the tightening.
+	if !strings.Contains(csp, "img-src 'self' data: http: https:") {
+		t.Errorf("img-src was narrowed too: %q", csp)
+	}
+}
+
+// A panic must answer with the standard envelope and must not reach
+// gin.DefaultErrorWriter: gin's dump masks only Authorization, so its broken-pipe
+// branch would print the session cookie, X-API-Key and X-CSRF-Token outside the
+// slog handler entirely.
+func TestPanicIsRecoveredWithoutDumpingTheRequest(t *testing.T) {
+	server := newTestServer(t)
+	var dump bytes.Buffer
+	original := gin.DefaultErrorWriter
+	gin.DefaultErrorWriter = &dump
+	t.Cleanup(func() { gin.DefaultErrorWriter = original })
+
+	router := gin.New()
+	_ = router.SetTrustedProxies(nil)
+	router.Use(gin.RecoveryWithWriter(nil, recoveredPanic), requestID(), server.securityHeaders())
+	router.GET("/boom", func(*gin.Context) { panic("handler exploded") })
+	// A broken pipe is the branch that used to dump unconditionally.
+	router.GET("/pipe", func(*gin.Context) { panic(&net.OpError{Op: "write", Err: syscall.EPIPE}) })
+
+	request := httptest.NewRequest(http.MethodGet, "/boom", nil)
+	request.AddCookie(&http.Cookie{Name: sessionservice.CookieName, Value: "session-token-that-must-not-be-logged"})
+	request.Header.Set("X-API-Key", testAPIKey)
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500", response.Code)
+	}
+	var envelope errorEnvelope
+	if err := json.Unmarshal(response.Body.Bytes(), &envelope); err != nil {
+		t.Fatalf("panic response is not the error envelope: %s", response.Body.String())
+	}
+	if envelope.Error.Code != "internal_error" || envelope.Error.RequestID == "" {
+		t.Fatalf("envelope = %+v", envelope.Error)
+	}
+
+	pipe := httptest.NewRequest(http.MethodGet, "/pipe", nil)
+	pipe.AddCookie(&http.Cookie{Name: sessionservice.CookieName, Value: "session-token-that-must-not-be-logged"})
+	router.ServeHTTP(httptest.NewRecorder(), pipe)
+
+	if dump.Len() != 0 {
+		t.Fatalf("gin wrote %d bytes to DefaultErrorWriter: %s", dump.Len(), dump.String())
+	}
+}
+
 // TestSessionCookieIsHardened checks the flags rather than the value: HttpOnly and
 // SameSite are what keep the token out of reach of injected script and cross-site
 // requests.
@@ -445,7 +533,7 @@ func newTestServer(t *testing.T) *Server {
 func probeRouter(server *Server) *gin.Engine {
 	router := gin.New()
 	_ = router.SetTrustedProxies(nil)
-	router.Use(gin.Recovery(), requestID(), securityHeaders())
+	router.Use(gin.RecoveryWithWriter(nil, recoveredPanic), requestID(), server.securityHeaders())
 	group := router.Group("/probe")
 	group.Use(server.authenticate())
 	handler := func(c *gin.Context) { c.String(http.StatusOK, c.GetString("auth_method")) }

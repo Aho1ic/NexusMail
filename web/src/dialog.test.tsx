@@ -17,6 +17,7 @@ vi.mock('./lib/api', () => ({
   api: {
     drafts: vi.fn(async () => ({ items: [] })),
     draft: vi.fn(async () => ({ draft: null, attachments: [] })),
+    deleteAccount: vi.fn(async () => undefined),
   },
   isAuthenticated: () => true,
 }))
@@ -29,7 +30,7 @@ const dialogs: Record<string, (onClose: () => void) => React.ReactElement> = {
   '连接邮箱': onClose => <AccountDialog onClose={onClose} onCreated={() => {}} />,
   '草稿与发件箱': onClose => <OutboxDialog onClose={onClose} onEdit={() => {}} />,
   '新邮件': onClose => <Composer accounts={accounts} replyTo={null} initialDraft={null} onClose={onClose} onSent={() => {}} />,
-  '设置': onClose => <SettingsDialog preferences={defaultPreferences} accounts={[]} onChange={() => {}} onClose={onClose} onAddAccount={() => {}} onLogout={() => {}} />,
+  '设置': onClose => <SettingsDialog preferences={defaultPreferences} accounts={[]} onChange={() => {}} onClose={onClose} onAddAccount={() => {}} onDeleted={() => {}} onLogout={() => {}} />,
 }
 
 describe('dialog behaviour is the same for every modal', () => {
@@ -63,7 +64,7 @@ describe('dialog behaviour is the same for every modal', () => {
   // keeps answering Escape for whatever is on screen next.
   it('stops answering Escape once unmounted', () => {
     const onClose = vi.fn()
-    const view = render(<SettingsDialog preferences={defaultPreferences} accounts={[]} onChange={() => {}} onClose={onClose} onAddAccount={() => {}} onLogout={() => {}} />)
+    const view = render(<SettingsDialog preferences={defaultPreferences} accounts={[]} onChange={() => {}} onClose={onClose} onAddAccount={() => {}} onDeleted={() => {}} onLogout={() => {}} />)
     view.unmount()
     fireEvent.keyDown(window, { key: 'Escape' })
     expect(onClose).not.toHaveBeenCalled()

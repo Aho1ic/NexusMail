@@ -44,6 +44,20 @@ func TestClassifyMailboxByName(t *testing.T) {
 		{"Draftsman", "custom", "lazy"},
 		{"Trashy Novels", "custom", "lazy"},
 		{"Inboxing Tips", "custom", "lazy"},
+		// "INBOX." is the standard hierarchy prefix, so a folder under it yields the
+		// "inbox" token alongside its own. The inbox rule used to win the first-match
+		// loop, producing a second realtime role='inbox' mailbox that joined the
+		// unified feed and could capture the 5s probe and the IDLE SELECT ahead of the
+		// real INBOX. The specific role has to be tested first.
+		{"INBOX.Sent", "sent", "periodic"},
+		{"INBOX.Drafts", "drafts", "periodic"},
+		{"INBOX.Trash", "trash", "lazy"},
+		{"INBOX/Junk", "junk", "lazy"},
+		{"INBOX.Archive", "archive", "periodic"},
+		{"收件箱/已发送", "sent", "periodic"},
+		// A container that is genuinely only an inbox variant still classifies as one:
+		// nothing more specific matches it.
+		{"Inbox Backup", "inbox", "realtime"},
 	}
 	for _, item := range cases {
 		role, syncMode := ClassifyMailbox(item.name, nil)

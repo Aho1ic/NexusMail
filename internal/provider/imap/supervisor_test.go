@@ -792,3 +792,46 @@ func TestRuntimeLockTwoLevelPreemption(t *testing.T) {
 	}
 	rt.unlock()
 }
+
+// StopAccount is what the account-delete path calls, so it has to retire one
+// account's runtime while the rest of the supervisor keeps running, and it must
+// return without waiting on the shared WaitGroup — the loops it just cancelled are
+// on it, along with the four body workers, so waiting would block on unrelated
+// goroutines and a later Stop would never complete.
+func TestStopAccountRetiresOneRuntime(t *testing.T) {
+	h := newHarness(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := h.supervisor.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	waitConnected(t, h)
+
+	if _, err := h.supervisor.runtime(h.account.ID); err != nil {
+		t.Fatalf("runtime missing before StopAccount: %v", err)
+	}
+	// An id that was never started is the common race with a delete, and must not
+	// disturb the account that is running.
+	h.supervisor.StopAccount(999999)
+	if _, err := h.supervisor.runtime(h.account.ID); err != nil {
+		t.Fatalf("an unknown id disturbed a live runtime: %v", err)
+	}
+
+	h.supervisor.StopAccount(h.account.ID)
+	if _, err := h.supervisor.runtime(h.account.ID); err == nil {
+		t.Fatal("the runtime is still registered after StopAccount")
+	}
+	// Calling it twice is not an error either: the transport can retry a delete.
+	h.supervisor.StopAccount(h.account.ID)
+
+	// Stop still has to complete: the cancelled loops leave the WaitGroup on their
+	// own. This is where a StopAccount that waited, or held the mutex while
+	// waiting, would hang the test.
+	stopped := make(chan struct{})
+	go func() { h.supervisor.Stop(); close(stopped) }()
+	select {
+	case <-stopped:
+	case <-time.After(30 * time.Second):
+		t.Fatal("Stop did not return after StopAccount")
+	}
+}

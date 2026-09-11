@@ -654,6 +654,84 @@ func TestAccessTokenAcceptsAResponseWithNoScope(t *testing.T) {
 	}
 }
 
+// recordingStore captures what the manager persists after a refresh.
+type recordingStore struct {
+	mu      sync.Mutex
+	ids     []int64
+	tokens  []string
+	failure error
+}
+
+func (r *recordingStore) UpdateRefreshToken(_ context.Context, accountID int64, refreshToken string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.ids = append(r.ids, accountID)
+	r.tokens = append(r.tokens, refreshToken)
+	return r.failure
+}
+
+func (r *recordingStore) snapshot() ([]int64, []string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]int64(nil), r.ids...), append([]string(nil), r.tokens...)
+}
+
+// Microsoft's v2.0 endpoint rotates the refresh token on every refresh and
+// invalidates the one presented, so a rotated token that stays in memory leaves the
+// account dead at the next cold start with no way back but re-authorizing.
+func TestAccessTokenPersistsARotatedRefreshToken(t *testing.T) {
+	manager := configuredManager()
+	store := &recordingStore{}
+	manager.SetCredentialStore(store)
+	transport := &stubTransport{tokenBody: tokenJSON("rotated-token", "https://outlook.office.com/IMAP.AccessAsUser.All", 3600)}
+
+	if _, err := manager.AccessToken(stubContext(transport), oauthAccount(7, "outlook"), "original-token"); err != nil {
+		t.Fatal(err)
+	}
+	ids, tokens := store.snapshot()
+	if len(tokens) != 1 || tokens[0] != "rotated-token" || ids[0] != 7 {
+		t.Fatalf("persisted ids=%v tokens=%v", ids, tokens)
+	}
+}
+
+// Most providers return the same refresh token, or none at all, on every refresh.
+// Neither is a rotation, and writing the account row for either would reseal the
+// credential on every reconnect.
+func TestAccessTokenDoesNotPersistAnUnchangedRefreshToken(t *testing.T) {
+	for name, body := range map[string]string{
+		"same token": tokenJSON("original-token", "https://mail.google.com/", 3600),
+		"no token":   tokenJSON("", "https://mail.google.com/", 3600),
+	} {
+		t.Run(name, func(t *testing.T) {
+			manager := configuredManager()
+			store := &recordingStore{}
+			manager.SetCredentialStore(store)
+			if _, err := manager.AccessToken(stubContext(&stubTransport{tokenBody: body}), oauthAccount(1, "gmail"), "original-token"); err != nil {
+				t.Fatal(err)
+			}
+			if _, tokens := store.snapshot(); len(tokens) != 0 {
+				t.Fatalf("persisted %v for an unchanged refresh token", tokens)
+			}
+		})
+	}
+}
+
+// The access token in hand is valid, so a failed persist must not fail the caller's
+// IMAP or SMTP operation: that would turn a durability problem into an outage.
+func TestAccessTokenSurvivesAFailedPersist(t *testing.T) {
+	manager := configuredManager()
+	manager.SetCredentialStore(&recordingStore{failure: errors.New("database is locked")})
+	transport := &stubTransport{tokenBody: tokenJSON("rotated-token", "https://mail.google.com/", 3600)}
+
+	token, err := manager.AccessToken(stubContext(transport), oauthAccount(1, "gmail"), "original-token")
+	if err != nil {
+		t.Fatalf("a failed persist failed the caller: %v", err)
+	}
+	if token != "access-token-value" {
+		t.Fatalf("token = %q", token)
+	}
+}
+
 func TestProviderConfigRedirectURIMatchesThePublicURL(t *testing.T) {
 	cfg := config.Config{PublicURL: "https://mail.example.com"}
 	cfg.Google.ClientID, cfg.Google.ClientSecret = "id", "secret"

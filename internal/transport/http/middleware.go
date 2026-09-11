@@ -69,19 +69,37 @@ func requestID() gin.HandlerFunc {
 		c.Next()
 	}
 }
-func securityHeaders() gin.HandlerFunc {
+
+// securityHeaders is a method because HSTS is only correct over TLS. The scheme in
+// PublicURL is the same signal the session cookie's Secure flag is decided from, so
+// both agree about what the deployment is.
+func (s *Server) securityHeaders() gin.HandlerFunc {
+	https := strings.HasPrefix(s.cfg.PublicURL, "https://")
 	return func(c *gin.Context) {
 		c.Header("X-Content-Type-Options", "nosniff")
 		c.Header("Referrer-Policy", "no-referrer")
 		c.Header("X-Frame-Options", "DENY")
+		if https {
+			// Only when the deployment is really HTTPS: a browser ignores HSTS on a
+			// plain-HTTP response anyway, and if one ever reached a client over TLS
+			// for a host that is served over http, it would pin that host to a scheme
+			// the deployment does not answer on for a year.
+			c.Header("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+		}
 		// frame-ancestors 'none' is the modern equivalent of X-Frame-Options DENY
 		// and is the only directive that actually stops the SPA from being iframed
 		// by a hostile site; without it the cookie+CSRF auth model would let
 		// clickjacking drive state-changing endpoints.
-		c.Header("Content-Security-Policy", "default-src 'self'; connect-src 'self' ws: wss:; img-src 'self' data: http: https:; style-src 'self' 'unsafe-inline'; script-src 'self'; frame-src 'self'; frame-ancestors 'none'")
+		//
+		// connect-src is 'self' alone: ws:/wss: are scheme-only sources, which match
+		// any host, and the only socket the app opens is the same-origin one in
+		// useRealtime — already covered by 'self'. img-src keeps http:/https: because
+		// that is the deliberate remote-image valve, not an oversight.
+		c.Header("Content-Security-Policy", "default-src 'self'; connect-src 'self'; img-src 'self' data: http: https:; style-src 'self' 'unsafe-inline'; script-src 'self'; frame-src 'self'; frame-ancestors 'none'")
 		c.Next()
 	}
 }
+
 func sameOrigin(request *http.Request, publicURL string) bool {
 	origin := request.Header.Get("Origin")
 	if origin == "" {

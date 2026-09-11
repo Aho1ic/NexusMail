@@ -35,10 +35,18 @@ export function MessageList({ visible, title, messages, accountMap, selected, un
       <div className="flex items-center justify-between"><button onClick={onOpenNav} aria-label="打开文件夹" className="md:hidden"><Menu size={21} /></button><div><p className="text-[10px] font-bold uppercase tracking-[.2em] text-pine/40">Nexus stream</p><h1 className="font-serif text-2xl">{title}</h1></div><div className="flex gap-1"><button onClick={onMarkViewRead} disabled={markingRead || unreadCount === 0} className="icon-button disabled:opacity-35" title={unreadCount ? `将当前视图的 ${unreadCount} 封未读邮件标记为已读` : '当前视图没有未读邮件'} aria-label="全部已读">{markingRead ? <LoaderCircle size={17} className="animate-spin" /> : <CheckCheck size={17} />}</button><button onClick={onRefresh} className="icon-button" aria-label="刷新"><RefreshCw size={17} className={loading ? 'animate-spin' : ''} /></button></div></div>
       <div className="relative mt-4"><Search className="absolute left-3 top-1/2 -translate-y-1/2 text-black/30" size={16} /><input value={query} onChange={event => onQueryChange(event.target.value)} className="w-full rounded-2xl border border-black/5 bg-white py-2.5 pl-9 pr-8 text-sm shadow-lift-1 outline-none ring-pine/20 transition focus:shadow-lift-2 focus:ring-2" placeholder="搜索主题、发件人或正文…" />{query && <button onClick={() => onQueryChange('')} className="absolute right-2.5 top-1/2 -translate-y-1/2 text-black/30"><X size={15} /></button>}</div>
     </header>
-    <div className="flex-1 overflow-y-auto p-2" aria-label="邮件列表">
-      {error && <div className="m-3 rounded-card bg-red-50 p-3 text-xs text-red-700 shadow-lift-1">{error}</div>}
+    {/* aria-label sat on a bare div with no role, so it named nothing and never
+        reached assistive tech. The label belongs to the list, and the rows are its
+        items; the error, the empty state and the load-more button are not, so the
+        role goes on an inner wrapper rather than the scroll container. aria-busy
+        covers the fetch, during which the pane renders neither rows nor the empty
+        state and would otherwise be a silently blank region. */}
+    <div className="flex-1 overflow-y-auto p-2" aria-busy={loading}>
+      {error && <div role="alert" className="m-3 rounded-card bg-red-50 p-3 text-xs text-red-700 shadow-lift-1">{error}</div>}
       {!loading && messages.length === 0 && <EmptyState />}
-      {messages.map(message => <MessageRow key={message.id} message={message} account={accountMap.get(message.account_id)} active={selected?.id === message.id} revealed={revealID === message.id} onClick={() => onOpen(message)} />)}
+      <div role="list" aria-label="邮件列表">
+        {messages.map(message => <div role="listitem" key={message.id}><MessageRow message={message} account={accountMap.get(message.account_id)} active={selected?.id === message.id} revealed={revealID === message.id} onClick={() => onOpen(message)} /></div>)}
+      </div>
       {cursor && <button disabled={loading} onClick={onLoadMore} className="my-3 w-full rounded-2xl py-3 text-xs font-semibold text-pine/60 transition hover:bg-sage/40">{loading ? '加载中…' : '加载更多'}</button>}
     </div>
   </section>

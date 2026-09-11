@@ -5,7 +5,9 @@ package send
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -397,6 +399,94 @@ func TestSentSnippetIsTruncated(t *testing.T) {
 	if sent.BodyText != long {
 		t.Fatalf("body_text is %d bytes, want the full %d", len(sent.BodyText), len(long))
 	}
+}
+
+// A reply has to carry In-Reply-To and References or it arrives as a new thread in
+// Gmail, Outlook and Apple Mail. References is the ancestor's own chain plus the
+// ancestor's Message-ID (RFC 5322 3.6.4), and the local Sent row stores the same
+// ancestry so our own list view groups the pair the way every other client does.
+func TestDeliverThreadsAReply(t *testing.T) {
+	h := newHarness(t, &backend{})
+	source := h.sourceMessage(t, "<parent@example.com>", `["<root@example.com>"]`)
+	draft := h.queueDraft(t, "Re: threading", "replying")
+	if err := h.exec(t, `UPDATE drafts SET source_message_id = ? WHERE id = ?`, source, draft.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	h.worker.deliver(context.Background(), draft.ID)
+
+	if status := h.draft(t, draft.ID).Status; status != "sent" {
+		t.Fatalf("status = %q", status)
+	}
+	transmitted := h.backend.messages()[0]
+	if !strings.Contains(transmitted, "In-Reply-To: <parent@example.com>") {
+		t.Fatalf("In-Reply-To missing:\n%s", transmitted)
+	}
+	if !strings.Contains(transmitted, "References: <root@example.com> <parent@example.com>") {
+		t.Fatalf("References chain wrong:\n%s", transmitted)
+	}
+
+	page, err := h.repo.ListMessages(context.Background(), ports.MessageFilter{AccountID: &h.account.ID, Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sent domain.Message
+	for _, item := range page.Items {
+		if item.Direction == "outgoing" {
+			sent, _, err = h.repo.GetMessage(context.Background(), item.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if sent.InReplyTo == nil || *sent.InReplyTo != "<parent@example.com>" {
+		t.Fatalf("sent row in_reply_to = %v", sent.InReplyTo)
+	}
+	var stored []string
+	if err := json.Unmarshal([]byte(sent.ReferencesJSON), &stored); err != nil {
+		t.Fatalf("references_json = %s: %v", sent.ReferencesJSON, err)
+	}
+	if len(stored) != 2 || stored[0] != "<root@example.com>" || stored[1] != "<parent@example.com>" {
+		t.Fatalf("sent row references = %v", stored)
+	}
+}
+
+// A source message the user has since deleted must not fail the send: threading is
+// cosmetic, delivery is not.
+func TestDeliverSendsWhenTheSourceMessageIsGone(t *testing.T) {
+	h := newHarness(t, &backend{})
+	draft := h.queueDraft(t, "orphan reply", "replying")
+	if err := h.exec(t, `PRAGMA foreign_keys=off; UPDATE drafts SET source_message_id = 999999 WHERE id = ?`, draft.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	h.worker.deliver(context.Background(), draft.ID)
+
+	if status := h.draft(t, draft.ID).Status; status != "sent" {
+		t.Fatalf("status = %q, want sent", status)
+	}
+	if strings.Contains(h.backend.messages()[0], "In-Reply-To:") {
+		t.Fatal("threaded against a message that does not exist")
+	}
+}
+
+// sourceMessage stores the message a reply answers and returns its id. The Sent
+// writer is used because it is the one path that creates a message row without a
+// mailbox mapping, which is all this needs.
+func (h *harness) sourceMessage(t *testing.T, rfcID, referencesJSON string) int64 {
+	t.Helper()
+	now := time.Now().UnixMilli()
+	digest := sha256.Sum256([]byte(rfcID))
+	message := domain.Message{
+		AccountID: h.account.ID, Direction: "incoming", DedupeKey: digest[:], RFCMessageID: &rfcID,
+		Subject: "threading", Sender: "them@example.com", Recipients: "sender@example.com",
+		FromJSON: "[]", ToJSON: "[]", CCJSON: "[]", BCCJSON: "[]", ReplyToJSON: "[]", ReferencesJSON: referencesJSON,
+		BodyState: "ready", ReceivedAt: now, CreatedAt: now, UpdatedAt: now,
+	}
+	if err := h.repo.CreateSentMessage(context.Background(), &message, 0); err != nil {
+		t.Fatal(err)
+	}
+	return message.ID
 }
 
 // Recipients across To, CC and BCC must all receive the message, and BCC must not

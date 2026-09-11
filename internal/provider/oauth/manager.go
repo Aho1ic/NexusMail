@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strings"
 	"sync"
@@ -37,6 +38,28 @@ type Manager struct {
 	mu     sync.Mutex
 	states map[string]stateEntry
 	tokens map[int64]*cachedToken
+	// credentials persists a rotated refresh token. It is optional and injected
+	// after construction because the account service that implements it is built
+	// on top of this manager, and taking it in New would close that cycle.
+	credentials CredentialStore
+}
+
+// CredentialStore writes a refreshed refresh token back to the account's sealed
+// credential.
+type CredentialStore interface {
+	UpdateRefreshToken(ctx context.Context, accountID int64, refreshToken string) error
+}
+
+func (m *Manager) SetCredentialStore(store CredentialStore) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.credentials = store
+}
+
+func (m *Manager) credentialStore() CredentialStore {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.credentials
 }
 
 func New(cfg config.Config) *Manager {
@@ -122,6 +145,20 @@ func (m *Manager) AccessToken(ctx context.Context, account domain.Account, refre
 		return "", err
 	}
 	entry.Token = token
+	// Microsoft's v2.0 endpoint rotates the refresh token on every refresh and
+	// invalidates the one presented. SecretCiphertext is written once at account
+	// creation, so without this the app keeps presenting a superseded token and the
+	// account dies at the next cold start with no path to recover short of
+	// re-authorizing. Persisted under entry.mu so the write cannot interleave with
+	// another refresh for the same account and store the older of the two.
+	if store := m.credentialStore(); store != nil && token.RefreshToken != "" && token.RefreshToken != refreshToken {
+		if err := store.UpdateRefreshToken(ctx, account.ID, token.RefreshToken); err != nil {
+			// Logged, not returned: the access token in hand is valid, so failing the
+			// caller's IMAP or SMTP operation would turn a durability problem into an
+			// outage. The next refresh tries again.
+			slog.Warn("persist rotated refresh token", "account_id", account.ID, "error", err)
+		}
+	}
 	return token.AccessToken, nil
 }
 

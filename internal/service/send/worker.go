@@ -40,6 +40,7 @@ type Store interface {
 	GetDraft(context.Context, int64) (domain.Draft, []domain.DraftAttachment, error)
 	GetAccount(context.Context, int64) (domain.Account, error)
 	GetBlob(context.Context, int64) (domain.BlobObject, error)
+	GetMessage(context.Context, int64) (domain.Message, []domain.Attachment, error)
 	ListMessages(context.Context, ports.MessageFilter) (ports.MessagePage, error)
 	CreateSentMessage(context.Context, *domain.Message, int64) error
 }
@@ -148,7 +149,11 @@ func (w *Worker) deliver(ctx context.Context, id int64) {
 			return
 		}
 	}
-	message, recipients, err := w.compose(ctx, account, draft, attachments)
+	// Resolved once here and handed to both compose and complete: the wire headers
+	// and the local Sent row have to describe the same thread, and one read of the
+	// source message serves both.
+	thread := w.ancestry(ctx, draft)
+	message, recipients, err := w.compose(ctx, account, draft, attachments, thread)
 	if err != nil {
 		w.fail(ctx, draft, err, false, 0)
 		return
@@ -180,13 +185,52 @@ func (w *Worker) deliver(ctx context.Context, id int64) {
 		w.fail(ctx, draft, err, true, 0)
 		return
 	}
-	w.complete(ctx, account, draft, message)
+	w.complete(ctx, account, draft, message, thread)
+}
+
+// ancestry resolves the reply headers for a draft written in reply to a stored
+// message. Everything is best-effort: a source row the user has since deleted, or
+// one whose Message-ID the provider never supplied, must not fail the send — a
+// reply that threads as a new conversation is a cosmetic loss, a reply that never
+// leaves is not.
+func (w *Worker) ancestry(ctx context.Context, draft domain.Draft) threadRefs {
+	if draft.SourceMessageID == nil {
+		return threadRefs{}
+	}
+	source, _, err := w.repo.GetMessage(ctx, *draft.SourceMessageID)
+	if err != nil || source.RFCMessageID == nil || *source.RFCMessageID == "" {
+		return threadRefs{}
+	}
+	parent := *source.RFCMessageID
+	// RFC 5322 3.6.4: References is the parent's own References chain with the
+	// parent's Message-ID appended, which is what lets a client place the reply
+	// under the whole thread rather than only under its immediate parent.
+	var inherited []string
+	_ = json.Unmarshal([]byte(source.ReferencesJSON), &inherited)
+	return threadRefs{inReplyTo: parent, references: append(inherited, parent)}
+}
+
+// threadRefs carries a reply's ancestry from the source message to both the
+// composed headers and the local Sent row. Empty means "not a reply".
+type threadRefs struct {
+	inReplyTo  string
+	references []string
+}
+
+// referencesJSON encodes the chain for storage. A reply with no ancestry stores
+// "[]" rather than the "null" a nil slice would marshal to, which is what every
+// other writer of this column stores.
+func (t threadRefs) referencesJSON() string {
+	if len(t.references) == 0 {
+		return "[]"
+	}
+	return encodeStrings(t.references)
 }
 
 // compose renders the draft into an RFC 5322 payload and the envelope recipient
 // list. Every attachment file descriptor it opens is also closed before it
 // returns, so the caller inherits nothing to clean up.
-func (w *Worker) compose(ctx context.Context, account domain.Account, draft domain.Draft, attachments []domain.DraftAttachment) ([]byte, []string, error) {
+func (w *Worker) compose(ctx context.Context, account domain.Account, draft domain.Draft, attachments []domain.DraftAttachment, thread threadRefs) ([]byte, []string, error) {
 	to, err := parseAddresses(draft.ToJSON)
 	if err != nil {
 		return nil, nil, err
@@ -220,7 +264,7 @@ func (w *Worker) compose(ctx context.Context, account domain.Account, draft doma
 	// already spent. Keeping the lifetime inside this function rather than handing
 	// closers back to the caller is what keeps an attachment's FD scoped to its
 	// actual use instead of to the whole send, SMTP round-trip included.
-	payload, err := mailbuilder.Compose(mailbuilder.Outgoing{MessageID: draft.RFCMessageID, From: from, To: to, CC: cc, BCC: bcc, Subject: draft.Subject, BodyText: draft.BodyText, Attachments: outgoingAttachments})
+	payload, err := mailbuilder.Compose(mailbuilder.Outgoing{MessageID: draft.RFCMessageID, From: from, To: to, CC: cc, BCC: bcc, Subject: draft.Subject, BodyText: draft.BodyText, InReplyTo: thread.inReplyTo, References: thread.references, Attachments: outgoingAttachments})
 	recipients := addressValues(append(append(append([]mail.Address{}, to...), cc...), bcc...))
 	return payload, recipients, err
 }
@@ -234,13 +278,22 @@ func (w *Worker) closeAll(closers []io.Closer) {
 	}
 }
 
-func (w *Worker) complete(ctx context.Context, account domain.Account, draft domain.Draft, payload []byte) {
+func (w *Worker) complete(ctx context.Context, account domain.Account, draft domain.Draft, payload []byte, thread threadRefs) {
 	now := time.Now().UnixMilli()
 	digest := sha256.Sum256([]byte(draft.RFCMessageID))
+	// The Sent row carries the same ancestry as the transmitted headers. Storing an
+	// empty chain here left the local copy outside the thread it was sent into, so
+	// the reply and the message it answers never grouped in our own list view even
+	// though every other client threaded them correctly.
+	var inReplyTo *string
+	if thread.inReplyTo != "" {
+		inReplyTo = &thread.inReplyTo
+	}
 	message := domain.Message{
 		AccountID: account.ID, Direction: "outgoing", DedupeKey: digest[:], RFCMessageID: &draft.RFCMessageID,
-		Subject: draft.Subject, Sender: account.Email, Recipients: recipientsText(draft), FromJSON: encodeStrings([]string{account.Email}),
-		ToJSON: draft.ToJSON, CCJSON: draft.CCJSON, BCCJSON: draft.BCCJSON, ReplyToJSON: "[]", ReferencesJSON: "[]",
+		InReplyTo: inReplyTo,
+		Subject:   draft.Subject, Sender: account.Email, Recipients: recipientsText(draft), FromJSON: encodeStrings([]string{account.Email}),
+		ToJSON: draft.ToJSON, CCJSON: draft.CCJSON, BCCJSON: draft.BCCJSON, ReplyToJSON: "[]", ReferencesJSON: thread.referencesJSON(),
 		Snippet: snippet(draft.BodyText, 240), BodyText: draft.BodyText, BodyState: "ready", SentAt: &now, ReceivedAt: now,
 		IsRead: true, CreatedAt: now, UpdatedAt: now,
 	}
@@ -279,7 +332,12 @@ func (w *Worker) fail(ctx context.Context, draft domain.Draft, err error, tempor
 	var next *int64
 	if temporary && draft.AttemptCount < 5 {
 		status = "retry_wait"
-		delay := []time.Duration{5 * time.Second, 30 * time.Second, 2 * time.Minute, 10 * time.Minute, 30 * time.Minute}[draft.AttemptCount-1]
+		// Four rungs for a five-attempt cap: ClaimSendableDraft has already
+		// incremented AttemptCount when this runs, so attempt N reads rung N-1 and
+		// the guard above stops at attempt 4. Attempt 5 is terminal, so a fifth
+		// rung could never be indexed — it was dead weight that read as a 30m
+		// retry the state machine never performs.
+		delay := []time.Duration{5 * time.Second, 30 * time.Second, 2 * time.Minute, 10 * time.Minute}[draft.AttemptCount-1]
 		value := time.Now().Add(delay).UnixMilli()
 		next = &value
 	}

@@ -76,7 +76,7 @@ func Compose(input Outgoing) ([]byte, error) {
 	writeQuotedPrintable(part, input.BodyText)
 	for _, attachment := range input.Attachments {
 		header := textproto.MIMEHeader{}
-		contentType := attachment.ContentType
+		contentType := headerSanitizer.Replace(attachment.ContentType)
 		if contentType == "" {
 			contentType = "application/octet-stream"
 		}
@@ -103,9 +103,18 @@ func Compose(input Outgoing) ([]byte, error) {
 	return output.Bytes(), nil
 }
 
+// headerSanitizer removes both CR and LF from a header value. Stripping CR alone
+// was not enough: MTAs and most parsers accept a bare LF as a line terminator, so
+// an embedded "\n" splits the header exactly as CRLF would and injects whatever
+// follows it. The guarantee has to be made here rather than inherited from the
+// callers that happen to Q-encode or otherwise neutralise their values — reply
+// threading feeds In-Reply-To and References straight from remote message
+// headers, which is precisely the untrusted case.
+var headerSanitizer = strings.NewReplacer("\r", "", "\n", "")
+
 func writeHeader(writer io.Writer, key, value string) {
 	if value != "" {
-		_, _ = fmt.Fprintf(writer, "%s: %s\r\n", key, strings.ReplaceAll(value, "\r", ""))
+		_, _ = fmt.Fprintf(writer, "%s: %s\r\n", key, headerSanitizer.Replace(value))
 	}
 }
 

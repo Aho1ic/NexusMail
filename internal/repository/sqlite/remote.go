@@ -36,17 +36,39 @@ func (s *Store) UpdateMailboxCursor(ctx context.Context, id int64, uidValidity, 
 func (s *Store) ResetMailbox(ctx context.Context, id int64, uidValidity uint32) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		// The mapped message ids are read before the mappings are dropped, for the
+		// same reason as in DeleteMailboxUIDs: afterwards there is nothing left to
+		// name them by, and they are what bounds the orphan sweep.
+		//
+		// The sweep used to be `id NOT IN (SELECT message_id FROM mailbox_messages)`
+		// over the whole messages table — the anti-pattern already removed from the
+		// sibling path. It scanned every message on a UIDVALIDITY reset and reached
+		// orphans belonging to other accounts, so one account's reset could delete
+		// another's rows.
+		var affected []int64
+		if err := tx.Raw("SELECT message_id FROM mailbox_messages WHERE mailbox_id = ?", id).Scan(&affected).Error; err != nil {
+			return err
+		}
 		if err := tx.Exec("DELETE FROM mailbox_messages WHERE mailbox_id = ?", id).Error; err != nil {
 			return err
 		}
-		if err := tx.Exec("DELETE FROM messages WHERE id NOT IN (SELECT message_id FROM mailbox_messages) AND direction = 'incoming'").Error; err != nil {
-			return err
+		for start := 0; start < len(affected); start += sqliteParameterChunk {
+			end := min(start+sqliteParameterChunk, len(affected))
+			if err := tx.Exec(orphanSweepSQL, affected[start:end]).Error; err != nil {
+				return err
+			}
 		}
 		return tx.Model(&domain.Mailbox{}).Where("id = ?", id).Updates(map[string]any{
 			"uid_validity": uidValidity, "last_uid": 0, "last_sync_at": nil, "updated_at": time.Now().UnixMilli(),
 		}).Error
 	})
+	if err == nil {
+		// A reset removes every message this mailbox held, so any memoised unread
+		// total that covered it is now wrong.
+		s.invalidateUnreadCache()
+	}
+	return err
 }
 
 // ReconcileMailboxFlags applies the provider's view of \Seen and \Flagged to the
@@ -191,6 +213,11 @@ func (s *Store) DeleteMailboxUIDs(ctx context.Context, mailboxID int64, stale []
 		}
 		return nil
 	})
+	if err == nil && removed > 0 {
+		// Expunged mail can be unread, so the memoised total no longer matches the
+		// set the feed will return.
+		s.invalidateUnreadCache()
+	}
 	return removed, err
 }
 
@@ -310,6 +337,16 @@ func (s *Store) MoveMessageLocation(ctx context.Context, messageID, sourceMailbo
 		}
 		if err := tx.Raw("SELECT flags_json, internal_date FROM mailbox_messages WHERE mailbox_id = ? AND message_id = ?", sourceMailboxID, messageID).Scan(&source).Error; err != nil {
 			return err
+		}
+		// Scan reports no error for zero rows, so a message that is not in the
+		// source mailbox leaves source zero-valued and FlagsJSON as "". Inserting
+		// that at the destination writes an empty string into a column whose
+		// contract is a JSON array defaulting to '[]', which is not parseable and
+		// which ReconcileMailboxFlags then rewrites on every pass. The move never
+		// happened remotely either, so the absent mapping is a 404, not a silent
+		// repair.
+		if source.FlagsJSON == "" {
+			return ports.NotFoundf("message is not in the source mailbox")
 		}
 		if err := tx.Exec("DELETE FROM mailbox_messages WHERE mailbox_id = ? AND message_id = ?", sourceMailboxID, messageID).Error; err != nil {
 			return err

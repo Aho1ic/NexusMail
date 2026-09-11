@@ -100,6 +100,7 @@ export const api = {
   },
   accounts: () => request<{ items: Account[] }>('/api/v1/accounts'),
   addAccount: (input: unknown) => request<Account | { authorization_url: string }>('/api/v1/accounts', { method: 'POST', body: JSON.stringify(input) }),
+  deleteAccount: (id: number) => request(`/api/v1/accounts/${id}`, { method: 'DELETE' }),
   mailboxes: (accountID: number) => request<{ items: Mailbox[] }>(`/api/v1/accounts/${accountID}/mailboxes`),
   messages: (params: URLSearchParams) => request<MessagePage>(`/api/v1/messages?${params}`),
   markAllRead: (params: URLSearchParams) => request<MarkReadResult>(`/api/v1/messages/mark-read?${params}`, { method: 'POST' }),

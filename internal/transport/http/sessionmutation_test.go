@@ -69,3 +69,56 @@ func TestMarkReadRequiresCSRFFromTheCurrentCookieSession(t *testing.T) {
 		t.Fatal("the matching session and CSRF token did not mark the message read")
 	}
 }
+
+// A websocket authenticates once at the upgrade and then streams events — otp_code
+// included — for as long as the socket lives. The watcher is what makes a logout or
+// an expired TTL actually disconnect it, so it has to cancel the context the hub is
+// serving on rather than wait for the client to go away.
+func TestWatchSessionCancelsWhenTheSessionIsGone(t *testing.T) {
+	h := newHarness(t)
+	token, _, _, err := h.server.sessions.Create(context.Background(), testAPIKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	// Still valid: the watcher must leave a live session alone.
+	go h.server.watchSession(ctx, cancel, token, time.Millisecond)
+	select {
+	case <-ctx.Done():
+		t.Fatal("the watcher cancelled a socket whose session is still valid")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	if err := h.server.sessions.Delete(context.Background(), token); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-ctx.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("the socket outlived the session it was opened with")
+	}
+}
+
+// The watcher runs on a context the handler defers cancel on, so it must exit with
+// it: a goroutine per socket that never returns is a leak for the life of the
+// process.
+func TestWatchSessionExitsWithTheHandler(t *testing.T) {
+	h := newHarness(t)
+	token, _, _, err := h.server.sessions.Create(context.Background(), testAPIKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		h.server.watchSession(ctx, cancel, token, time.Hour)
+		close(done)
+	}()
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the watcher is still running after its context was cancelled")
+	}
+}

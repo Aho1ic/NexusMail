@@ -21,6 +21,10 @@ type fakeStore struct {
 	validateCSRF  []byte
 	validateOK    bool
 	validateErr   error
+	touchHash     []byte
+	touchDeadline int64
+	touchCalls    int
+	touchErr      error
 	deletedHash   []byte
 	deleteErr     error
 	createdCalls  int
@@ -39,6 +43,11 @@ func (f *fakeStore) ValidateSession(_ context.Context, token []byte, now int64) 
 	f.validateCalls++
 	f.validateHash, f.validateNow = token, now
 	return f.validateCSRF, f.validateOK, f.validateErr
+}
+func (f *fakeStore) TouchSession(_ context.Context, token []byte, idleExpiresAt int64) error {
+	f.touchCalls++
+	f.touchHash, f.touchDeadline = token, idleExpiresAt
+	return f.touchErr
 }
 func (f *fakeStore) DeleteSession(_ context.Context, token []byte) error {
 	f.deletedHash = token
@@ -235,6 +244,94 @@ func TestDeleteHashesTheToken(t *testing.T) {
 	failing := newService(&fakeStore{deleteErr: errors.New("busy")})
 	if err := failing.Delete(context.Background(), "token"); err == nil {
 		t.Fatal("expected the store error")
+	}
+}
+
+// Create is the only other writer of expires_at, so without a slide on every real
+// request the session died idleTTL after login however actively it was used.
+func TestValidateSlidesTheIdleDeadline(t *testing.T) {
+	store := &fakeStore{validateOK: true}
+	service := newService(store)
+	before := time.Now()
+
+	valid, err := service.Validate(context.Background(), "token", "", false)
+	if err != nil || !valid {
+		t.Fatalf("Validate = %v, %v", valid, err)
+	}
+	if store.touchCalls != 1 {
+		t.Fatalf("TouchSession calls = %d, want 1", store.touchCalls)
+	}
+	tokenDigest := sha256.Sum256([]byte("token"))
+	if !bytes.Equal(store.touchHash, tokenDigest[:]) {
+		t.Fatal("slid the deadline for something other than the token hash")
+	}
+	// The new deadline is one idle window out. The clamp to the absolute cap is the
+	// repository's job, so what is checked here is the value handed to it.
+	slid := time.UnixMilli(store.touchDeadline)
+	if slid.Before(before.Add(29*time.Minute)) || slid.After(before.Add(31*time.Minute)) {
+		t.Fatalf("new deadline = %v, want about 30 minutes out from %v", slid, before)
+	}
+}
+
+// A request that fails CSRF is not activity by the session's owner. Renewing on it
+// would let someone holding only the cookie keep the session alive indefinitely.
+func TestValidateDoesNotSlideWhenTheRequestIsRejected(t *testing.T) {
+	digest := sha256.Sum256([]byte("real-csrf"))
+	for name, store := range map[string]*fakeStore{
+		"bad csrf":        {validateCSRF: digest[:], validateOK: true},
+		"unknown session": {validateOK: false},
+		"store failure":   {validateErr: errors.New("read failed")},
+	} {
+		t.Run(name, func(t *testing.T) {
+			service := newService(store)
+			if valid, _ := service.Validate(context.Background(), "token", "wrong-csrf", true); valid {
+				t.Fatal("a rejected request was accepted")
+			}
+			if store.touchCalls != 0 {
+				t.Fatalf("TouchSession calls = %d for a rejected request", store.touchCalls)
+			}
+		})
+	}
+}
+
+// The session is valid, so a failed slide must not turn a durability blip into a
+// 401. The cost is that this one request did not count as activity.
+func TestValidateSurvivesAFailedSlide(t *testing.T) {
+	store := &fakeStore{validateOK: true, touchErr: errors.New("database is locked")}
+	valid, err := newService(store).Validate(context.Background(), "token", "", false)
+	if err != nil || !valid {
+		t.Fatalf("a failed slide failed the request: %v, %v", valid, err)
+	}
+}
+
+// Alive is what the WebSocket watcher polls every 30s. Going through Validate would
+// make the watcher its own keep-alive: an open socket would renew its idle TTL
+// forever, defeating the stolen-cookie case the watcher exists for.
+func TestAliveChecksWithoutSliding(t *testing.T) {
+	store := &fakeStore{validateOK: true}
+	service := newService(store)
+
+	alive, err := service.Alive(context.Background(), "token")
+	if err != nil || !alive {
+		t.Fatalf("Alive = %v, %v", alive, err)
+	}
+	if store.touchCalls != 0 {
+		t.Fatalf("Alive slid the deadline %d times", store.touchCalls)
+	}
+	tokenDigest := sha256.Sum256([]byte("token"))
+	if !bytes.Equal(store.validateHash, tokenDigest[:]) {
+		t.Fatal("looked the session up by something other than the token hash")
+	}
+
+	// Expiry and logout still have to disconnect the socket, and a store failure is
+	// not a verdict.
+	expired := &fakeStore{validateOK: false}
+	if alive, err := newService(expired).Alive(context.Background(), "token"); err != nil || alive {
+		t.Fatalf("Alive = %v, %v for an expired session", alive, err)
+	}
+	want := errors.New("read failed")
+	if alive, err := newService(&fakeStore{validateErr: want}).Alive(context.Background(), "token"); !errors.Is(err, want) || alive {
+		t.Fatalf("Alive = %v, %v", alive, err)
 	}
 }
 

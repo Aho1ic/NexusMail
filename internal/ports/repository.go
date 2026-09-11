@@ -72,6 +72,13 @@ type AccountRepo interface {
 	GetAccount(context.Context, int64) (domain.Account, error)
 	ListAccounts(context.Context) ([]domain.Account, error)
 	UpdateAccountStatus(context.Context, int64, string, *string) error
+	// UpdateAccountSecret replaces the encrypted credential blob. The refresh
+	// token an OAuth provider rotates on every exchange is stored this way, so
+	// the next process start reuses the current token rather than the consumed one.
+	UpdateAccountSecret(context.Context, int64, []byte) error
+	// DeleteAccount removes an account and, through the schema's cascades, its
+	// mailboxes, messages and drafts.
+	DeleteAccount(context.Context, int64) error
 }
 
 // MailboxRepo persists the mailbox catalog and each mailbox's sync cursor.
@@ -152,6 +159,9 @@ type BlobRepo interface {
 type SessionRepo interface {
 	CreateSession(context.Context, []byte, []byte, int64, int64) error
 	ValidateSession(context.Context, []byte, int64) ([]byte, bool, error)
+	// TouchSession slides the idle deadline forward on activity, clamped to the
+	// session's absolute cap so renewal cannot extend a session indefinitely.
+	TouchSession(context.Context, []byte, int64) error
 	DeleteSession(context.Context, []byte) error
 	DeleteExpiredSessions(context.Context, int64) error
 }

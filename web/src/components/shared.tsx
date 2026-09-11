@@ -1,4 +1,4 @@
-import { useEffect } from 'react'
+import { useEffect, useRef } from 'react'
 import { Archive, AtSign, ChevronRight, Circle, Inbox, Mail, Send } from 'lucide-react'
 
 // Dialog is the one place the four modals agree on: the backdrop, Escape, and the
@@ -13,13 +13,39 @@ import { Archive, AtSign, ChevronRight, Circle, Inbox, Mail, Send } from 'lucide
 // and it autosaves every two seconds, so closing it parks a draft rather than
 // discarding one.
 export function Dialog({ label, onClose, className, children }: { label: string; onClose: () => void; className: string; children: React.ReactNode }) {
+  const panel = useRef<HTMLDivElement>(null)
   useEffect(() => {
     const handler = (event: KeyboardEvent) => { if (event.key === 'Escape') onClose() }
     addEventListener('keydown', handler)
     return () => removeEventListener('keydown', handler)
   }, [onClose])
+  // The containment role="dialog" aria-modal="true" already promises. Without it the
+  // panel never took focus, so Tab walked into the mailbox behind the dialog and the
+  // element that opened the dialog lost its place when the dialog went away.
+  useEffect(() => {
+    const opener = document.activeElement as HTMLElement | null
+    panel.current?.focus()
+    const trap = (event: KeyboardEvent) => {
+      if (event.key !== 'Tab' || !panel.current) return
+      // checkVisibility keeps a display:none control — the file input behind the
+      // paperclip is one — out of the cycle. jsdom has no layout and no such method,
+      // so there the element stays in it rather than being dropped silently.
+      const focusable = Array.from(panel.current.querySelectorAll<HTMLElement>('a[href],button:not([disabled]),input:not([disabled]),select:not([disabled]),textarea:not([disabled]),[tabindex]:not([tabindex="-1"])'))
+        .filter(element => element.checkVisibility?.() ?? true)
+      if (focusable.length === 0) { event.preventDefault(); panel.current.focus(); return }
+      // Focus starts on the panel, which is itself focusable, so Tab from there has
+      // to enter the cycle and Shift+Tab has to wrap to its far end. Both fall out of
+      // treating the panel as sitting just before the first element.
+      const edge = event.shiftKey ? focusable[0] : focusable[focusable.length - 1]
+      if (document.activeElement !== edge && document.activeElement !== panel.current) return
+      event.preventDefault()
+      ;(event.shiftKey ? focusable[focusable.length - 1] : focusable[0]).focus()
+    }
+    addEventListener('keydown', trap)
+    return () => { removeEventListener('keydown', trap); opener?.focus?.() }
+  }, [])
   return <div className="modal-backdrop">
-    <div role="dialog" aria-modal="true" aria-label={label} className={className}>{children}</div>
+    <div ref={panel} role="dialog" aria-modal="true" aria-label={label} tabIndex={-1} className={className}>{children}</div>
   </div>
 }
 

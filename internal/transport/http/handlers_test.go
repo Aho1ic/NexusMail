@@ -42,6 +42,7 @@ type fakeProvider struct {
 	mu sync.Mutex
 
 	started      []domain.Account
+	stopped      []int64
 	mailboxCalls []int64
 	mailboxErr   error
 
@@ -73,6 +74,18 @@ func (f *fakeProvider) StartAccount(_ context.Context, account domain.Account) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.started = append(f.started, account)
+}
+
+func (f *fakeProvider) StopAccount(id int64) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.stopped = append(f.stopped, id)
+}
+
+func (f *fakeProvider) stoppedIDs() []int64 {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]int64(nil), f.stopped...)
 }
 
 func (f *fakeProvider) RequestMailbox(_ context.Context, id int64) error {
@@ -204,6 +217,7 @@ type harness struct {
 	blobs    *storage.Store
 	provider *fakeProvider
 	sender   *fakeSender
+	blobDir  string
 }
 
 func newHarness(t *testing.T) *harness {
@@ -235,7 +249,21 @@ func newHarness(t *testing.T) *harness {
 		drafts,
 		sessionservice.New(repo, testAPIKey, time.Hour, 24*time.Hour),
 		oauth.New(cfg), remote, sender, hub, context.Background())
-	return &harness{t: t, server: server, router: server.routes(), repo: repo, blobs: blobs, provider: remote, sender: sender}
+	return &harness{t: t, server: server, router: server.routes(), repo: repo, blobs: blobs, provider: remote, sender: sender, blobDir: filepath.Join(dir, "blobs")}
+}
+
+// storedBlobFiles counts the blob files actually on disk. The blobs table only
+// exposes evictable rows through CachedBlobs, so a durable orphan is invisible to
+// every repository query a test can reach; the file count is what proves nothing
+// was written.
+func (h *harness) storedBlobFiles() int {
+	h.t.Helper()
+	// Put keys a blob as <digest[:2]>/<digest[2:4]>/<digest>.
+	matches, err := filepath.Glob(filepath.Join(h.blobDir, "*", "*", "*"))
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	return len(matches)
 }
 
 // do issues an API-key authenticated request, which is the channel external
@@ -525,6 +553,36 @@ func TestListAccountsHidesCredentials(t *testing.T) {
 		if strings.Contains(response.Body.String(), secret) {
 			t.Fatalf("%q was returned to the client", secret)
 		}
+	}
+}
+
+// Removing an account has to stop its IMAP loops before the rows go, or the live
+// supervisor keeps writing mailboxes and messages back for an account that is being
+// deleted.
+func TestDeleteAccountStopsSyncBeforeRemovingIt(t *testing.T) {
+	h := newHarness(t)
+	account := h.seedAccount()
+	response := h.do(http.MethodDelete, fmt.Sprintf("/api/v1/accounts/%d", account.ID), nil)
+	if response.Code != http.StatusNoContent {
+		t.Fatalf("status = %d: %s", response.Code, response.Body.String())
+	}
+	if stopped := h.provider.stoppedIDs(); len(stopped) != 1 || stopped[0] != account.ID {
+		t.Fatalf("StopAccount calls = %v, want [%d]", stopped, account.ID)
+	}
+	stored, err := h.repo.ListAccounts(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stored) != 0 {
+		t.Fatalf("accounts after the delete = %d, want 0", len(stored))
+	}
+}
+
+func TestDeleteAccountRejectsABadID(t *testing.T) {
+	h := newHarness(t)
+	h.expectError(h.do(http.MethodDelete, "/api/v1/accounts/0", nil), 400, "invalid_id")
+	if stopped := h.provider.stoppedIDs(); len(stopped) != 0 {
+		t.Fatalf("a rejected id still stopped %v", stopped)
 	}
 }
 

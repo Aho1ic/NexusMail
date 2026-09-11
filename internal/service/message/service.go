@@ -48,7 +48,17 @@ func (s *Service) Patch(ctx context.Context, id int64, patch ports.MessagePatch,
 		// {} nothing about what was wrong with the request.
 		return domain.Message{}, ports.Invalidf("empty message patch")
 	}
-	if s.remote != nil {
+	existing, _, err := s.repo.GetMessage(ctx, id)
+	if err != nil {
+		return domain.Message{}, err
+	}
+	// An outgoing row is the local copy of a sent message and has no
+	// mailbox_messages mapping by design, so every remote mutator resolves its
+	// location to ports.ErrNotFound and the transport answered 404 for an id whose
+	// GET returns 200 — starring your own sent mail failed. There is nothing on the
+	// provider to mutate for this row (the Sent copy the server keeps is a separate
+	// message with its own UID), so the patch is purely local.
+	if s.remote != nil && existing.Direction != "outgoing" {
 		if patch.IsRead != nil || patch.IsStarred != nil {
 			if err := s.remote.SetFlags(ctx, id, patch.IsRead, patch.IsStarred); err != nil {
 				return domain.Message{}, err

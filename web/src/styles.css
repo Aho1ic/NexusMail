@@ -1,4 +1,8 @@
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Newsreader:opsz,wght@6..72,500;6..72,600&display=swap');
+/* No webfont import here on purpose. A self-hosted mail client should not call a
+   third party on every load, and the app's own CSP would refuse it anyway: style-src
+   names no remote origin and there is no font-src, so it falls back to default-src
+   'self' and both the stylesheet and its woff2 files are blocked in production. The
+   real faces are the local stacks in tailwind.config.ts. */
 @tailwind base;
 @tailwind components;
 @tailwind utilities;

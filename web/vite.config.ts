@@ -11,6 +11,9 @@ export default defineConfig({
       '/readyz': 'http://localhost:8080',
     },
   },
-  build: { outDir: 'dist', sourcemap: true },
+  // No sourcemap in the production bundle: the SPA is served unauthenticated, so an
+  // emitted .js.map publishes the complete original TypeScript, sourcesContent and
+  // all, to anyone who asks for it.
+  build: { outDir: 'dist', sourcemap: false },
 })
 

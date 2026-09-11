@@ -1,17 +1,39 @@
 import { useState } from 'react'
-import { AtSign, Bell, Image, Keyboard, LogOut, Plus, X } from 'lucide-react'
+import { AtSign, Bell, Image, Keyboard, LogOut, Plus, Trash2, X } from 'lucide-react'
 import { Dialog } from './shared'
 import { providerLabel } from './providers'
-import { accountStatusLabel, formatFullDate } from '../lib/format'
+import { accountStatusLabel, formatFullDate, messageOf } from '../lib/format'
+import { APIError, api } from '../lib/api'
 import { notificationPermission, requestNotificationPermission, type Preferences } from '../lib/preferences'
 import type { Account } from '../types'
 
-type Props = { preferences: Preferences; accounts: Account[]; onChange: (patch: Partial<Preferences>) => void; onClose: () => void; onAddAccount: () => void; onLogout: () => void }
+type Props = { preferences: Preferences; accounts: Account[]; onChange: (patch: Partial<Preferences>) => void; onClose: () => void; onAddAccount: () => void; onDeleted: (id: number) => void; onLogout: () => void }
 
-export function SettingsDialog({ preferences, accounts, onChange, onClose, onAddAccount, onLogout }: Props) {
+export function SettingsDialog({ preferences, accounts, onChange, onClose, onAddAccount, onDeleted, onLogout }: Props) {
   const [permission, setPermission] = useState(notificationPermission)
   const [asking, setAsking] = useState(false)
+  // Deletion is irreversible and takes the account's stored mail with it, so it is
+  // confirmed in place and the row names what is about to go.
+  const [confirming, setConfirming] = useState<number | null>(null)
+  const [deleting, setDeleting] = useState<number | null>(null)
+  const [deleteError, setDeleteError] = useState('')
   async function askPermission() { setAsking(true); try { setPermission(await requestNotificationPermission()) } finally { setAsking(false) } }
+  async function remove(account: Account) {
+    setDeleting(account.id)
+    setDeleteError('')
+    try {
+      await api.deleteAccount(account.id)
+      setConfirming(null)
+      onDeleted(account.id)
+    } catch (err) {
+      // A 404 means it is already gone — a second tab or a repeated press got there
+      // first — which is the state the press was asking for, so it is not reported as
+      // a failure. Deletion is by primary key server-side and does not report a
+      // missing row, so this only shows up when the row was read before the delete.
+      if (err instanceof APIError && err.status === 404) { setConfirming(null); onDeleted(account.id); return }
+      setDeleteError(messageOf(err))
+    } finally { setDeleting(null) }
+  }
   return <Dialog label="设置" onClose={onClose} className="flex max-h-[min(88vh,780px)] w-[min(94vw,540px)] flex-col overflow-hidden rounded-panel bg-white shadow-glass-high">
       <header className="flex shrink-0 items-center justify-between border-b border-black/5 px-7 py-6"><div><p className="text-[10px] font-bold uppercase tracking-[.2em] text-pine/40">Preferences</p><h2 className="font-serif text-3xl">设置</h2></div><button onClick={onClose} className="icon-button" aria-label="关闭设置"><X size={19} /></button></header>
       <div className="flex-1 overflow-y-auto px-7 py-2">
@@ -44,6 +66,16 @@ export function SettingsDialog({ preferences, accounts, onChange, onClose, onAdd
             </div>
             <p className="mt-2 text-[11px] text-black/35">{accountStatusLabel(account.status)}{account.last_connected_at ? ` · 最近连接 ${formatFullDate(account.last_connected_at)}` : ''}</p>
             {account.last_error && <p className="mt-2 break-words rounded-xl bg-red-50 px-2.5 py-2 text-[11px] leading-4 text-red-700" role="alert">{account.last_error}</p>}
+            {confirming === account.id
+              ? <div className="mt-2.5 rounded-xl bg-red-50 p-3">
+                  <p className="text-[11px] leading-5 text-red-800">确认删除账户「{account.display_name || account.email}」（{account.email}）？该账户在本地保存的邮件、文件夹与草稿会一并删除，无法恢复。远端邮箱本身不受影响。</p>
+                  <div className="mt-2.5 flex gap-2">
+                    <button onClick={() => remove(account)} disabled={deleting === account.id} className="rounded-full bg-red-600 px-3 py-1.5 text-[11px] font-semibold text-white disabled:opacity-60">{deleting === account.id ? '删除中…' : '确认删除'}</button>
+                    <button onClick={() => { setConfirming(null); setDeleteError('') }} disabled={deleting === account.id} className="rounded-full bg-white px-3 py-1.5 text-[11px] font-semibold text-black/55">取消</button>
+                  </div>
+                  {deleteError && <p className="mt-2 break-words text-[11px] leading-4 text-red-700" role="alert">{deleteError}</p>}
+                </div>
+              : <button onClick={() => { setConfirming(account.id); setDeleteError('') }} aria-label={`删除账户 ${account.display_name || account.email}`} className="mt-2.5 flex items-center gap-1.5 text-[11px] font-semibold text-red-600 hover:text-red-700"><Trash2 size={13} />删除账户</button>}
           </div>)}
           <button onClick={onAddAccount} className="button-secondary w-full justify-center"><Plus size={15} />连接邮箱</button>
         </SettingsSection>

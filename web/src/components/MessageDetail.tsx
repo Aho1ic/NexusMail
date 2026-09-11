@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from 'react'
 import { Archive, ChevronDown, Copy, File, LoaderCircle, SquarePen, Star } from 'lucide-react'
 import { decodeEncodedWords, displaySender, formatBytes, formatFullDate } from '../lib/format'
-import { messageDocument, prepareMessageHTML } from '../lib/messagehtml'
+import { inlineImageRefs, messageDocument, prepareMessageHTML } from '../lib/messagehtml'
 import { copyText } from '../lib/notifications'
 import type { Message, MessageDetails } from '../types'
 import { Avatar } from './shared'
@@ -17,6 +17,11 @@ type Props = {
   onNotice: (text: string) => void
 }
 
+// noInlineSources is a shared empty map so the pre-resolution render and the
+// message-change reset both settle on one identity, which lets setState bail out
+// instead of scheduling a render that changes nothing.
+const noInlineSources: Map<string, string> = new Map()
+
 export function MessageDetail({ selected, details, autoLoadRemoteImages, onBack, onStar, onArchive, onReply, onNotice }: Props) {
   const message = details?.message ?? selected
   const bodyHTML = message.body_html ?? ''
@@ -24,7 +29,49 @@ export function MessageDetail({ selected, details, autoLoadRemoteImages, onBack,
   // Remote images are re-blocked per message unless the setting opts in, so
   // trusting one sender never silently leaks the next sender a read receipt.
   useEffect(() => setLoadRemoteImages(autoLoadRemoteImages), [message.id, autoLoadRemoteImages])
-  const renderedHTML = useMemo(() => prepareMessageHTML(bodyHTML, details?.attachments ?? [], message.id, loadRemoteImages), [bodyHTML, details?.attachments, message.id, loadRemoteImages])
+  const [inlineSources, setInlineSources] = useState(noInlineSources)
+  const attachments = details?.attachments
+  const inlineRefs = useMemo(() => inlineImageRefs(bodyHTML, attachments ?? [], message.id), [bodyHTML, attachments, message.id])
+  // The frame cannot fetch its own inline parts — see prepareMessageHTML — so the
+  // parent fetches them with its credentials and the bytes are substituted into the
+  // document before it is handed to srcDoc. Nothing is retained across messages:
+  // the map is dropped on every change and the request is aborted, so reading mail
+  // does not accumulate one resolved part per inline image per message.
+  useEffect(() => {
+    setInlineSources(noInlineSources)
+    if (inlineRefs.length === 0) return
+    const abort = new AbortController()
+    let live = true
+    void (async () => {
+      const resolved = await Promise.all(inlineRefs.map(async ref => {
+        try {
+          const response = await fetch(ref.url, { credentials: 'same-origin', signal: abort.signal })
+          if (!response.ok) return null
+          const blob = await response.blob()
+          // FileReader rather than a hand-rolled base64 pass: it takes arbitrary
+          // binary without a per-byte String.fromCharCode loop, and carries the
+          // part's own content type into the URL.
+          const source = await new Promise<string>((resolve, reject) => {
+            const reader = new FileReader()
+            reader.onerror = () => reject(reader.error)
+            reader.onload = () => resolve(String(reader.result))
+            reader.readAsDataURL(blob)
+          })
+          return [ref.contentID, source] as const
+        } catch {
+          // A part that cannot be fetched — 4xx, a transport failure, or the abort
+          // when the message changes — falls back to the blocked-image presentation,
+          // the same placeholder a blocked remote image gets.
+          return null
+        }
+      }))
+      if (!live) return
+      const next = new Map(resolved.filter((entry): entry is readonly [string, string] => entry !== null))
+      if (next.size > 0) setInlineSources(next)
+    })()
+    return () => { live = false; abort.abort() }
+  }, [inlineRefs])
+  const renderedHTML = useMemo(() => prepareMessageHTML(bodyHTML, inlineSources, loadRemoteImages), [bodyHTML, inlineSources, loadRemoteImages])
   const hasRemoteImages = bodyHTML.includes('data-nexusmail-remote-src')
   // The chip is both the Safari path (no notification buttons there) and the way
   // back to a code whose notification was dismissed or missed on a reconnect.

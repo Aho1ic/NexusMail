@@ -307,16 +307,20 @@ func TestDeleteDraftToleratesAMissingRemoteCopy(t *testing.T) {
 	}
 }
 
-// Any other remote failure blocks the delete: dropping the row locally while the
-// provider still has it means the draft reappears on the next sync.
-func TestDeleteDraftStopsOnAnUnexpectedRemoteFailure(t *testing.T) {
+// The local row goes first and an unexpected remote failure is logged rather than
+// returned: the delete the caller asked for did happen, so reporting 503 would
+// misreport it. A leftover remote copy is reconciled by the next draft sync, while
+// the expunge the old ordering ran first is irreversible.
+func TestDeleteDraftSucceedsDespiteAnUnexpectedRemoteFailure(t *testing.T) {
 	h := newHarness(t)
 	account := h.seedAccount()
 	draft := h.createDraft(map[string]any{"account_id": account.ID})
 	h.provider.set(func(f *fakeProvider) { f.deleteRemErr = unavailableError() })
-	h.expectError(h.do(http.MethodDelete, fmt.Sprintf("/api/v1/drafts/%d", draft.ID), nil), 503, "provider_unavailable")
-	if _, _, err := h.repo.GetDraft(context.Background(), draft.ID); err != nil {
-		t.Fatalf("the draft was deleted locally although the remote delete failed: %v", err)
+	if response := h.do(http.MethodDelete, fmt.Sprintf("/api/v1/drafts/%d", draft.ID), nil); response.Code != http.StatusNoContent {
+		t.Fatalf("status = %d: %s", response.Code, response.Body.String())
+	}
+	if _, _, err := h.repo.GetDraft(context.Background(), draft.ID); err == nil {
+		t.Fatal("the local row survived a delete that answered 204")
 	}
 }
 
@@ -412,6 +416,18 @@ func TestAddDraftAttachmentEnforcesTheSizeLimit(t *testing.T) {
 		Attachments []domain.DraftAttachment `json:"attachments"`
 	}](t, detail).Attachments); got != 0 {
 		t.Fatalf("attachments = %d after a rejected upload", got)
+	}
+}
+
+// A POST naming a draft that does not exist must be a 404 and must leave nothing on
+// disk. The blob is durable, and CachedBlobs only offers durability='cache' to the
+// evictor, so bytes stored before the draft was checked are unreclaimable for the
+// life of the deployment.
+func TestAddDraftAttachmentToAMissingDraftStoresNothing(t *testing.T) {
+	h := newHarness(t)
+	h.expectError(h.uploadAttachment(4242, "note.txt", []byte("orphan bytes")), 404, "not_found")
+	if got := h.storedBlobFiles(); got != 0 {
+		t.Fatalf("blob files on disk = %d after a rejected upload, want 0: the bytes can never be evicted", got)
 	}
 }
 

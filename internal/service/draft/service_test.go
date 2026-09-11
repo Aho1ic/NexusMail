@@ -275,8 +275,8 @@ func TestListPropagatesError(t *testing.T) {
 	}
 }
 
-// A draft the provider no longer has is the outcome the caller wanted, so only a
-// different remote failure may block the local delete.
+// A draft the provider no longer has is the outcome the caller wanted, so the
+// delete still succeeds.
 func TestDeleteTreatsRemoteNotFoundAsSuccess(t *testing.T) {
 	store := &fakeStore{}
 	remote := &fakeRemote{deleteErr: ports.NotFoundf("no such remote draft")}
@@ -290,16 +290,19 @@ func TestDeleteTreatsRemoteNotFoundAsSuccess(t *testing.T) {
 	}
 }
 
-func TestDeleteStopsOnOtherRemoteFailures(t *testing.T) {
+// The local row is gone by the time the expunge runs, so a remote failure cannot
+// be reported as a failed delete: the delete the caller asked for did happen. A
+// leftover remote copy is recoverable on the next sync; an expunged one is not.
+func TestDeleteReportsSuccessWhenOnlyTheRemoteFails(t *testing.T) {
 	store := &fakeStore{}
 	remote := &fakeRemote{deleteErr: errors.New("connection reset")}
 	service := New(store, &recorder{}, remote)
 
-	if err := service.Delete(context.Background(), 6); err == nil {
-		t.Fatal("expected the remote failure to block the local delete")
+	if err := service.Delete(context.Background(), 6); err != nil {
+		t.Fatalf("Delete = %v, want nil", err)
 	}
-	if store.deleteCalls != 0 {
-		t.Fatal("deleted locally while the provider still holds the draft")
+	if store.deleteCalls != 1 {
+		t.Fatalf("local delete calls = %d, want 1", store.deleteCalls)
 	}
 }
 
@@ -314,10 +317,16 @@ func TestDeleteWithoutRemoteDeletesLocally(t *testing.T) {
 	}
 }
 
+// The terminal-state guard lives in DeleteDraft, so a refused local delete must
+// leave the provider's copy alone: the expunge is irreversible.
 func TestDeletePropagatesLocalError(t *testing.T) {
-	service := New(&fakeStore{deleteErr: errors.New("busy")}, &recorder{}, nil)
+	remote := &fakeRemote{}
+	service := New(&fakeStore{deleteErr: errors.New("busy")}, &recorder{}, remote)
 	if err := service.Delete(context.Background(), 1); err == nil {
 		t.Fatal("expected the local delete error")
+	}
+	if remote.deleteCalls != 0 {
+		t.Fatal("expunged the remote copy after the local delete was refused")
 	}
 }
 

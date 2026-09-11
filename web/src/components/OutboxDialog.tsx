@@ -3,6 +3,7 @@ import { Bell, RefreshCw, X } from 'lucide-react'
 import { api } from '../lib/api'
 import { Dialog } from './shared'
 import { decodeAddressList, formatFullDate, messageOf } from '../lib/format'
+import { useRealtimeEvents } from '../hooks/useRealtime'
 import type { Draft } from '../types'
 
 export function OutboxDialog({ onClose, onEdit }: { onClose: () => void; onEdit: (draft: Draft) => void }) {
@@ -14,6 +15,13 @@ export function OutboxDialog({ onClose, onEdit }: { onClose: () => void; onEdit:
     try { setItems((await api.drafts()).items); setError('') } catch (err) { setError(messageOf(err)) } finally { setLoading(false) }
   }, [])
   useEffect(() => { load() }, [load])
+  // The pane used to load once on mount and subscribe to nothing, so an open
+  // 「草稿与发件箱」 still showed 「发送中」 after the send worker had already published
+  // sent or failed. Both event types are re-read because the outbox rows and the
+  // draft rows are the same list.
+  useRealtimeEvents(payload => {
+    if (payload.type === 'OUTBOX_UPDATED' || payload.type === 'DRAFT_UPDATED') void load()
+  })
   async function retry(id: number) { try { await api.retryDraft(id); await load() } catch (err) { setError(messageOf(err)) } }
   async function remove(id: number) { try { await api.deleteDraft(id); await load() } catch (err) { setError(messageOf(err)) } }
   return <Dialog label="草稿与发件箱" onClose={onClose} className="flex h-[min(86vh,680px)] w-[min(94vw,680px)] flex-col overflow-hidden rounded-panel bg-white shadow-glass-high">

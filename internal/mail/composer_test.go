@@ -95,6 +95,57 @@ func TestComposeCarriesReplyThreadingHeaders(t *testing.T) {
 	}
 }
 
+// A bare LF terminates a header line for MTAs and most parsers just as CRLF does, so
+// a value carrying one splits the header and injects whatever follows. The values that
+// reach here now include In-Reply-To and References derived from remote message
+// headers, so the filter has to live in Compose rather than in whichever caller
+// happens to encode first.
+func TestComposeStripsLineBreaksFromHeaderValues(t *testing.T) {
+	raw, err := Compose(Outgoing{
+		MessageID: "<new@example.com>",
+		From:      mail.Address{Address: "me@example.com"},
+		To:        []mail.Address{{Address: "you@example.com"}},
+		Subject:   "injected",
+		BodyText:  "body",
+		InReplyTo: "<parent@example.com>\nBcc: victim@example.com",
+		References: []string{
+			"<root@example.com>\r\nX-Injected: one",
+			"<parent@example.com>\nX-Injected: two",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	message := parseComposed(t, raw)
+	for _, key := range []string{"Bcc", "X-Injected"} {
+		if _, present := message.Header[key]; present {
+			t.Fatalf("%s was injected through a header value:\n%s", key, raw)
+		}
+	}
+	if got := message.Header.Get("In-Reply-To"); got != "<parent@example.com>Bcc: victim@example.com" {
+		t.Errorf("In-Reply-To = %q", got)
+	}
+
+	// The attachment Content-Type is interpolated into a MIME part header, so it
+	// carries the same exposure.
+	withAttachment, err := Compose(Outgoing{
+		From: mail.Address{Address: "me@example.com"}, To: []mail.Address{{Address: "you@example.com"}}, BodyText: "body",
+		Attachments: []OutgoingAttachment{{
+			Filename:    "notes.txt",
+			ContentType: "text/plain\r\nX-Part-Injected: yes",
+			Data:        strings.NewReader("payload"),
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The sanitised value still contains the text; what must not exist is a new
+	// header line carrying it.
+	if strings.Contains(string(withAttachment), "\nX-Part-Injected") {
+		t.Fatalf("a part header was injected through Content-Type:\n%s", withAttachment)
+	}
+}
+
 // TestComposeWrapsBase64AtSeventySixColumns is the one that matters most here. RFC 2045
 // caps an encoded line at 76 characters and RFC 5321 refuses a line over 998 octets
 // outright, so an unwrapped attachment is a message the server rejects or silently

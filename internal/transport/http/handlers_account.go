@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"nexusmail/internal/provider"
 	sessionservice "nexusmail/internal/service/session"
 
 	"github.com/gin-gonic/gin"
@@ -53,7 +54,17 @@ func (s *Server) createAccount(c *gin.Context) {
 		fail(c, 400, "invalid_request", err.Error(), nil)
 		return
 	}
-	if input.Provider == "gmail" || input.Provider == "outlook" {
+	// The preset already carries the decision, and the account service branches on
+	// the same field. Re-deriving it from a provider name list here meant a new
+	// oauth2 provider silently fell through to AddPassword and answered with the
+	// misleading "provider requires OAuth2" 400. Get also owns the unknown-provider
+	// rejection, so that 400 has one source instead of two.
+	preset, err := provider.Get(input.Provider)
+	if err != nil {
+		writeError(c, err)
+		return
+	}
+	if preset.AuthType == "oauth2" {
 		url, err := s.oauth.Start(input.Provider, input.DisplayName)
 		if err != nil {
 			writeError(c, err)
@@ -107,6 +118,23 @@ func (s *Server) listAccounts(c *gin.Context) {
 		return
 	}
 	c.JSON(200, gin.H{"items": items})
+}
+
+func (s *Server) deleteAccount(c *gin.Context) {
+	id, ok := idParam(c, "id")
+	if !ok {
+		return
+	}
+	// Loops first, rows second. A supervisor still running for this account holds a
+	// connection that keeps writing messages, mailboxes and status back, so deleting
+	// the rows underneath a live runtime races it into re-creating them — or into
+	// failing every write against an account that no longer exists.
+	s.sync.StopAccount(id)
+	if err := s.accounts.Delete(c.Request.Context(), id); err != nil {
+		writeError(c, err)
+		return
+	}
+	c.Status(http.StatusNoContent)
 }
 func (s *Server) listMailboxes(c *gin.Context) {
 	id, ok := idParam(c, "id")

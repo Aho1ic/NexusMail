@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { LoaderCircle, Paperclip, Send, X } from 'lucide-react'
-import { api } from '../lib/api'
+import { APIError, api } from '../lib/api'
 import { Dialog } from './shared'
 import { decodeAddressList, messageOf, splitEmails } from '../lib/format'
 import type { Account, Draft, DraftInput, Message } from '../types'
@@ -32,6 +32,11 @@ export function Composer({ accounts, replyTo, initialDraft, onClose, onSent }: P
   const input: DraftInput = useMemo(() => ({ account_id: accountID, to: splitEmails(to), cc: splitEmails(cc), bcc: splitEmails(bcc), subject, body_text: body }), [accountID, to, cc, bcc, subject, body])
   latest.current = input
 
+  // Four paths adopt a stored draft — create, update, the conflict re-read and the
+  // retry after it — and each has to move the ref and the state together. The ref is
+  // what the next save reads; the state is what disables the account picker.
+  const remember = useCallback((saved: Draft) => { draftRef.current = saved; setDraft(saved); return saved }, [])
+
   // persist writes the newest input and returns the stored draft. Callers never
   // pass the draft in: whether this is a create or an update is decided at the
   // moment the turn actually runs, after any earlier save has settled.
@@ -39,19 +44,39 @@ export function Composer({ accounts, replyTo, initialDraft, onClose, onSent }: P
     const run = saving.current.then(async () => {
       const payload = latest.current!
       const current = draftRef.current
-      const saved = current ? await api.updateDraft(current.id, current.revision, payload) : await api.createDraft(payload)
-      draftRef.current = saved
-      setDraft(saved)
-      return saved
+      if (!current) return remember(await api.createDraft(payload))
+      try { return remember(await api.updateDraft(current.id, current.revision, payload)) }
+      catch (err) {
+        // A 409 means the revision we hold is not the server's. Replaying it can only
+        // fail the same way, so every later autosave and the send itself failed
+        // identically with no way out of the composer. This is reachable in normal
+        // use: remote draft reconciliation bumps the revision, and the server also
+        // refuses an update once the status leaves draft/failed/unknown. Re-read the
+        // draft, adopt the server's revision and try once more.
+        if (!(err instanceof APIError) || err.status !== 409) throw err
+        const fresh = remember((await api.draft(current.id)).draft)
+        try { return remember(await api.updateDraft(fresh.id, fresh.revision, latest.current!)) }
+        catch (retryErr) {
+          if (retryErr instanceof APIError && retryErr.status === 409) throw new Error('这封草稿已在别处更新，关闭后从「草稿与发件箱」重新打开即可继续编辑')
+          throw retryErr
+        }
+      }
     })
     // Keep the chain alive after a rejection so one failed save does not wedge
     // every later one, while still surfacing the error to this caller.
     saving.current = run.catch(() => undefined)
     return run
-  }, [])
+  }, [remember])
 
   useEffect(() => {
     if (!accountID) return
+    // An untouched composer must not autosave. accountID defaults to the first
+    // account, so opening 「写邮件」 and pausing two seconds used to POST an empty
+    // draft, which the server APPENDs to the real remote Drafts folder — and closing
+    // the composer neither deleted nor flushed it, so every abandoned compose left a
+    // permanent empty draft locally and at the provider. attach() is unaffected: it
+    // calls persist() directly and has a file to justify the draft.
+    if (!input.to.length && !input.cc.length && !input.bcc.length && !input.subject.trim() && !input.body_text.trim()) return
     window.clearTimeout(timer.current)
     timer.current = window.setTimeout(async () => {
       try {

@@ -13,6 +13,7 @@
 /web/test-results/
 /internal/transport/http/static/dist/*
 !/internal/transport/http/static/dist/.gitkeep
+!/internal/transport/http/static/dist/placeholder.txt
 /web/*.tsbuildinfo
 /web/vite.config.js
 /web/vite.config.d.ts

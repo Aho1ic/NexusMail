@@ -130,6 +130,30 @@ func (s *Supervisor) StartAccount(parent context.Context, account domain.Account
 	go func() { defer s.wg.Done(); s.idleLoop(ctx, rt) }()
 }
 
+// StopAccount tears down one account's loops, leaving every other account running.
+// Unknown ids are a no-op: the caller is usually a delete that races the account
+// ever having been started.
+//
+// The runtime is unregistered under the lock and cancelled outside it, so this
+// cannot deadlock against the loops it is stopping — they take s.mu themselves via
+// runtime() and RequestMailbox. s.wg is deliberately not waited on: it is shared by
+// every loop and the four body workers, so waiting here would block on unrelated
+// goroutines, and doing so anywhere near the mutex is what would deadlock against
+// Stop(). The cancelled loops return on their own.
+func (s *Supervisor) StopAccount(accountID int64) {
+	s.mu.Lock()
+	rt := s.runtimes[accountID]
+	delete(s.runtimes, accountID)
+	s.mu.Unlock()
+	if rt == nil {
+		return
+	}
+	rt.cancel()
+	if client := rt.client.Load(); client != nil {
+		_ = client.Close()
+	}
+}
+
 func (s *Supervisor) Stop() {
 	s.mu.Lock()
 	if s.workerCancel != nil {

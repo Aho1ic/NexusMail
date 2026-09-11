@@ -1,0 +1,1 @@
+Keeps the go:embed dist pattern satisfiable before a build; make web-build overwrites this directory.

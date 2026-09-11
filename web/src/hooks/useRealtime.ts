@@ -2,7 +2,27 @@ import { useEffect, useRef } from 'react'
 import { loadPreferences } from '../lib/preferences'
 import type { EventEnvelope } from '../types'
 
-const realtimeEvents = ['NEW_EMAIL', 'MESSAGE_UPDATED', 'ACCOUNT_STATUS', 'OUTBOX_UPDATED']
+// DRAFT_UPDATED is published by the server and declared in the OpenAPI event enum,
+// but was missing here, so every one of them was discarded by this filter.
+const realtimeEvents = ['NEW_EMAIL', 'MESSAGE_UPDATED', 'ACCOUNT_STATUS', 'OUTBOX_UPDATED', 'DRAFT_UPDATED']
+
+// One socket serves the whole session, so a component that needs events of its own
+// registers here instead of connecting again. Module scope rather than context
+// because the socket already lives outside the React tree.
+const subscribers = new Set<(payload: EventEnvelope) => void>()
+
+// useRealtimeEvents delivers every accepted event to one extra listener. The
+// callback is held in a ref so a caller may pass an inline function without
+// re-subscribing on each render.
+export function useRealtimeEvents(onEvent: (payload: EventEnvelope) => void) {
+  const listener = useRef(onEvent)
+  useEffect(() => { listener.current = onEvent }, [onEvent])
+  useEffect(() => {
+    const forward = (payload: EventEnvelope) => listener.current(payload)
+    subscribers.add(forward)
+    return () => { subscribers.delete(forward) }
+  }, [])
+}
 
 // The socket handler calls notify() from outside the React tree, so the desktop
 // notification preference is mirrored here rather than read from state.
@@ -43,7 +63,10 @@ export function useRealtime(onChange: () => void, onEvent: (payload: EventEnvelo
       socket.onmessage = event => {
         let payload: EventEnvelope
         try { payload = JSON.parse(event.data) as EventEnvelope } catch { return }
-        if (realtimeEvents.includes(payload?.type)) { schedule(); events.current(payload) }
+        if (!realtimeEvents.includes(payload?.type)) return
+        schedule()
+        events.current(payload)
+        subscribers.forEach(subscriber => subscriber(payload))
       }
       socket.onclose = () => { if (!stopped) { timer = window.setTimeout(connect, delay); delay = Math.min(delay * 2, 10000) } }
     }

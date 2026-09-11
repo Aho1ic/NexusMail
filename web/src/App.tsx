@@ -101,7 +101,15 @@ function MailboxApp({ onLogout }: { onLogout: () => void }) {
   // state update would arrive one render too late.
   const pendingReveal = useRef(false)
 
+  // Every load that writes into state carries a generation. The guard exists
+  // because the abandoned view's response can arrive after the new one: switching
+  // account or mailbox, or opening a second message, leaves the first request in
+  // flight, and without this the later-resolving older response wins and renders a
+  // view nobody is looking at. Bumped on entry, compared before every write.
+  const generation = useRef(0)
+
   const loadMessages = useCallback(async (append = false, nextCursor?: string, quiet = false) => {
+    const current = ++generation.current
     if (!quiet) setLoading(true)
     setError('')
     const params = viewParams()
@@ -114,7 +122,8 @@ function MailboxApp({ onLogout }: { onLogout: () => void }) {
     if (nextCursor) params.set('cursor', nextCursor)
     try {
       const page = await api.messages(params)
-      setMessages(current => append ? [...current, ...page.items.filter(item => !current.some(existing => existing.id === item.id))] : page.items)
+      if (current !== generation.current) return
+      setMessages(items => append ? [...items, ...page.items.filter(item => !items.some(existing => existing.id === item.id))] : page.items)
       setCursor(page.next_cursor)
       setUnreadTotal(page.unread_total ?? 0)
       if (revealing) {
@@ -124,7 +133,9 @@ function MailboxApp({ onLogout }: { onLogout: () => void }) {
         setRevealID(target?.id ?? null)
         if (!target && (page.unread_total ?? 0) > 0) announce('未读邮件不在最近 100 封内，可继续向下加载')
       }
-    } catch (err) { setError(messageOf(err)) } finally { setLoading(false) }
+    } catch (err) { if (current === generation.current) setError(messageOf(err)) }
+    // The spinner belongs to the newest load, so a superseded one must leave it up.
+    finally { if (current === generation.current) setLoading(false) }
   }, [viewParams, announce])
 
   useEffect(() => { loadAccounts() }, [loadAccounts])
@@ -152,14 +163,30 @@ function MailboxApp({ onLogout }: { onLogout: () => void }) {
   // event naming this message re-fetches — the body-prefetch backlog emits these
   // in bursts, and the rest of them concern mail that is not on screen.
   const selectedID = selected?.id
+  // Counted separately from the feed: a quiet feed refresh must not discard the
+  // details of the message still on screen, and opening another message must
+  // discard the previous one's details.
+  const detailGeneration = useRef(0)
   const refreshOpenMessage = useCallback(async (messageID: number) => {
     if (messageID !== selectedID) return
-    try { setDetails(await api.message(messageID)) } catch { /* the next event or a reopen retries */ }
+    const current = detailGeneration.current
+    try {
+      const loaded = await api.message(messageID)
+      // Same reason as the feed guard: this response can land after the user has
+      // already opened something else.
+      if (current === detailGeneration.current) setDetails(loaded)
+    } catch { /* the next event or a reopen retries */ }
   }, [selectedID])
 
   const handleEvent = useCallback((payload: EventEnvelope) => {
     const updatedID = typeof payload.data?.message_id === 'number' ? payload.data.message_id : 0
     if (payload.type === 'MESSAGE_UPDATED' && updatedID) void refreshOpenMessage(updatedID)
+    // The account list is the only carrier of status and last_error, so the
+    // connection dot, the sync-failure banner and the settings lines cannot move
+    // without re-reading it. refreshQuietly deliberately skips it, which left the
+    // one event that exists to report a status change unable to show one. Kept off
+    // the NEW_EMAIL hot path by keying on this type alone.
+    if (payload.type === 'ACCOUNT_STATUS') void loadAccounts()
     const code = typeof payload.data?.otp_code === 'string' ? payload.data.otp_code : ''
     // The code notification replaces the generic notice rather than adding to it,
     // so switching only the code notification off has to fall back to the generic
@@ -173,7 +200,7 @@ function MailboxApp({ onLogout }: { onLogout: () => void }) {
       return
     }
     if (payload.type === 'NEW_EMAIL') notify()
-  }, [preferences.desktopNotifications, preferences.verificationCodeNotifications, refreshOpenMessage])
+  }, [loadAccounts, preferences.desktopNotifications, preferences.verificationCodeNotifications, refreshOpenMessage])
   useRealtime(refreshQuietly, handleEvent)
 
   async function markViewRead() {
@@ -215,7 +242,15 @@ function MailboxApp({ onLogout }: { onLogout: () => void }) {
         announce(`标记已读失败：${messageOf(err)}`)
       })
     }
-    try { setDetails(await api.message(message.id)) } catch (err) { setError(messageOf(err)) }
+    const current = ++detailGeneration.current
+    try {
+      const loaded = await api.message(message.id)
+      // Clicking A then B resolves last-response-wins without this: A's response can
+      // land after B's and would render A's subject, sender and body under B's
+      // highlighted row.
+      if (current !== detailGeneration.current) return
+      setDetails(loaded)
+    } catch (err) { if (current === detailGeneration.current) setError(messageOf(err)) }
   }
 
   async function mutateMessage(patch: object) {
@@ -227,12 +262,28 @@ function MailboxApp({ onLogout }: { onLogout: () => void }) {
     } catch (err) { setError(messageOf(err)) }
   }
 
-  useKeyboard(preferences.keyboardShortcuts, messages, selected, openMessage, () => compose(), () => mutateMessage({ archive: true }))
+  // The shortcuts are bound to window and every dialog renders as a sibling of the
+  // still-mounted mailbox, so without this 'e' archived the message behind an open
+  // dialog — destructive, and not undoable from this UI — and 'c' mounted a second
+  // composer over the first.
+  const dialogOpen = showAccounts || showComposer || showOutbox || showSettings
+  useKeyboard(preferences.keyboardShortcuts, dialogOpen, messages, selected, openMessage, () => compose(), () => mutateMessage({ archive: true }))
 
   // The local session ends either way. Swallowing the failure rather than letting
   // `finally` re-throw keeps a rejected DELETE from escaping the click handler as
   // an unhandled rejection, which is all the caller would ever see of it.
   async function logout() { try { await api.logout() } catch { /* the session is over locally regardless */ } finally { onLogout() } }
+
+  // The deleted account may be the one on screen, and its mailboxes and mail went
+  // with it. Releasing the scope is enough to reload both: the folder effect and the
+  // feed effect already key off it. refresh() cannot be used here — it would read
+  // the pre-update selectedAccount and spend a folder request on an account the
+  // server has just forgotten.
+  function forgetAccount(id: number) {
+    loadAccounts()
+    if (selectedAccount !== id) { loadMessages(); return }
+    setSelectedAccount(null); setSelectedMailbox(null); setSelected(null); setDetails(null); setPane('list')
+  }
   const accountMap = useMemo(() => new Map(accounts.map(account => [account.id, account])), [accounts])
   // The server counts the whole view; the loaded page only holds 40 rows, so
   // counting locally reported "0 unread" on any view whose unread mail sits past
@@ -316,7 +367,7 @@ function MailboxApp({ onLogout }: { onLogout: () => void }) {
     {showAccounts && <AccountDialog onClose={() => setShowAccounts(false)} onCreated={() => { setShowAccounts(false); loadAccounts() }} />}
     {showOutbox && <OutboxDialog onClose={() => setShowOutbox(false)} onEdit={draft => { setShowOutbox(false); compose(draft) }} />}
     {showComposer && <Composer accounts={accounts} replyTo={composerDraft ? null : selected} initialDraft={composerDraft} onClose={() => setShowComposer(false)} onSent={() => { setShowComposer(false); refresh() }} />}
-    {showSettings && <SettingsDialog preferences={preferences} accounts={accounts} onChange={updatePreferences} onClose={() => setShowSettings(false)} onAddAccount={() => { setShowSettings(false); setShowAccounts(true) }} onLogout={logout} />}
+    {showSettings && <SettingsDialog preferences={preferences} accounts={accounts} onChange={updatePreferences} onClose={() => setShowSettings(false)} onAddAccount={() => { setShowSettings(false); setShowAccounts(true) }} onDeleted={forgetAccount} onLogout={logout} />}
     {toast && <div role="status" className="pointer-events-none fixed bottom-6 left-1/2 z-50 -translate-x-1/2 rounded-full bg-pine px-5 py-2.5 text-xs font-semibold text-white shadow-lift-4">{toast}</div>}
   </div>
 }

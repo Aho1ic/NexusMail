@@ -83,7 +83,7 @@ cd web && npx playwright test e2e/mailbox.spec.ts
 ### 持久化
 
 - `internal/repository/sqlite/store.go` 用单个 `writeMu` 串行化**全部写操作**；读路径不加锁。新增写方法必须同样持有它，否则在 WAL + 8 连接池下会出现 `SQLITE_BUSY`。
-- migration 运行器按版本号升序遍历 `migrations/*.up.sql`（`parseMigrationName` 取前缀数字），跳过 `schema_migrations` 中已记录的版本。新增 `000002_*.up.sql` 会被 `go:embed` 打包并自动执行，无需改 `migrate()`；文件名前缀必须是可解析的数字，否则会被静默忽略。
+- migration 运行器按版本号升序遍历 `migrations/*.up.sql`（`parseMigrationName` 取前缀数字），跳过 `schema_migrations` 中已记录的版本。新增一个编号大于现有最大值的 `NNNNNN_*.up.sql` 会被 `go:embed` 打包并自动执行，无需改 `migrate()`；文件名前缀必须是可解析的数字，否则会被静默忽略。已发布的 migration 一律不改，只追加新编号。
 - 消息落库只有批量一条路径 `BatchCreateOrUpdateMessages`（单条写入的 `CreateOrUpdateMessage` 已删除）。它手工展开 `IN (?,?…)`，每个 dedupe key 必须包成 `blobArg`：GORM 会把紧跟 `(` 的 `?` 上绑定的 slice 按元素展开，裸 `[]byte` 会被当成 32 个整数比较，导致每批第一条永远去重失败并撞 unique 索引回滚整批。
 - FTS5：`message_fts` 虚拟表由 3 个 trigger 维护（insert / delete / update of `subject,sender,recipients,body_text`）。绕过这些列直接改正文，或用非 trigger 路径写入，索引会静默失去同步。
 - 分页是 keyset cursor：base64(JSON `{received_at,id}`)，配合 `(received_at DESC, id DESC)` 索引。不要改成 OFFSET。
@@ -93,7 +93,7 @@ cd web && npx playwright test e2e/mailbox.spec.ts
 `internal/service/send/worker.go` 的 `deliver` 区分四种结果，其中 `unknown` 最关键：
 
 - `sent` → `CreateSentMessage` + 删除远端草稿；随后仅当 `provider.Preset.ServerSavesSent == false` 时才 APPEND 到远端 Sent（QQ/163 需要，Gmail/Outlook 会自己保存，重复 APPEND 会产生副本）。
-- `retry_wait` → 仅对明确的临时失败，退避阶梯 `5s / 30s / 2m / 10m / 30m`，`AttemptCount` 上限 5。
+- `retry_wait` → 仅对明确的临时失败，退避阶梯 `5s / 30s / 2m / 10m`，`AttemptCount` 上限 5。**阶梯长度被上限锁定为 4 级**：`ClaimSendableDraft` 已经先自增了 `AttemptCount`，所以第 N 次尝试读第 N-1 级，而 `fail` 的 `AttemptCount < 5` 守卫让排下一次重试最多发生在第 4 次尝试——第 5 次是终态（`failed`）。第 5 级永远索引不到，留着只会让人以为还有一次 30m 重试。改上限必须同步改阶梯长度。
 - `failed` → 永久失败。
 - `unknown` → `DATA` 之后连接中断，**终态，绝不自动重试**（可能已投递）。这类草稿的附件 blob 必须持久保存，不可被 LRU 淘汰。
 
@@ -103,8 +103,16 @@ cd web && npx playwright test e2e/mailbox.spec.ts
 - 邮箱角色与同步档位由 `provider.ClassifyMailbox` 决定（`realtime`/`periodic`/`lazy`），先看 IMAP special-use attribute，再回退到名称匹配（含中文名）。新增服务商差异应收敛到 `internal/provider` 的 preset 与该函数。
 - 前端无 router、无状态库：`web/src/App.tsx`（≈220 行）只负责装配与"当前视图"这一份状态，UI 拆到 `components/`（9 个），跨视图行为拆到 `hooks/`（`useRealtime` 持有唯一 socket，`useKeyboard` 绑定单键快捷键），纯函数拆到 `lib/`（`api.ts` 极薄请求封装、`format.ts`、`messagehtml.ts`、`notifications.ts`、`preferences.ts`），`types.ts` 手写对齐 OpenAPI。新增 UI 优先扩展现有结构，不要顺手引入组件框架。
 - 前端"当前视图"只有一个定义：`App.tsx` 的 `viewParams()`。feed 列表与 mark-all-read 共用它，因此 `account_id`/`mailbox_id`/`query` 不会与屏幕上显示的邮件脱节。切账户与回 All Inboxes 时清 `selectedMailbox` 的责任在两个 handler 里（同一次 render 内完成），不要挪到 effect：effect 晚一个 render，会先按旧 mailbox 多发一次 feed 请求。
-- `internal/transport/http/static/dist` 由 `make web-build` 从 `web/dist` 复制并 `go:embed`，是生成产物，禁止手工编辑。
+- `internal/transport/http/static/dist` 由 `make web-build` 从 `web/dist` 复制并 `go:embed`，是生成产物，禁止手工编辑。复制前该目录会被清空（只保留 `placeholder.txt` 与 `.gitkeep`）：vite 输出带内容哈希的文件名，不清就会把历次构建的产物全部编进二进制。`placeholder.txt` 是 `go:embed dist` 在全新 clone 上仍能解析的唯一保证——`go:embed` 会忽略点开头的 `.gitkeep`，别删它。
 
 ## 版本与发布
 
-`VERSION`（单行 semver）是唯一版本源：`make build`/`make docker-build` 读取它并通过 `-ldflags` 注入 `internal/version.Value`，启动日志输出。`.github/workflows/publish-image.yml` **仅在 push 到 `main` 且 `VERSION` 文件发生改动时**触发，推送 `<version>`、`v<version>`、`latest` 到 Docker Hub 与 GHCR；格式不合 semver 直接失败。仓库没有 CI 测试流水线，测试与验证完全依赖本地执行。
+`VERSION`（单行 semver）是唯一版本源：`make build`/`make docker-build` 读取它并通过 `-ldflags` 注入 `internal/version.Value`，启动日志输出。
+
+`.github/workflows/publish-image.yml` 在**每次 push 到 `main`** 时触发（另支持手动 `workflow_dispatch`），没有 `paths` 过滤：
+
+- `sha-<短 SHA>` 与 `latest` 每次推送都推——`latest` 没有 `enable=` 条件，永远跟随 `main` 最新提交。
+- `VERSION` 是否改动只决定**语义标签**（`<version>` / `v<version>`）这一次要不要加（`enable=` 绑在 `release` 上；手动触发一律按发布处理）；格式不合 semver 直接失败。
+- 非发布构建注入的版本号带 `-<短 SHA>` 后缀，启动日志可定位来源提交。
+
+工作流有 `test` job（Go 全量测试带 `sqlite_fts5` + 前端 Vitest）：`build` 直接 `needs` 它，唯一移动标签的 `merge` 又 `needs` `build`，所以任何标签移动前测试必须先绿。工作流还按 ref 串行（`concurrency`，不取消进行中的 run），避免交错的 merge 让 `latest` 停在较旧提交。这不替代本地验证：`make test` / `make test-race` 仍是改动后的第一道关。

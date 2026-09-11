@@ -126,29 +126,21 @@ func TestDeliverTemporaryFailureRetries(t *testing.T) {
 
 // TestRetryLadderAndAttemptCap pins both halves of the backoff contract: the delays
 // grow, and attempt 5 is the last one. Without the cap a permanently broken account
-// retries forever.
+// retries forever. The ladder has four rungs for five attempts because
+// ClaimSendableDraft increments attempt_count before the failure is classified, so
+// attempt N reads rung N-1 and attempt 5 never reads one at all.
 func TestRetryLadderAndAttemptCap(t *testing.T) {
 	harness := newHarness(t, &backend{rcptErr: &gosmtp.SMTPError{Code: 451, Message: "try again later"}})
 	draft := harness.queueDraft(t, "Ladder", "hello")
 	ctx := context.Background()
 
-	wantDelays := []time.Duration{5 * time.Second, 30 * time.Second, 2 * time.Minute, 10 * time.Minute, 30 * time.Minute}
+	wantDelays := []time.Duration{5 * time.Second, 30 * time.Second, 2 * time.Minute, 10 * time.Minute}
 	for attempt, want := range wantDelays {
 		before := time.Now().UnixMilli()
 		harness.worker.deliver(ctx, draft.ID)
 		stored := harness.draft(t, draft.ID)
 		if stored.AttemptCount != attempt+1 {
 			t.Fatalf("attempt_count = %d after %d deliveries", stored.AttemptCount, attempt+1)
-		}
-		if attempt == len(wantDelays)-1 {
-			// The fifth attempt exhausts the budget, so this one is terminal.
-			if stored.Status != "failed" {
-				t.Fatalf("attempt 5 status = %q, want failed", stored.Status)
-			}
-			if stored.NextAttemptAt != nil {
-				t.Fatal("attempt 5 scheduled a sixth")
-			}
-			break
 		}
 		if stored.Status != "retry_wait" || stored.NextAttemptAt == nil {
 			t.Fatalf("attempt %d status = %q next=%v (%s)", attempt+1, stored.Status, stored.NextAttemptAt, errText(stored))
@@ -165,6 +157,19 @@ func TestRetryLadderAndAttemptCap(t *testing.T) {
 		if err := harness.repo.SetDraftDelivery(ctx, draft.ID, "retry_wait", stored.AttemptCount, ptr(time.Now().UnixMilli()), nil, nil, nil); err != nil {
 			t.Fatal(err)
 		}
+	}
+
+	// The fifth attempt exhausts the budget, so this one is terminal.
+	harness.worker.deliver(ctx, draft.ID)
+	stored := harness.draft(t, draft.ID)
+	if stored.AttemptCount != 5 {
+		t.Fatalf("attempt_count = %d after five deliveries", stored.AttemptCount)
+	}
+	if stored.Status != "failed" {
+		t.Fatalf("attempt 5 status = %q, want failed", stored.Status)
+	}
+	if stored.NextAttemptAt != nil {
+		t.Fatal("attempt 5 scheduled a sixth")
 	}
 }
 

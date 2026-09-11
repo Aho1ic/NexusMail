@@ -88,6 +88,20 @@ paths:
         - { in: query, name: code, required: true, schema: { type: string } }
       responses:
         '302': { description: Redirect to the SPA carrying the outcome }
+  /api/v1/accounts/{id}:
+    delete:
+      summary: Disconnect an account and delete its local mail
+      description: >-
+        Stops the account's IMAP sync loops and closes its connections first, then
+        deletes the account row. Everything stored locally for it — mailboxes,
+        messages, attachments and drafts — is removed with it, so this is not a
+        pause: reconnecting the same address resyncs from the provider. Mail on the
+        provider is never touched.
+      parameters: [ { $ref: '#/components/parameters/ID' } ]
+      responses:
+        '204': { description: Account disconnected and its local data deleted }
+        '400': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
   /api/v1/accounts/{id}/mailboxes:
     get:
       summary: List account mailboxes
@@ -111,7 +125,12 @@ paths:
         - { in: query, name: is_read, schema: { type: boolean } }
         - { in: query, name: query, schema: { type: string } }
         - { in: query, name: cursor, schema: { type: string } }
-        - { in: query, name: limit, schema: { type: integer, minimum: 1, maximum: 100, default: 50 } }
+        - in: query
+          name: limit
+          description: >-
+            Page size. Absent, non-numeric or below 1 falls back to 20; anything
+            above 100 is clamped to 100 rather than rejected.
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
       responses:
         '200':
           description: Keyset page
@@ -167,6 +186,13 @@ paths:
         '404': { $ref: '#/components/responses/Error' }
     patch:
       summary: Change read/starred state or archive remotely
+      description: >-
+        At least one of the three fields must be present; an empty body is 400.
+        The provider is updated before the local row, so a provider failure leaves
+        both unchanged and answers 503 (offline account, or no reachable archive
+        mailbox). 404 covers an unknown id and an archive whose message has no
+        mapping in the mailbox it is being moved out of. Outgoing rows have no
+        mapping by design and are patched locally without contacting the provider.
       parameters: [ { $ref: '#/components/parameters/ID' } ]
       requestBody:
         required: true
@@ -182,6 +208,9 @@ paths:
         '200':
           description: Updated message
           content: { application/json: { schema: { $ref: '#/components/schemas/Message' } } }
+        '400': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+        '503': { $ref: '#/components/responses/Error' }
   /api/v1/messages/{id}/attachments/{attachment_id}:
     get:
       summary: Fetch and stream an attachment
@@ -414,6 +443,7 @@ components:
         part_id: { type: string }
         filename: { type: string }
         content_type: { type: string }
+        content_id: { type: [string, 'null'], description: 'RFC 2392 Content-ID with angle brackets, e.g. <img001@example>; present on inline parts and absent otherwise. Clients resolve cid: URLs in body_html against it.' }
         size_bytes: { type: integer, format: int64 }
         fetch_state: { type: string, enum: [metadata, fetching, ready, error] }
     DraftStatus:
@@ -435,6 +465,13 @@ components:
       properties:
         id: { type: integer, format: int64 }
         account_id: { type: integer, format: int64 }
+        conflict_of_id:
+          type: [integer, 'null']
+          format: int64
+          description: >-
+            Set on a conflict copy: the id of the local draft this was split from
+            when a remote edit collided with an unsynced local one. Absent on
+            ordinary drafts; a copy carries remote_sync_state conflict.
         rfc_message_id: { type: string }
         revision: { type: integer, format: int64 }
         to: { type: string, description: JSON address array }
@@ -461,7 +498,7 @@ components:
       type: object
       required: [type, sequence, occurred_at, data]
       properties:
-        type: { type: string, enum: [NEW_EMAIL, MESSAGE_UPDATED, ACCOUNT_STATUS, SYNC_PROGRESS, DRAFT_UPDATED, OUTBOX_UPDATED] }
+        type: { type: string, enum: [NEW_EMAIL, MESSAGE_UPDATED, ACCOUNT_STATUS, DRAFT_UPDATED, OUTBOX_UPDATED] }
         sequence: { type: integer, format: int64 }
         occurred_at: { type: integer, format: int64 }
         data:

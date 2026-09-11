@@ -194,9 +194,17 @@ func (s *Store) GetBlob(ctx context.Context, id int64) (domain.BlobObject, error
 	// concurrent delete or upsert of the same blob can race the read and the
 	// WAL+8 connection pool can return SQLITE_BUSY. The lookup itself does
 	// not need the lock, but the touch does.
-	s.writeMu.Lock()
-	touchErr := s.db.WithContext(ctx).Model(&blob).Update("last_accessed_at", time.Now().UnixMilli()).Error
-	s.writeMu.Unlock()
+	//
+	// The closure exists so the release is a defer like everywhere else in the
+	// package: unlocking by hand meant a panic inside the Update — the driver's,
+	// or a future edit's — left writeMu held for the life of the process and
+	// deadlocked every write method behind it.
+	var touchErr error
+	func() {
+		s.writeMu.Lock()
+		defer s.writeMu.Unlock()
+		touchErr = s.db.WithContext(ctx).Model(&blob).Update("last_accessed_at", time.Now().UnixMilli()).Error
+	}()
 	if touchErr != nil {
 		// The read succeeded; surfacing a write-only error would force callers
 		// to retry a fetch that already has the data they need. Log and return
@@ -284,6 +292,22 @@ func (s *Store) ValidateSession(ctx context.Context, tokenHash []byte, now int64
 	return row.CSRFHash, true, nil
 }
 
+// TouchSession slides the idle deadline to idleExpiresAt and records the
+// activity. MIN clamps the new deadline to absolute_expires_at: without it a
+// session that keeps being used just often enough to be renewed would push its
+// idle deadline past the absolute cap on every request and never expire, which
+// is exactly the property the cap exists to guarantee. Clamping in SQL also
+// keeps it one statement, so a concurrent request cannot read a deadline
+// between the load and the store.
+func (s *Store) TouchSession(ctx context.Context, tokenHash []byte, idleExpiresAt int64) error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	_, err := s.sqlDB.ExecContext(ctx, `UPDATE web_sessions
+        SET expires_at = MIN(?, absolute_expires_at), last_seen_at = ?
+        WHERE token_hash = ?`, idleExpiresAt, time.Now().UnixMilli(), tokenHash)
+	return err
+}
+
 func (s *Store) DeleteSession(ctx context.Context, tokenHash []byte) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
@@ -354,7 +378,7 @@ func (s *Store) SetDraftDelivery(ctx context.Context, id int64, status string, a
 func (s *Store) CreateSentMessage(ctx context.Context, message *domain.Message, draftID int64) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		if err := tx.Create(message).Error; err != nil {
 			var existing domain.Message
 			if findErr := tx.Where("account_id = ? AND dedupe_key = ?", message.AccountID, message.DedupeKey).First(&existing).Error; findErr != nil {
@@ -364,4 +388,10 @@ func (s *Store) CreateSentMessage(ctx context.Context, message *domain.Message, 
 		}
 		return tx.Model(&domain.Draft{}).Where("id = ?", draftID).Update("sent_message_id", message.ID).Error
 	})
+	if err == nil {
+		// A new message row lands in the sent folder's view, so any memoised
+		// unread total that counted it is stale.
+		s.invalidateUnreadCache()
+	}
+	return err
 }

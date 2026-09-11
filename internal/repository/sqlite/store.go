@@ -250,6 +250,28 @@ func (s *Store) UpdateAccountStatus(ctx context.Context, id int64, status string
 	return s.db.WithContext(ctx).Model(&domain.Account{}).Where("id = ?", id).Updates(values).Error
 }
 
+// UpdateAccountSecret replaces the encrypted credential blob in place. Nothing
+// else about the account changes, so a rotated OAuth refresh token cannot
+// clobber the status or the sync cursor that the connection loop owns.
+func (s *Store) UpdateAccountSecret(ctx context.Context, id int64, secret []byte) error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	return s.db.WithContext(ctx).Model(&domain.Account{}).Where("id = ?", id).Updates(map[string]any{
+		"secret_ciphertext": blobArg(secret), "updated_at": time.Now().UnixMilli(),
+	}).Error
+}
+
+// DeleteAccount removes the account row only. Its mailboxes, messages, drafts
+// and mailbox mappings go with it through the ON DELETE CASCADE chain in
+// 000001_init, which configure enables with PRAGMA foreign_keys=ON — deleting
+// the children here by hand would duplicate the schema's rules in Go and drift
+// from them the first time a table is added.
+func (s *Store) DeleteAccount(ctx context.Context, id int64) error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	return s.db.WithContext(ctx).Delete(&domain.Account{}, id).Error
+}
+
 // UpsertMailbox records what LIST reported about a mailbox: its name, delimiter,
 // role and sync tier.
 //
@@ -347,6 +369,14 @@ func (s *Store) BatchCreateOrUpdateMessages(ctx context.Context, items []ports.M
 		}
 		return nil
 	})
+	if err == nil {
+		// This is the path new mail arrives on, so it is the one that changes the
+		// unread count most often. Without the invalidation cachedUnreadTotal
+		// keeps serving the pre-ingest total for up to unreadCacheTTL, and the
+		// NEW_EMAIL-driven 80ms-coalesced refresh the client performs lands
+		// inside that window: the badge stayed one sync behind the feed.
+		s.invalidateUnreadCache()
+	}
 	return ids, created, err
 }
 

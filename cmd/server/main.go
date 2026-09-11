@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sync"
 	"syscall"
 	"time"
 
@@ -69,6 +70,11 @@ func run(rootCtx context.Context) error {
 	hub := realtime.New()
 	accountSvc := accountservice.New(repo, box)
 	oauthManager := oauth.New(cfg)
+	// The account service and the OAuth manager would form a cycle if either took the
+	// other at construction, so the manager is handed its credential store here.
+	// Without it a rotated refresh token lives only in the manager's cache and the
+	// next boot re-authorizes with a token the provider has already invalidated.
+	oauthManager.SetCredentialStore(accountSvc)
 	syncer := imapprovider.NewSupervisor(repo, blobStore, accountSvc, oauthManager, hub)
 	messageSvc := messageservice.New(repo, syncer, hub)
 	draftSvc := draftservice.New(repo, hub, syncer)
@@ -82,8 +88,33 @@ func run(rootCtx context.Context) error {
 	// Registered after syncer.Stop so it runs before it: defers are LIFO, and a
 	// pending draft push must not fire into a supervisor that has already stopped.
 	defer draftSvc.Close()
-	go sender.Start(rootCtx)
-	go maintenance(rootCtx, repo, blobStore, maintenanceInterval)
+	// The workers are joined before the deferred repo.Close, so this defer is
+	// registered after it: defers are LIFO. The SMTP client only uses ctx for the
+	// dial and drives the rest of the conversation on socket deadlines, so a
+	// cancelled context does not abort a delivery in flight — without the join it can
+	// be accepted by the provider and then fail its CreateSentMessage and
+	// SetDraftDelivery writes against a closed database, leaving the draft in
+	// 'sending' for RecoverSendingDrafts to downgrade to 'unknown' on the next boot:
+	// a delivered message presented as possibly undelivered.
+	//
+	// The workers get their own cancel rather than watching rootCtx, because a
+	// listener that fails to bind returns from run with rootCtx still live, and Wait
+	// would then block forever.
+	workerCtx, stopWorkers := context.WithCancel(rootCtx)
+	var workers sync.WaitGroup
+	defer func() {
+		stopWorkers()
+		workers.Wait()
+	}()
+	workers.Add(2)
+	go func() {
+		defer workers.Done()
+		sender.Start(workerCtx)
+	}()
+	go func() {
+		defer workers.Done()
+		maintenance(workerCtx, repo, blobStore, maintenanceInterval)
+	}()
 
 	api := httptransport.New(cfg, repo, blobStore, accountSvc, messageSvc, draftSvc, sessionSvc, oauthManager, syncer, sender, hub, rootCtx)
 	server := &http.Server{Addr: cfg.ListenAddr, Handler: api.Handler(), ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 30 * time.Second, WriteTimeout: 2 * time.Minute, IdleTimeout: 60 * time.Second}

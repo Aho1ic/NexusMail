@@ -24,7 +24,11 @@ func (s *Server) mountSPA(router *gin.Engine) {
 		}
 		path := strings.TrimPrefix(filepath.Clean(c.Request.URL.Path), "/")
 		if path != "." {
-			if _, err := fs.Stat(root, path); err == nil {
+			// The mode is the whole point: fs.Stat succeeds for directories too, so
+			// matching on err alone handed /assets/ to http.FileServer, which answers
+			// with an HTML index of every embedded file. Only a regular file is an
+			// asset; a directory falls through to the shell like any unknown path.
+			if info, err := fs.Stat(root, path); err == nil && info.Mode().IsRegular() {
 				files.ServeHTTP(c.Writer, c.Request)
 				return
 			}

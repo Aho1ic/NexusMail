@@ -61,8 +61,17 @@ type roleRule struct {
 
 // The order is significant: the first rule that matches wins, so "Deleted
 // Messages" must be tested for trash before "messages" can mean anything else.
+//
+// "inbox" is last because it is the only keyword that is also the standard IMAP
+// hierarchy prefix and a common container name: mailboxWords tokenises on
+// non-alphanumerics, so "INBOX.Sent", "Inbox Backup" and anything containing
+// 收件箱 all yield the "inbox" token. Matched first, such a folder became a decoy
+// role='inbox' with sync_mode='realtime' that joined the unified inbox feed and,
+// because GetMailboxByRole orders by id, could capture the 5s probe and the IDLE
+// SELECT while real inbox mail waited for the 5-minute periodic pass. Every more
+// specific role therefore gets first refusal. The real INBOX is unaffected: the
+// exact-name fast path at normalized == "inbox" returns before this loop runs.
 var roleRules = []roleRule{
-	{role: "inbox", syncMode: "realtime", words: []string{"inbox"}, contains: []string{"收件箱"}},
 	{role: "trash", syncMode: "lazy", words: []string{"trash", "deleted", "bin"}, contains: []string{"已删除", "废件箱", "回收站"}},
 	{role: "junk", syncMode: "lazy", words: []string{"junk", "spam"}, contains: []string{"垃圾"}},
 	{role: "sent", syncMode: "periodic", words: []string{"sent"}, contains: []string{"已发送", "发件箱"}},
@@ -71,6 +80,7 @@ var roleRules = []roleRule{
 	// reason "All Mail" is, while a real archive folder stays on the periodic tick.
 	{role: "archive", syncMode: "lazy", contains: []string{"所有邮件"}},
 	{role: "archive", syncMode: "periodic", words: []string{"archive", "archives"}, contains: []string{"归档"}},
+	{role: "inbox", syncMode: "realtime", words: []string{"inbox"}, contains: []string{"收件箱"}},
 }
 
 func ClassifyMailbox(name string, attributes []string) (role, syncMode string) {

@@ -55,14 +55,31 @@ func (s *Store) Put(ctx context.Context, reader io.Reader, durability string) (d
 	if err := os.MkdirAll(filepath.Dir(target), 0o750); err != nil {
 		return domain.BlobObject{}, err
 	}
-	if err := os.Rename(tempName, target); err != nil && !errors.Is(err, os.ErrExist) {
-		if _, statErr := os.Stat(target); statErr != nil {
-			return domain.BlobObject{}, fmt.Errorf("commit blob: %w", err)
+	// Track whether this call is the one that put the file at target. The rename
+	// consumes tempName, so the deferred cleanup above no longer has anything to
+	// remove; if the index write then fails, the file is unreferenced and
+	// eviction — which is driven entirely by blob_objects rows — can never find
+	// it again.
+	//
+	// A concurrent writer of the same content is not an error: os.ErrExist, or a
+	// failed rename whose target nevertheless exists, means the other caller won
+	// the race. The file is theirs, so this call must not remove it on failure.
+	committed := false
+	if err := os.Rename(tempName, target); err != nil {
+		if !errors.Is(err, os.ErrExist) {
+			if _, statErr := os.Stat(target); statErr != nil {
+				return domain.BlobObject{}, fmt.Errorf("commit blob: %w", err)
+			}
 		}
+	} else {
+		committed = true
 	}
 	now := time.Now().UnixMilli()
 	blob := domain.BlobObject{StorageKey: key, SHA256: digest, SizeBytes: size, Durability: durability, LastAccessedAt: now, CreatedAt: now}
 	if err := s.repo.CreateBlob(ctx, &blob); err != nil {
+		if committed {
+			_ = os.Remove(target)
+		}
 		return domain.BlobObject{}, err
 	}
 	if durability == "cache" {

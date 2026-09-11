@@ -6,6 +6,14 @@ on:
       - main
   workflow_dispatch:
 
+# Serialised per ref and never cancelled: the merge job is what moves `latest`, so
+# two overlapping pushes whose merge jobs interleave can leave it on the older
+# commit. Cancelling would be worse than queueing — it can abandon a run that has
+# already pushed per-architecture digests but not yet tagged them.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
 env:
   IMAGE_NAME: nexusmail
 
@@ -110,12 +118,51 @@ jobs:
           echo "dockerhub=$dockerhub" >> "$GITHUB_OUTPUT"
           echo "images=$images" >> "$GITHUB_OUTPUT"
 
+  # The gate. `latest` carries no enable= and therefore moves on every push, so a
+  # commit that breaks the suite would become the image users pull. Runs alongside
+  # prepare and blocks build, which is what merge — the only job that moves a tag —
+  # transitively waits on.
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          # Read from go.mod so the tested toolchain cannot drift from the built one.
+          go-version-file: go.mod
+
+      - name: Run Go tests
+        # sqlite_fts5 is not optional: the schema declares FTS5 virtual tables and
+        # migration fails without the tag. go-sqlite3 is CGO, built with the C
+        # toolchain ubuntu-latest already ships.
+        env:
+          CGO_ENABLED: '1'
+        run: go test -tags sqlite_fts5 ./...
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install frontend dependencies
+        run: npm ci
+        working-directory: web
+
+      - name: Run frontend tests
+        run: npm test
+        working-directory: web
+
   # One leg per architecture on its own native runner. The alternative — a single
   # job building both under QEMU — emulates the CGO/static Go build, and this
   # workflow now runs on every push, so the emulation penalty would be paid every
   # time. arm64 runners are free on public repositories.
   build:
-    needs: prepare
+    needs: [prepare, test]
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read

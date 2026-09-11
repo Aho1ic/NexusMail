@@ -212,9 +212,14 @@ func TestPutReportsAnUncreatableShard(t *testing.T) {
 // TestPutReportsARepositoryFailure covers the row-creation error. The file is on disk
 // by that point, so returning the blob anyway would hand back an ID of zero and a key
 // no row references — a leaked file that eviction can never find.
+//
+// The error alone is not enough: eviction is driven entirely by blob_objects rows, so
+// a file left behind with no row is unreachable for the life of the store. Put has to
+// undo the commit it made.
 func TestPutReportsARepositoryFailure(t *testing.T) {
 	store, repo := newTestStore(t, 1<<20)
 	ctx := context.Background()
+	const payload = "payload"
 
 	// Closing the repository is the least artificial way to make every query fail;
 	// it is what a lost database handle looks like to this layer.
@@ -222,8 +227,15 @@ func TestPutReportsARepositoryFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := store.Put(ctx, strings.NewReader("payload"), "cache"); err == nil {
+	if _, err := store.Put(ctx, strings.NewReader(payload), "cache"); err == nil {
 		t.Fatal("Put succeeded with a closed repository")
+	}
+
+	digest := sha256.Sum256([]byte(payload))
+	hexDigest := hex.EncodeToString(digest[:])
+	target := filepath.Join(store.root, hexDigest[:2], hexDigest[2:4], hexDigest)
+	if _, err := os.Stat(target); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("blob file at %s survived the failed row creation (stat error %v)", target, err)
 	}
 }
 

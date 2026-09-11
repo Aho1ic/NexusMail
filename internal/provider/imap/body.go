@@ -204,24 +204,33 @@ func (s *Supervisor) enqueueBodyCandidates(ctx context.Context, accountID int64)
 	// A candidate that does not make it onto the queue goes back to 'metadata' so
 	// the next probe reconsiders it; leaving it 'queued' costs nothing but is a
 	// lie about work that is not scheduled.
-	for _, id := range candidates {
+	//
+	// The whole remainder is released, not just the id in hand: every candidate was
+	// flipped to 'queued' in one batch write and every one of them holds a bodySeen
+	// entry, so an id abandoned here is skipped by the pre-filter for the life of
+	// the process and its reading pane waits on a fetch that will never be
+	// scheduled. Returning after releasing only the current id stranded the other
+	// len(candidates)-index-1 exactly that way.
+	for index, id := range candidates {
 		select {
 		case s.bodyQueue <- id:
 		case <-ctx.Done():
-			s.releaseCandidate(ctx, id)
+			s.releaseCandidates(ctx, candidates[index:])
 			return
 		default:
-			s.releaseCandidate(ctx, id)
+			s.releaseCandidates(ctx, candidates[index:])
 			return
 		}
 	}
 }
 
-func (s *Supervisor) releaseCandidate(ctx context.Context, id int64) {
-	s.bodySeen.Delete(id)
+func (s *Supervisor) releaseCandidates(ctx context.Context, ids []int64) {
 	undoCtx, cancel := rollbackCtx(ctx)
 	defer cancel()
-	_ = s.repo.SetMessageBodyState(undoCtx, id, "metadata")
+	for _, id := range ids {
+		s.bodySeen.Delete(id)
+		_ = s.repo.SetMessageBodyState(undoCtx, id, "metadata")
+	}
 }
 
 func (s *Supervisor) bodyWorker(ctx context.Context) {

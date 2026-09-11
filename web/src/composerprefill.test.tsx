@@ -277,14 +277,48 @@ describe('composer send failures', () => {
     expect(calls.some(call => call.url.endsWith('/send'))).toBe(false)
   })
 
-  it('reports a conflict from the optimistic-concurrency save', async () => {
-    stubAPI(call => call.method === 'PATCH'
-      ? json({ error: { code: 'conflict', message: '草稿已在别处修改' } }, 409)
-      : json({}))
-    open({ initialDraft: draft() })
+  // A 409 is recoverable now: the composer re-reads the draft, adopts the server's
+  // revision and retries. Before that, draftRef kept the refused revision forever,
+  // so this same If-Match was replayed by every later autosave and by send — one
+  // conflict wedged both for the life of the window.
+  it('recovers from a conflict by adopting the server revision', async () => {
+    let patches = 0
+    const calls = stubAPI(call => {
+      if (call.method === 'PATCH') {
+        patches += 1
+        return patches === 1
+          ? json({ error: { code: 'conflict', message: '草稿已在别处修改' } }, 409)
+          : json(draft({ revision: 9 }))
+      }
+      if (call.method === 'GET') return json({ draft: draft({ revision: 8 }), attachments: [] })
+      return json({ id: 501, status: 'queued' }, 202)
+    })
+    const { onSent } = open({ initialDraft: draft() })
     fireEvent.change(field('收件人'), { target: { value: 'a@example.com' } })
     fireEvent.click(sendButton())
-    expect(await screen.findByText('草稿已在别处修改')).toBeInTheDocument()
+
+    await waitFor(() => expect(onSent).toHaveBeenCalled())
+    // The retry carries the revision the re-read returned, not the refused one.
+    const retry = calls.filter(call => call.method === 'PATCH')
+    expect(retry).toHaveLength(2)
+    expect(calls.some(call => call.method === 'GET' && call.url === '/api/v1/drafts/501')).toBe(true)
+    expect(calls.some(call => call.url.endsWith('/send'))).toBe(true)
+  })
+
+  // Only when the re-read revision is refused too is the conflict terminal, and then
+  // the message has to tell the user how to get their text back rather than repeating
+  // the server's wording, which does not say what to do.
+  it('reports an actionable conflict when even the fresh revision is refused', async () => {
+    stubAPI(call => {
+      if (call.method === 'PATCH') return json({ error: { code: 'conflict', message: '草稿已在别处修改' } }, 409)
+      if (call.method === 'GET') return json({ draft: draft({ revision: 8 }), attachments: [] })
+      return json({})
+    })
+    const { onSent } = open({ initialDraft: draft() })
+    fireEvent.change(field('收件人'), { target: { value: 'a@example.com' } })
+    fireEvent.click(sendButton())
+    expect(await screen.findByText(/草稿与发件箱/)).toBeInTheDocument()
+    expect(onSent).not.toHaveBeenCalled()
   })
 
   it('recovers on a second attempt after one failed save', async () => {

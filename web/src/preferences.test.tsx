@@ -1,6 +1,7 @@
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { SettingsDialog } from './components/SettingsDialog'
+import type { Account } from './types'
 import {
   defaultPreferences, loadPreferences, notificationPermission,
   requestNotificationPermission, savePreferences, type Preferences,
@@ -122,14 +123,15 @@ describe('settings dialog', () => {
   afterEach(cleanup)
   beforeEach(() => { localStorage.clear(); vi.unstubAllGlobals() })
 
-  function open(overrides: Partial<Preferences> = {}, accounts: Parameters<typeof SettingsDialog>[0]['accounts'] = []) {
+  function open(overrides: Partial<Preferences> = {}, accounts: Account[] = []) {
     const onChange = vi.fn()
     const onClose = vi.fn()
     const onAddAccount = vi.fn()
+    const onDeleted = vi.fn()
     const onLogout = vi.fn()
     render(<SettingsDialog preferences={{ ...defaultPreferences, ...overrides }} accounts={accounts}
-      onChange={onChange} onClose={onClose} onAddAccount={onAddAccount} onLogout={onLogout} />)
-    return { onChange, onClose, onAddAccount, onLogout }
+      onChange={onChange} onClose={onClose} onAddAccount={onAddAccount} onDeleted={onDeleted} onLogout={onLogout} />)
+    return { onChange, onClose, onAddAccount, onDeleted, onLogout }
   }
 
   it('offers the authorization prompt only while the decision is open', () => {
@@ -244,7 +246,7 @@ describe('settings dialog', () => {
   it('stops listening for Escape once unmounted', () => {
     const onClose = vi.fn()
     const view = render(<SettingsDialog preferences={defaultPreferences} accounts={[]}
-      onChange={() => undefined} onClose={onClose} onAddAccount={() => undefined} onLogout={() => undefined} />)
+      onChange={() => undefined} onClose={onClose} onAddAccount={() => undefined} onDeleted={() => undefined} onLogout={() => undefined} />)
     view.unmount()
     fireEvent.keyDown(window, { key: 'Escape' })
     expect(onClose).not.toHaveBeenCalled()

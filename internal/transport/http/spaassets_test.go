@@ -132,3 +132,62 @@ func TestSPAFallsBackForAMissingAssetPath(t *testing.T) {
 		t.Errorf("Content-Type = %q, want text/html", response.Header().Get("Content-Type"))
 	}
 }
+
+// bundleDir finds an embedded subdirectory, so the assertion runs against whatever
+// layout the current build produced rather than assuming "assets".
+func bundleDir(t *testing.T) string {
+	t.Helper()
+	root, err := fs.Sub(static.Files, "dist")
+	if err != nil {
+		t.Fatalf("embedded bundle: %v", err)
+	}
+	found := ""
+	err = fs.WalkDir(root, ".", func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.IsDir() && path != "." && found == "" {
+			found = path
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk bundle: %v", err)
+	}
+	if found == "" {
+		t.Skip("no subdirectory in the embedded bundle")
+	}
+	return found
+}
+
+// fs.Stat succeeds for a directory, so matching on the error alone handed the
+// request to http.FileServer, which answers with an HTML index listing every
+// embedded file. Only a regular file is an asset; a directory is just another
+// unknown path and gets the shell.
+func TestSPADoesNotListADirectory(t *testing.T) {
+	if !hasBundle() {
+		t.Skip("no embedded SPA bundle; run make web-build")
+	}
+	h := newHarness(t)
+	directory := bundleDir(t)
+	root, err := fs.Sub(static.Files, "dist")
+	if err != nil {
+		t.Fatalf("embedded bundle: %v", err)
+	}
+	shell, err := fs.ReadFile(root, "index.html")
+	if err != nil {
+		t.Fatalf("read index.html: %v", err)
+	}
+
+	for _, path := range []string{"/" + directory, "/" + directory + "/"} {
+		response := h.plain(http.MethodGet, path)
+		if !strings.Contains(response.Header().Get("Content-Type"), "text/html") {
+			t.Errorf("%s: Content-Type = %q", path, response.Header().Get("Content-Type"))
+		}
+		// Byte-exact against the shell: a directory index is HTML too, so the content
+		// type alone would not tell the two apart.
+		if response.Body.String() != string(shell) {
+			t.Errorf("%s did not answer with the shell, body was:\n%s", path, response.Body.String())
+		}
+	}
+}

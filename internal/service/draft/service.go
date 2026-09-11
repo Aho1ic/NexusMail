@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/mail"
 	"strings"
 	"sync"
@@ -142,16 +143,29 @@ func (s *Service) Delete(ctx context.Context, id int64) error {
 	// Cancel any push still waiting on the debounce. It would fire after the row is
 	// gone, find nothing, and have spent a provider connection to learn that.
 	s.cancel(id)
+	// The local delete runs first because it carries the terminal-state guard: a
+	// queued or sending draft is answered 409 and keeps its row. DeleteRemoteDraft
+	// sets \Deleted and UIDEXPUNGEs, which is irreversible, so running it first
+	// destroyed the provider's copy and left remote_uid dangling on exactly the
+	// drafts the guard was refusing to delete.
+	if err := s.repo.DeleteDraft(ctx, id); err != nil {
+		return err
+	}
 	if s.remote != nil {
 		// A draft the provider no longer has is the outcome the caller wanted, so
-		// only a different remote failure blocks the local delete. Matched on the
-		// sentinel: the previous substring check on "not found" also swallowed any
-		// unrelated error whose text happened to contain those words.
+		// it is not an error. Matched on the sentinel: the previous substring check
+		// on "not found" also swallowed any unrelated error whose text happened to
+		// contain those words.
+		//
+		// Any other remote failure is logged rather than returned. The local row is
+		// already gone, so the delete the caller asked for did happen; reporting an
+		// error would misreport it. A leftover remote copy is recoverable — the next
+		// draft sync sees an unmatched remote draft — while an expunged one is not.
 		if err := s.remote.DeleteRemoteDraft(ctx, id); err != nil && !errors.Is(err, ports.ErrNotFound) {
-			return err
+			slog.Warn("delete remote draft", "draft_id", id, "error", err)
 		}
 	}
-	return s.repo.DeleteDraft(ctx, id)
+	return nil
 }
 
 func (s *Service) schedule(id int64) {

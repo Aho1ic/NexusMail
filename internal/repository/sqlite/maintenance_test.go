@@ -89,8 +89,10 @@ func TestResetMailboxDropsTheMailboxContents(t *testing.T) {
 }
 
 // TestResetMailboxKeepsOtherMailboxesAndSentMail pins the two limits on that
-// deletion. The orphan sweep is a global NOT IN over messages, so without these the
-// blast radius of one renumbered mailbox is the whole database.
+// deletion. The sweep is what needs the guard: it used to be a global NOT IN over
+// messages, so the blast radius of one renumbered mailbox was the whole database.
+// It is now bounded to the ids this mailbox actually held, and these assertions are
+// what keep it that way.
 func TestResetMailboxKeepsOtherMailboxesAndSentMail(t *testing.T) {
 	store := openTestStore(t)
 	ctx := context.Background()
@@ -215,5 +217,87 @@ func TestDeleteExpiredSessionsLeavesAnEmptyTableAlone(t *testing.T) {
 	store := openTestStore(t)
 	if err := store.DeleteExpiredSessions(context.Background(), time.Now().UnixMilli()); err != nil {
 		t.Errorf("sweeping an empty table failed: %v", err)
+	}
+}
+
+// sessionDeadlines reads both expiry columns for one digest. ValidateSession only
+// reports a yes/no, so it cannot show where a renewal actually left the deadline.
+func sessionDeadlines(t *testing.T, store *Store, hash []byte) (expiresAt, absoluteExpiresAt int64) {
+	t.Helper()
+	err := store.sqlDB.QueryRowContext(context.Background(),
+		"SELECT expires_at, absolute_expires_at FROM web_sessions WHERE token_hash = ?", hash).
+		Scan(&expiresAt, &absoluteExpiresAt)
+	if err != nil {
+		t.Fatalf("read session deadlines: %v", err)
+	}
+	return expiresAt, absoluteExpiresAt
+}
+
+// TestTouchSessionSlidesTheIdleDeadline covers the ordinary renewal: activity has to
+// push expires_at forward, or an active user is logged out on the idle timeout.
+func TestTouchSessionSlidesTheIdleDeadline(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UnixMilli()
+	hour := time.Hour.Milliseconds()
+
+	hash := tokenHash("sliding")
+	if err := store.CreateSession(ctx, hash, tokenHash("csrf"), now+hour, now+24*hour); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.TouchSession(ctx, hash, now+2*hour); err != nil {
+		t.Fatalf("touch session: %v", err)
+	}
+
+	expiresAt, _ := sessionDeadlines(t, store, hash)
+	if expiresAt != now+2*hour {
+		t.Errorf("expires_at = %d, want the renewed %d", expiresAt, now+2*hour)
+	}
+}
+
+// TestTouchSessionClampsToTheAbsoluteCap is the reason the statement uses MIN. A
+// session used often enough to be renewed on every request would otherwise push its
+// idle deadline past absolute_expires_at forever and never be swept — the absolute
+// cap would exist in the schema and mean nothing.
+func TestTouchSessionClampsToTheAbsoluteCap(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UnixMilli()
+	hour := time.Hour.Milliseconds()
+
+	hash := tokenHash("near-the-cap")
+	// The cap is 30 minutes out; the renewal asks for two hours.
+	capAt := now + hour/2
+	if err := store.CreateSession(ctx, hash, tokenHash("csrf"), now+hour/4, capAt); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.TouchSession(ctx, hash, now+2*hour); err != nil {
+		t.Fatalf("touch session: %v", err)
+	}
+
+	expiresAt, absoluteExpiresAt := sessionDeadlines(t, store, hash)
+	if expiresAt != capAt {
+		t.Errorf("expires_at = %d, want it clamped to the cap %d", expiresAt, capAt)
+	}
+	if absoluteExpiresAt != capAt {
+		t.Errorf("absolute_expires_at = %d, want it untouched at %d", absoluteExpiresAt, capAt)
+	}
+	// The clamp has to make the session sweepable once the cap passes, which is the
+	// property the MIN is for.
+	if err := store.DeleteExpiredSessions(ctx, capAt); err != nil {
+		t.Fatal(err)
+	}
+	if rows := sessionRows(t, store, hash); rows != 0 {
+		t.Error("a session renewed past its absolute cap survived the sweep")
+	}
+}
+
+// TestTouchSessionIgnoresAnUnknownToken covers the deleted-session race: a request
+// carrying a cookie whose row was just swept must not turn the renewal into an error
+// the caller has to special-case.
+func TestTouchSessionIgnoresAnUnknownToken(t *testing.T) {
+	store := openTestStore(t)
+	if err := store.TouchSession(context.Background(), tokenHash("never-created"), time.Now().UnixMilli()); err != nil {
+		t.Errorf("touching an unknown session failed: %v", err)
 	}
 }

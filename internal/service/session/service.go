@@ -7,6 +7,7 @@ import (
 	"crypto/subtle"
 	"encoding/base64"
 	"errors"
+	"log/slog"
 	"time"
 )
 
@@ -17,6 +18,7 @@ const CookieName = "nexusmail_session"
 type Store interface {
 	CreateSession(context.Context, []byte, []byte, int64, int64) error
 	ValidateSession(context.Context, []byte, int64) ([]byte, bool, error)
+	TouchSession(context.Context, []byte, int64) error
 	DeleteSession(context.Context, []byte) error
 }
 
@@ -60,15 +62,47 @@ func (s *Service) Create(ctx context.Context, apiKey string) (token, csrf string
 	return token, csrf, expires.UnixMilli(), nil
 }
 
+// lookup is the shared half of Validate and Alive: the store decides expiry
+// against the timestamp it is handed. Factored out so the two callers cannot drift
+// on what "still valid" means — the only difference between them is whether the
+// check counts as activity.
+func (s *Service) lookup(ctx context.Context, token string) (csrfHash []byte, valid bool, err error) {
+	return s.repo.ValidateSession(ctx, hash(token), time.Now().UnixMilli())
+}
+
+// Validate authenticates a real request, so it slides the idle deadline: without
+// this the session died idleTTL after login no matter how actively it was used,
+// because Create is the only writer of expires_at. The slide happens after the CSRF
+// check, not before — a request that fails CSRF is not activity by the session's
+// owner, and renewing on it would let an attacker who only has the cookie keep the
+// session alive.
 func (s *Service) Validate(ctx context.Context, token, csrf string, requireCSRF bool) (bool, error) {
-	csrfHash, valid, err := s.repo.ValidateSession(ctx, hash(token), time.Now().UnixMilli())
+	csrfHash, valid, err := s.lookup(ctx, token)
 	if err != nil || !valid {
 		return false, err
 	}
 	if requireCSRF && subtle.ConstantTimeCompare(csrfHash, hash(csrf)) != 1 {
 		return false, nil
 	}
+	// The repo clamps the new deadline to the absolute cap, so sliding can never
+	// extend a session past it. A failed slide is logged rather than returned: the
+	// session is valid and the request should proceed; the cost is that this one
+	// request did not count as activity.
+	if err := s.repo.TouchSession(ctx, hash(token), time.Now().Add(s.idleTTL).UnixMilli()); err != nil {
+		slog.Warn("slide session idle deadline", "error", err)
+	}
 	return true, nil
+}
+
+// Alive reports whether a session is still valid without counting the check as user
+// activity: the idle deadline is not slid. The WebSocket watcher re-checks an open
+// socket every 30s so logout and expiry actually disconnect it, and going through
+// Validate would make that watcher its own keep-alive — an open socket would renew
+// its TTL forever, which is exactly the stolen-cookie case the watcher exists for.
+// No CSRF argument: there is no request body to protect, only a liveness question.
+func (s *Service) Alive(ctx context.Context, token string) (bool, error) {
+	_, valid, err := s.lookup(ctx, token)
+	return valid, err
 }
 
 func (s *Service) Delete(ctx context.Context, token string) error {
