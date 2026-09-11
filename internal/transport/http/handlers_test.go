@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -492,13 +493,19 @@ func TestCreateAccountValidation(t *testing.T) {
 }
 
 // An internal failure must not leak its text: only the four classified sentinels
-// reach the client verbatim. The missing-OAuth-credentials error is unclassified, so
-// it is a deployment detail the client must not be told.
+// reach the client verbatim. The send worker's error is unclassified, so the
+// handler has to redact it — the queue failure is an implementation detail, not
+// a contract.
 func TestUnclassifiedErrorIsRedacted(t *testing.T) {
 	h := newHarness(t)
-	envelope := h.expectError(h.do(http.MethodPost, "/api/v1/accounts", map[string]any{"provider": "gmail"}), 500, "internal_error")
+	rootCause := errors.New("queue exploded: SELECT * FROM secrets")
+	h.sender.err = rootCause
+	envelope := h.expectError(h.do(http.MethodPost, "/api/v1/drafts/7/send", nil), 500, "internal_error")
 	if envelope.Error.Message != "internal server error" {
 		t.Fatalf("message = %q, want the redacted text", envelope.Error.Message)
+	}
+	if strings.Contains(envelope.Error.Message, rootCause.Error()) {
+		t.Fatal("the unclassified error text leaked to the client")
 	}
 }
 
@@ -510,11 +517,23 @@ func TestCreateAccountRejectsMalformedJSON(t *testing.T) {
 }
 
 // An OAuth provider answers with an authorization URL instead of an account, and
-// nothing is stored until the callback returns. With no client id configured the
-// attempt has to fail rather than half-create anything.
+// nothing is stored until the callback returns. With no client credentials
+// configured the attempt has to fail — but as a classified 400 that says which
+// provider is missing, because in a self-hosted deployment the person clicking
+// is the same person who must add the NEXUSMAIL_*_CLIENT_* variables, and a
+// redacted "internal server error" tells them nothing. This was once 500 by
+// design (a deployment detail the client must not be told); the deployer is the
+// client here, so the message is the contract.
 func TestCreateAccountOAuthNeedsConfiguration(t *testing.T) {
 	h := newHarness(t)
-	h.expectError(h.do(http.MethodPost, "/api/v1/accounts", map[string]any{"provider": "gmail"}), 500, "internal_error")
+	envelope := h.expectError(h.do(http.MethodPost, "/api/v1/accounts", map[string]any{"provider": "gmail"}), 400, "invalid_request")
+	if !strings.Contains(envelope.Error.Message, "missing Google OAuth client credentials") {
+		t.Fatalf("message = %q, want the missing-credentials reason", envelope.Error.Message)
+	}
+	outlook := h.expectError(h.do(http.MethodPost, "/api/v1/accounts", map[string]any{"provider": "outlook", "display_name": "工作邮箱"}), 400, "invalid_request")
+	if !strings.Contains(outlook.Error.Message, "missing Microsoft OAuth client credentials") {
+		t.Fatalf("outlook message = %q, want the missing-credentials reason", outlook.Error.Message)
+	}
 	if started, _, _, _ := h.provider.counts(); started != 0 {
 		t.Fatal("an unconfigured OAuth attempt still started a sync")
 	}

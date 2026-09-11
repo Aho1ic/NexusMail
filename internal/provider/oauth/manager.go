@@ -15,6 +15,7 @@ import (
 
 	"nexusmail/internal/config"
 	"nexusmail/internal/domain"
+	"nexusmail/internal/ports"
 	"nexusmail/internal/provider/auth"
 
 	"golang.org/x/oauth2"
@@ -199,7 +200,7 @@ func (m *Manager) providerConfig(provider string) (*oauth2.Config, error) {
 	switch provider {
 	case "gmail":
 		if m.cfg.Google.ClientID == "" || m.cfg.Google.ClientSecret == "" {
-			return nil, errors.New("missing Google OAuth client credentials")
+			return nil, ports.Invalidf("missing Google OAuth client credentials")
 		}
 		return &oauth2.Config{
 			ClientID: m.cfg.Google.ClientID, ClientSecret: m.cfg.Google.ClientSecret,
@@ -208,7 +209,7 @@ func (m *Manager) providerConfig(provider string) (*oauth2.Config, error) {
 		}, nil
 	case "outlook":
 		if m.cfg.Microsoft.ClientID == "" || m.cfg.Microsoft.ClientSecret == "" {
-			return nil, errors.New("missing Microsoft OAuth client credentials")
+			return nil, ports.Invalidf("missing Microsoft OAuth client credentials")
 		}
 		return &oauth2.Config{
 			ClientID: m.cfg.Microsoft.ClientID, ClientSecret: m.cfg.Microsoft.ClientSecret,
