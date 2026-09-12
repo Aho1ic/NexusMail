@@ -120,4 +120,28 @@ describe('settings', () => {
     expect(dialog).toHaveTextContent('连接异常，正在重试')
     expect(dialog).toHaveTextContent('sync Drafts: connection reset')
   })
+
+  // A parked credential is the one account state only the user can clear, and the
+  // label map had no entry for it, so the fallback printed the machine code
+  // "auth_error" where the remedy belongs. Observed in a real container run.
+  it('tells the user what to do about a rejected credential', async () => {
+    stubAPI([{ ...account, status: 'auth_error', last_error: 'imap: LOGIN failed' }])
+    const dialog = await openSettings()
+
+    expect(dialog).toHaveTextContent('授权已失效，需重新连接该邮箱')
+    expect(dialog).not.toHaveTextContent('auth_error')
+    // The gateway's own text still shows: it is the evidence, not the instruction.
+    expect(dialog).toHaveTextContent('imap: LOGIN failed')
+  })
+
+  // The remedy has to be one the deployment can actually perform. A panic in an
+  // account loop parks it in `error` without restarting it, and there is no
+  // reconnect endpoint, so "稍后重试" named an action that would never happen.
+  it('names the generic fault state instead of printing its code', async () => {
+    stubAPI([{ ...account, status: 'error' }])
+    const dialog = await openSettings()
+
+    expect(dialog).toHaveTextContent('同步出错，请重启网关后重试')
+    expect(dialog).not.toHaveTextContent('error')
+  })
 })

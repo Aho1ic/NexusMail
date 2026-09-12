@@ -5,8 +5,10 @@ type Provider string
 const (
 	ProviderQQ      Provider = "qq"
 	Provider163     Provider = "163"
+	Provider126     Provider = "126"
 	ProviderGmail   Provider = "gmail"
 	ProviderOutlook Provider = "outlook"
+	ProviderICloud  Provider = "icloud"
 )
 
 type Account struct {

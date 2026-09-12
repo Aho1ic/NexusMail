@@ -200,6 +200,34 @@ func incrementalUIDRange(lastUID uint32, uidNext goimap.UID) (goimap.UIDSet, boo
 	return set, true
 }
 
+// selectForStoredUID selects a mailbox for an operation that is about to act on a
+// UID this app stored earlier, and refuses when the provider has renumbered it.
+//
+// UIDVALIDITY is the provider's statement about which incarnation of a mailbox its
+// UIDs belong to. QQ and 163 change it whenever the server rebuilds a mailbox
+// index, and every UID stored under the old value then names a different message —
+// or none. syncMailbox handles that by resetting the mailbox and re-ingesting; this
+// is the read-side half of the same invariant, for the paths that cannot wait for a
+// sync because they are already holding a stored UID.
+//
+// It exists as one function because four call sites need the identical comparison —
+// fetchBody, archiveOn, SetFlags and setSeenAccount — and three of them originally
+// had no check at all. Two guarded paths beside one unguarded path is worse than
+// none: the next reader takes the omission for a deliberate exemption. What each
+// caller does with the refusal still differs, and that stays at the call site.
+func selectForStoredUID(client *imapclient.Client, mailbox domain.Mailbox, options *goimap.SelectOptions) error {
+	selected, err := client.Select(mailbox.RemoteName, options).Wait()
+	if err != nil {
+		return err
+	}
+	// A zero stored value means this mailbox has no cursor yet, so there is no
+	// earlier incarnation to disagree with.
+	if mailbox.UIDValidity != 0 && selected.UIDValidity != mailbox.UIDValidity {
+		return ports.Unavailablef("mailbox was renumbered by the provider, waiting for resync")
+	}
+	return nil
+}
+
 // syncMailbox ingests new UIDs and, unless skipReconcile is set, repairs
 // flag/expunge drift. The 5s inbox probe passes skipReconcile=true: the safety
 // net's only job is to surface new mail quickly, and reconciliation on a large
@@ -223,14 +251,21 @@ func (s *Supervisor) syncMailbox(ctx context.Context, client *imapclient.Client,
 		// is throttled" and "this one command is refused".
 		return fmt.Errorf("select: %w", err)
 	}
+	// rebuilt separates "the provider renumbered a mailbox this app had already
+	// synced" from "this mailbox has no cursor yet". Both leave LastUID at 0, and
+	// searchNewUIDs treats the second one as a first import bounded to 30 days —
+	// which on a reset would silently discard everything older that ResetMailbox
+	// just deleted locally and never ask for it again.
+	rebuilt := false
 	if mailbox.UIDValidity != 0 && mailbox.UIDValidity != selected.UIDValidity {
 		if err := s.repo.ResetMailbox(ctx, mailbox.ID, selected.UIDValidity); err != nil {
 			return err
 		}
 		mailbox.LastUID = 0
+		rebuilt = true
 	}
 	mailbox.UIDValidity = selected.UIDValidity
-	uids, err := searchNewUIDs(client, mailbox.LastUID, selected.UIDNext)
+	uids, err := searchNewUIDs(client, mailbox.LastUID, selected.UIDNext, rebuilt)
 	if err != nil {
 		return err
 	}
@@ -303,9 +338,17 @@ func (s *Supervisor) syncMailbox(ctx context.Context, client *imapclient.Client,
 // is seeded from the last 30 days rather than from everything it holds; one with a
 // cursor asks only for the range above it, and asks nothing at all when
 // incrementalUIDRange reports the range is empty.
-func searchNewUIDs(client *imapclient.Client, lastUID uint32, uidNext goimap.UID) ([]goimap.UID, error) {
+//
+// rebuilt makes a reset mailbox take the cursor path from UID 1 instead of the
+// 30-day seed. The window exists so adding an account does not import years of
+// mail at once; on a UIDVALIDITY change it would instead lose mail. QQ and 163
+// renumber a mailbox whenever the server rebuilds its index, and ResetMailbox has
+// by then deleted every local row for it — so anything the window excludes is gone
+// from this app while still sitting on the provider, and no later pass asks again:
+// the cursor advances past it on this very sync.
+func searchNewUIDs(client *imapclient.Client, lastUID uint32, uidNext goimap.UID, rebuilt bool) ([]goimap.UID, error) {
 	criteria := &goimap.SearchCriteria{}
-	if lastUID == 0 {
+	if lastUID == 0 && !rebuilt {
 		criteria.Since = time.Now().AddDate(0, 0, -30)
 	} else {
 		set, search := incrementalUIDRange(lastUID, uidNext)

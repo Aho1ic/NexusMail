@@ -134,14 +134,6 @@ jobs:
           # Read from go.mod so the tested toolchain cannot drift from the built one.
           go-version-file: go.mod
 
-      - name: Run Go tests
-        # sqlite_fts5 is not optional: the schema declares FTS5 virtual tables and
-        # migration fails without the tag. go-sqlite3 is CGO, built with the C
-        # toolchain ubuntu-latest already ships.
-        env:
-          CGO_ENABLED: '1'
-        run: go test -tags sqlite_fts5 ./...
-
       - name: Set up Node
         uses: actions/setup-node@v4
         with:
@@ -156,6 +148,24 @@ jobs:
       - name: Run frontend tests
         run: npm test
         working-directory: web
+
+      # Ahead of the Go tests on purpose. internal/transport/http/static/dist holds
+      # only the tracked placeholders in a fresh clone, so the seven SPA tests decide
+      # whether to run by looking for an embedded index.html: without a build they all
+      # skipped and the gate stayed green while the bundle Dockerfile embeds went
+      # untested. NEXUSMAIL_REQUIRE_SPA_BUNDLE turns that skip into a failure so a
+      # missing bundle can never be silent here again.
+      - name: Build the frontend bundle
+        run: make web-build
+
+      - name: Run Go tests
+        # sqlite_fts5 is not optional: the schema declares FTS5 virtual tables and
+        # migration fails without the tag. go-sqlite3 is CGO, built with the C
+        # toolchain ubuntu-latest already ships.
+        env:
+          CGO_ENABLED: '1'
+          NEXUSMAIL_REQUIRE_SPA_BUNDLE: '1'
+        run: go test -tags sqlite_fts5 ./...
 
   # One leg per architecture on its own native runner. The alternative — a single
   # job building both under QEMU — emulates the CGO/static Go build, and this

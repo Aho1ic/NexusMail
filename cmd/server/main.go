@@ -91,11 +91,17 @@ func run(rootCtx context.Context) error {
 	// The workers are joined before the deferred repo.Close, so this defer is
 	// registered after it: defers are LIFO. The SMTP client only uses ctx for the
 	// dial and drives the rest of the conversation on socket deadlines, so a
-	// cancelled context does not abort a delivery in flight — without the join it can
-	// be accepted by the provider and then fail its CreateSentMessage and
-	// SetDraftDelivery writes against a closed database, leaving the draft in
-	// 'sending' for RecoverSendingDrafts to downgrade to 'unknown' on the next boot:
-	// a delivered message presented as possibly undelivered.
+	// cancelled context does not abort a delivery in flight — without the join its
+	// CreateSentMessage and SetDraftDelivery writes would run against a closed
+	// database.
+	//
+	// The join keeps the database open; it does not make workerCtx usable. A
+	// cancelled context fails a write in database/sql before a connection is even
+	// taken from the pool, so the send worker derives its own context for the
+	// writes that record a delivery outcome (see postDeliveryWrite). Both halves
+	// are needed: without either, a message the provider accepted is left in
+	// 'sending' for RecoverSendingDrafts to downgrade to 'unknown' on the next
+	// boot, and presented to the user as possibly undelivered.
 	//
 	// The workers get their own cancel rather than watching rootCtx, because a
 	// listener that fails to bind returns from run with rootCtx still live, and Wait
@@ -140,12 +146,19 @@ func run(rootCtx context.Context) error {
 type maintRepo interface {
 	DeleteExpiredSessions(context.Context, int64) error
 }
-type evictor interface{ Evict(context.Context) error }
 
-// maintenanceInterval is how often expired sessions are swept and the blob cache
-// is trimmed. Both are cheap and neither is urgent: a session past its TTL is
-// already rejected on use, and the cache only has to stay under its ceiling over
-// time.
+// evictor is the blob maintenance surface, which is deliberately wider here than
+// ports.BlobStore: ReclaimOrphans scans for unreferenced rows, and no HTTP handler
+// should be able to reach a full-table sweep. The ticker is its only caller.
+type evictor interface {
+	Evict(context.Context) error
+	ReclaimOrphans(context.Context) error
+}
+
+// maintenanceInterval is how often expired sessions are swept, the blob cache is
+// trimmed and orphaned durable blobs are reclaimed. None is urgent: a session past
+// its TTL is already rejected on use, the cache only has to stay under its ceiling
+// over time, and an orphan costs disk rather than correctness.
 const maintenanceInterval = 15 * time.Minute
 
 // maintenance takes its interval as a parameter so a test can observe a tick
@@ -160,6 +173,10 @@ func maintenance(ctx context.Context, repo maintRepo, blobs evictor, every time.
 		case <-ticker.C:
 			_ = repo.DeleteExpiredSessions(ctx, time.Now().UnixMilli())
 			_ = blobs.Evict(ctx)
+			// Evict only ever considers durability='cache', so this is the sole
+			// reclamation path for the durable tier: without it every attachment
+			// ever uploaded to a draft stays on disk for the life of the deployment.
+			_ = blobs.ReclaimOrphans(ctx)
 		}
 	}
 }

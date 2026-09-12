@@ -5,7 +5,10 @@ import (
 	"errors"
 	"log/slog"
 	"math/rand/v2"
+	"runtime/debug"
 	"time"
+
+	"nexusmail/internal/ports"
 
 	goimap "github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapclient"
@@ -14,7 +17,56 @@ import (
 // The two goroutines each account runs: commandLoop, which owns the command
 // connection and does all work, and idleLoop, which only listens and signals.
 
+// runAccountLoop runs one of the two per-account loops and recovers a panic so
+// it cannot take the process down. Both loops walk provider responses and write
+// to the database on every iteration, and neither had a recover: an out-of-range
+// index in a fetch response or a panic from the FTS5 triggers terminated
+// everything — the other accounts' connections, the send worker and the four
+// body workers. The prefetch workers already carry this guard for the same
+// reason (see Start).
+//
+// A recovered loop does not restart. Restarting is what `backoff` means, and
+// that status tells the user "正在重试"; a panic is a bug in this code, not a
+// transient provider fault, so retrying it would either hot-loop or paper over
+// the bug. The account is parked in `error` instead, which the settings page
+// renders as "同步出错，请重启网关后重试". last_error is left empty: the panic value
+// can carry a message body or a credential, and that text must not reach the
+// client. The stack goes to the log. The sibling loop is cancelled so it cannot
+// overwrite the status on its next pass (commandLoop writes 'connecting' at the
+// top of every iteration).
+func (s *Supervisor) runAccountLoop(ctx context.Context, rt *runtime, name string, loop func(context.Context, *runtime)) {
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Error("mail account loop panicked", "account_id", rt.account.ID, "loop", name,
+				"panic", r, "stack", string(debug.Stack()))
+			// The loop's ctx is often already done — the sibling was cancelled, or
+			// Stop is in flight — so the status write cannot inherit it. Same
+			// reasoning as rollbackCtx on a failed body fetch.
+			writeCtx, cancel := context.WithTimeout(context.Background(), rollbackGrace)
+			defer cancel()
+			if err := s.repo.UpdateAccountStatus(writeCtx, rt.account.ID, "error", nil); err != nil {
+				slog.Error("mail account status update failed", "account_id", rt.account.ID, "status", "error", "error", err)
+			}
+			s.events.Publish(ports.Event{Type: "ACCOUNT_STATUS", Data: map[string]any{
+				"account_id": rt.account.ID, "status": "error",
+			}})
+			s.StopAccount(rt.account.ID)
+		}
+	}()
+	loop(ctx, rt)
+}
+
 func (s *Supervisor) commandLoop(ctx context.Context, rt *runtime) {
+	// A panic after rt.client.Store would skip the closeCommand below, so the
+	// leftover socket would outlive the parked account. Swapping it out here is
+	// a no-op on a normal return: closeCommand already nilled the pointer, and a
+	// nil Close is what we want on the leftover. StopAccount may also close it;
+	// closing twice is harmless.
+	defer func() {
+		if client := rt.client.Swap(nil); client != nil {
+			_ = client.Close()
+		}
+	}()
 	backoff := time.Second
 	for ctx.Err() == nil {
 		_ = s.repo.UpdateAccountStatus(ctx, rt.account.ID, "connecting", nil)
@@ -86,9 +138,7 @@ func (s *Supervisor) runSession(ctx context.Context, rt *runtime, client *imapcl
 	if _, listErr := s.refreshMailboxCatalog(ctx, rt, client); listErr != nil {
 		return verdict{status: "backoff", delay: ladder, store: true, ladder: true}, listErr
 	}
-	rt.lock()
-	syncErr := s.syncAllMailboxes(ctx, rt, client)
-	rt.unlock()
+	syncErr := rt.withLock(func() error { return s.syncAllMailboxes(ctx, rt, client) })
 	if syncErr != nil {
 		// OAuth tokens can expire mid-session: the connect succeeded but a
 		// later IMAP command now returns ResponseCodeAuthenticationFailed.
@@ -210,9 +260,7 @@ func (s *Supervisor) serveConnected(ctx context.Context, rt *runtime, client *im
 // runProbe takes the command lock for one inbox probe and queues whatever bodies
 // it turned up.
 func (s *Supervisor) runProbe(ctx context.Context, rt *runtime, client *imapclient.Client) error {
-	rt.lock()
-	err := s.probeInbox(ctx, rt, client)
-	rt.unlock()
+	err := rt.withLock(func() error { return s.probeInbox(ctx, rt, client) })
 	if err != nil {
 		return err
 	}
@@ -223,16 +271,16 @@ func (s *Supervisor) runProbe(ctx context.Context, rt *runtime, client *imapclie
 // serviceSyncRequest answers one queued sync request and everything queued behind
 // it, in a single lock acquisition.
 func (s *Supervisor) serviceSyncRequest(ctx context.Context, rt *runtime, client *imapclient.Client, mailboxID int64) error {
-	rt.lock()
 	// servicePending, not a copy of its rules: it resolves the zero
 	// sentinel to the inbox and refuses a mailbox belonging to another
 	// account. Anything else queued behind it is drained in the same lock
 	// acquisition rather than one request per pass through the select.
-	err := s.servicePending(ctx, rt, client, mailboxID)
-	if err == nil {
-		err = s.drainPending(ctx, rt, client)
-	}
-	rt.unlock()
+	err := rt.withLock(func() error {
+		if err := s.servicePending(ctx, rt, client, mailboxID); err != nil {
+			return err
+		}
+		return s.drainPending(ctx, rt, client)
+	})
 	if err != nil {
 		return err
 	}
@@ -250,9 +298,7 @@ func (s *Supervisor) periodicSync(ctx context.Context, rt *runtime, client *imap
 	if _, listErr := s.refreshMailboxCatalog(ctx, rt, client); listErr != nil {
 		slog.Debug("mailbox catalog refresh failed", "account_id", rt.account.ID, "error", listErr)
 	}
-	rt.lock()
-	err := s.syncAllMailboxes(ctx, rt, client)
-	rt.unlock()
+	err := rt.withLock(func() error { return s.syncAllMailboxes(ctx, rt, client) })
 	if err != nil {
 		return err
 	}

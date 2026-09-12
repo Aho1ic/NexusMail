@@ -1,6 +1,7 @@
 package sqlite
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"database/sql/driver"
@@ -68,8 +69,12 @@ type Store struct {
 	writeMu sync.Mutex
 	// unreadCache memoises unreadTotal with a short TTL so the realtime
 	// 80ms-coalesced feed refresh in App.tsx does not re-issue the
-	// COUNT(DISTINCT) join on every tick.
-	unreadCache sync.Map
+	// count on every tick. Guarded by unreadMu rather than held in a
+	// sync.Map because the bound below needs the entry count, which
+	// sync.Map cannot report; the critical section is a map lookup in
+	// front of a query that costs milliseconds.
+	unreadMu    sync.Mutex
+	unreadCache map[unreadCacheKey]unreadCacheEntry
 }
 
 func Open(path string) (*Store, error) {
@@ -88,7 +93,7 @@ func Open(path string) (*Store, error) {
 	sqlDB.SetMaxOpenConns(8)
 	sqlDB.SetMaxIdleConns(4)
 	sqlDB.SetConnMaxLifetime(0)
-	store := &Store{db: db, sqlDB: sqlDB}
+	store := &Store{db: db, sqlDB: sqlDB, unreadCache: make(map[unreadCacheKey]unreadCacheEntry)}
 	if err := store.configure(context.Background()); err != nil {
 		_ = sqlDB.Close()
 		return nil, err
@@ -181,12 +186,59 @@ func (s *Store) migrationApplied(ctx context.Context, version int) (bool, error)
 	return count > 0, nil
 }
 
+// foreignKeysOffDirective marks a migration that must run with foreign keys
+// disabled. It is needed to rebuild a table that is the parent of an
+// ON DELETE CASCADE chain: with foreign keys on, DROP TABLE performs an implicit
+// DELETE FROM that fires those actions, so rebuilding accounts inside the normal
+// transaction empties mailboxes, messages and drafts. PRAGMA foreign_keys is a
+// no-op inside a transaction, which is why the runner has to own this rather than
+// the script.
+const foreignKeysOffDirective = "-- nexusmail:foreign_keys=off"
+
+// applyMigration runs one migration and records it, atomically.
+//
+// Everything happens on one pinned connection because the PRAGMA that the
+// directive needs is per-connection: issued against the pool it would land on an
+// arbitrary connection and leave the migration running with foreign keys still
+// on. Pinning also guarantees the restore lands on the connection that was
+// changed.
 func (s *Store) applyMigration(ctx context.Context, version int, name string) error {
 	script, err := migrations.FS.ReadFile(name)
 	if err != nil {
 		return fmt.Errorf("read migration %s: %w", name, err)
 	}
-	tx, err := s.sqlDB.BeginTx(ctx, nil)
+	conn, err := s.sqlDB.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("pin connection for migration %s: %w", name, err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	if !bytes.HasPrefix(script, []byte(foreignKeysOffDirective)) {
+		return s.runMigration(ctx, conn, version, name, script)
+	}
+	if _, err := conn.ExecContext(ctx, "PRAGMA foreign_keys=OFF"); err != nil {
+		return fmt.Errorf("disable foreign keys for migration %s: %w", name, err)
+	}
+	// The restore must happen before the connection is handed back to the pool: a
+	// pooled connection with foreign keys off would silently drop every cascade
+	// that runs on it afterwards. A failure to restore is therefore reported even
+	// when the migration itself succeeded — Open is the only caller and it closes
+	// the pool on any error, so the connection never survives to be reused.
+	migrateErr := s.runMigration(ctx, conn, version, name, script)
+	if _, err := conn.ExecContext(ctx, "PRAGMA foreign_keys=ON"); err != nil {
+		return errors.Join(migrateErr, fmt.Errorf("restore foreign keys after migration %s: %w", name, err))
+	}
+	if migrateErr != nil {
+		return migrateErr
+	}
+	// A rebuild that carried the parent keys over wrongly leaves children pointing
+	// at rows that no longer exist. Nothing else would notice: the reads still
+	// succeed and return short.
+	return s.checkForeignKeys(ctx, conn, name)
+}
+
+func (s *Store) runMigration(ctx context.Context, conn *sql.Conn, version int, name string, script []byte) error {
+	tx, err := conn.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin migration %s: %w", name, err)
 	}
@@ -199,6 +251,37 @@ func (s *Store) applyMigration(ctx context.Context, version int, name string) er
 		return fmt.Errorf("record migration %s: %w", name, err)
 	}
 	return tx.Commit()
+}
+
+// checkForeignKeys reports the violations foreign_key_check finds. Only the first
+// few are named: a rebuild that went wrong can orphan every row in the database,
+// and the point is to fail with something readable, not to enumerate it.
+func (s *Store) checkForeignKeys(ctx context.Context, conn *sql.Conn, name string) error {
+	rows, err := conn.QueryContext(ctx, "PRAGMA foreign_key_check")
+	if err != nil {
+		return fmt.Errorf("foreign key check after migration %s: %w", name, err)
+	}
+	defer func() { _ = rows.Close() }()
+	var samples []string
+	for rows.Next() {
+		var table, parent sql.NullString
+		var rowid sql.NullInt64
+		var fkid sql.NullInt64
+		if err := rows.Scan(&table, &rowid, &parent, &fkid); err != nil {
+			return fmt.Errorf("foreign key check after migration %s: %w", name, err)
+		}
+		samples = append(samples, fmt.Sprintf("%s.rowid=%d -> %s", table.String, rowid.Int64, parent.String))
+		if len(samples) == 5 {
+			break
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("foreign key check after migration %s: %w", name, err)
+	}
+	if len(samples) > 0 {
+		return fmt.Errorf("migration %s left orphaned rows: %s", name, strings.Join(samples, ", "))
+	}
+	return nil
 }
 
 // parseMigrationName extracts the leading integer version from a migration
@@ -347,7 +430,13 @@ func (s *Store) BatchCreateOrUpdateMessages(ctx context.Context, items []ports.M
 				if err := tx.Model(&domain.Message{}).Where("id = ?", existingID).Updates(map[string]any{
 					"subject": item.Message.Subject, "sender": item.Message.Sender, "recipients": item.Message.Recipients,
 					"from_json": item.Message.FromJSON, "to_json": item.Message.ToJSON, "cc_json": item.Message.CCJSON,
-					"is_read": item.Message.IsRead, "is_starred": item.Message.IsStarred, "updated_at": item.Message.UpdatedAt,
+					"is_read": item.Message.IsRead, "is_starred": item.Message.IsStarred,
+					// has_attachments is re-derived from BodyStructure on every fetch, so
+					// including it here is what lets a re-sync correct rows written before
+					// ingest set the column at all — those rows are stuck at the schema
+					// default of 0 and show no paperclip however many attachments they carry.
+					"has_attachments": item.Message.HasAttachments,
+					"updated_at":      item.Message.UpdatedAt,
 				}).Error; err != nil {
 					return err
 				}
@@ -445,19 +534,57 @@ const feedColumns = `messages.id, messages.account_id, messages.direction, messa
 
 // unreadCacheTTL bounds how long an unreadTotal value can be reused. The
 // realtime 80ms-coalesced refresh in App.tsx fires many times per minute;
-// the underlying COUNT(DISTINCT) re-joins the same set on every call. A
+// the underlying count re-runs the same scoped query on every call. A
 // short TTL turns the burst into one query per window without losing the
 // "the badge updates" feel. Writes that change is_read (UpdateMessage /
 // UpdateMessages) invalidate the entry so a manual mark-read reflects
 // immediately.
 const unreadCacheTTL = 2 * time.Second
 
+// unreadCacheEntries bounds the table. Folder and Query come straight from the
+// query string, so the key space is client-controlled and not limited to the
+// handful of views the UI can produce: a client typing into the search box
+// mints one entry per keystroke prefix, and entries are only dropped by a write
+// that invalidates the whole table — which on an idle account may never come.
+// Overflowing the bound costs at most one recount per live view.
+const unreadCacheEntries = 512
+
+// unreadCacheKey identifies one view by value. The filter carries *int64 and
+// *bool, and struct equality compares pointers by address: the transport
+// allocates a fresh pointer per request (optionalInt64 in
+// transport/http/errors.go), so keying on the pointers made every lookup for a
+// filtered view miss and store a second entry — the cache existed only for the
+// unfiltered feed, which is not the view the client asks for once an account or
+// mailbox is selected. The has* flags keep "not specified" distinct from an
+// explicit zero, which are different queries.
 type unreadCacheKey struct {
-	AccountID *int64
-	MailboxID *int64
-	Folder    string
-	Query     string
-	IsRead    *bool
+	accountID    int64
+	hasAccountID bool
+	mailboxID    int64
+	hasMailboxID bool
+	folder       string
+	query        string
+	isRead       bool
+	hasIsRead    bool
+	isStarred    bool
+	hasIsStarred bool
+}
+
+func newUnreadCacheKey(filter ports.MessageFilter) unreadCacheKey {
+	key := unreadCacheKey{folder: filter.Folder, query: filter.Query}
+	if filter.AccountID != nil {
+		key.accountID, key.hasAccountID = *filter.AccountID, true
+	}
+	if filter.MailboxID != nil {
+		key.mailboxID, key.hasMailboxID = *filter.MailboxID, true
+	}
+	if filter.IsRead != nil {
+		key.isRead, key.hasIsRead = *filter.IsRead, true
+	}
+	if filter.IsStarred != nil {
+		key.isStarred, key.hasIsStarred = *filter.IsStarred, true
+	}
+	return key
 }
 
 type unreadCacheEntry struct {
@@ -466,19 +593,36 @@ type unreadCacheEntry struct {
 }
 
 func (s *Store) cachedUnreadTotal(ctx context.Context, filter ports.MessageFilter) (int, bool, error) {
-	key := unreadCacheKey{AccountID: filter.AccountID, MailboxID: filter.MailboxID, Folder: filter.Folder, Query: filter.Query, IsRead: filter.IsRead}
-	if value, ok := s.unreadCache.Load(key); ok {
-		entry := value.(unreadCacheEntry)
-		if time.Now().Before(entry.expiresAt) {
-			return entry.count, true, nil
-		}
+	key := newUnreadCacheKey(filter)
+	s.unreadMu.Lock()
+	entry, ok := s.unreadCache[key]
+	s.unreadMu.Unlock()
+	if ok && time.Now().Before(entry.expiresAt) {
+		return entry.count, true, nil
 	}
 	count, err := s.unreadTotal(ctx, filter)
 	if err != nil {
 		return 0, false, err
 	}
-	s.unreadCache.Store(key, unreadCacheEntry{count: count, expiresAt: time.Now().Add(unreadCacheTTL)})
+	now := time.Now()
+	s.unreadMu.Lock()
+	defer s.unreadMu.Unlock()
+	if len(s.unreadCache) >= unreadCacheEntries {
+		s.dropExpiredUnreadLocked(now)
+		if len(s.unreadCache) >= unreadCacheEntries {
+			clear(s.unreadCache)
+		}
+	}
+	s.unreadCache[key] = unreadCacheEntry{count: count, expiresAt: now.Add(unreadCacheTTL)}
 	return count, false, nil
+}
+
+func (s *Store) dropExpiredUnreadLocked(now time.Time) {
+	for key, entry := range s.unreadCache {
+		if !now.Before(entry.expiresAt) {
+			delete(s.unreadCache, key)
+		}
+	}
 }
 
 // invalidateUnreadCache drops every cache entry that could be affected by
@@ -492,10 +636,9 @@ func (s *Store) cachedUnreadTotal(ctx context.Context, filter ports.MessageFilte
 // improvement once the cache size becomes observable. The current 2s TTL
 // already bounds the staleness window.
 func (s *Store) invalidateUnreadCache() {
-	s.unreadCache.Range(func(key, _ any) bool {
-		s.unreadCache.Delete(key)
-		return true
-	})
+	s.unreadMu.Lock()
+	defer s.unreadMu.Unlock()
+	clear(s.unreadCache)
 }
 
 func (s *Store) ListMessages(ctx context.Context, filter ports.MessageFilter) (ports.MessagePage, error) {
@@ -506,23 +649,12 @@ func (s *Store) ListMessages(ctx context.Context, filter ports.MessageFilter) (p
 	if limit > 100 {
 		limit = 100
 	}
-	query := s.db.WithContext(ctx).Model(&domain.Message{}).Distinct(feedColumns)
-	query = applyMessageScope(query, filter)
-	if filter.IsRead != nil {
-		query = query.Where("messages.is_read = ?", *filter.IsRead)
-	}
-	if filter.Query != "" {
-		query = applyMessageSearch(query, filter.Query)
-	}
-	if filter.Cursor != "" {
-		cursor, err := decodeCursor(filter.Cursor)
-		if err != nil {
-			return ports.MessagePage{}, err
-		}
-		query = query.Where("(messages.received_at < ? OR (messages.received_at = ? AND messages.id < ?))", cursor.ReceivedAt, cursor.ReceivedAt, cursor.ID)
+	query, err := s.feedQuery(ctx, filter, limit)
+	if err != nil {
+		return ports.MessagePage{}, err
 	}
 	var items []domain.Message
-	if err := query.Order("messages.received_at DESC, messages.id DESC").Limit(limit + 1).Find(&items).Error; err != nil {
+	if err := query.Find(&items).Error; err != nil {
 		return ports.MessagePage{}, err
 	}
 	page := ports.MessagePage{Items: items}
@@ -539,17 +671,46 @@ func (s *Store) ListMessages(ctx context.Context, filter ports.MessageFilter) (p
 	return page, nil
 }
 
+// feedQuery builds the one page query the feed runs, up to but not including its
+// execution. It is separate from ListMessages so the query-plan regression test
+// can render the SQL this code really produces instead of a hand-copied
+// approximation that drifts the first time a predicate changes.
+func (s *Store) feedQuery(ctx context.Context, filter ports.MessageFilter, limit int) (*gorm.DB, error) {
+	query := applyMessageScope(s.db.WithContext(ctx).Model(&domain.Message{}).Select(feedColumns), filter)
+	if filter.IsRead != nil {
+		query = query.Where("messages.is_read = ?", *filter.IsRead)
+	}
+	if filter.Query != "" {
+		query = applyMessageSearch(query, filter.Query)
+	}
+	if filter.Cursor != "" {
+		cursor, err := decodeCursor(filter.Cursor)
+		if err != nil {
+			return nil, err
+		}
+		query = query.Where("(messages.received_at < ? OR (messages.received_at = ? AND messages.id < ?))", cursor.ReceivedAt, cursor.ReceivedAt, cursor.ID)
+	}
+	// limit+1 is the page probe: one row past the page proves there is a next one
+	// without a second count query.
+	return query.Order("messages.received_at DESC, messages.id DESC").Limit(limit + 1), nil
+}
+
 // unreadTotal counts the unread mail the whole view holds, ignoring the cursor:
 // the count belongs to the view, not to the page being read.
 func (s *Store) unreadTotal(ctx context.Context, filter ports.MessageFilter) (int, error) {
+	var count int64
+	err := s.unreadQuery(ctx, filter).Count(&count).Error
+	return int(count), err
+}
+
+// unreadQuery is split out for the same reason feedQuery is: the query-plan test
+// renders what this builds rather than a copy of it.
+func (s *Store) unreadQuery(ctx context.Context, filter ports.MessageFilter) *gorm.DB {
 	query := applyMessageScope(s.db.WithContext(ctx).Model(&domain.Message{}), filter)
 	if filter.Query != "" {
 		query = applyMessageSearch(query, filter.Query)
 	}
-	var count int64
-	err := query.Where("messages.is_read = 0 AND messages.direction = 'incoming'").
-		Distinct("messages.id").Count(&count).Error
-	return int(count), err
+	return query.Where("messages.is_read = 0 AND messages.direction = 'incoming'")
 }
 
 // applyMessageSearch applies the FTS or LIKE predicate shared by the message feed
@@ -586,18 +747,40 @@ func ftsPrefix(value string) string {
 // applyMessageScope adds the account, mailbox and folder predicates shared by the
 // message feed and the bulk mark-read query, so the two can never disagree about
 // which messages "the current view" contains.
+//
+// The mailbox predicate is a correlated EXISTS rather than a join. A message
+// filed in two mailboxes matches the join twice, so the feed had to carry
+// SELECT DISTINCT, and that combination made SQLite give up on the
+// (received_at DESC, id DESC) index: measured on 100k messages / 100k mappings
+// with no ANALYZE (the store never runs it), the default view App.tsx requests
+// on first paint and on every realtime refresh — folder=inbox with no account —
+// planned as SCAN mm plus a temp B-tree for DISTINCT and another for ORDER BY,
+// 42ms per call. EXISTS yields at most one row per message, so the ordered index
+// drives the query and LIMIT 41 stops it early: 1.6ms for the same result set.
+// It also removes the reason DISTINCT was there, which is why the feed selects
+// its columns plainly.
 func applyMessageScope(query *gorm.DB, filter ports.MessageFilter) *gorm.DB {
 	if filter.AccountID != nil {
 		query = query.Where("messages.account_id = ?", *filter.AccountID)
 	}
-	if filter.MailboxID != nil || filter.Folder != "" {
-		query = query.Joins("JOIN mailbox_messages mm ON mm.message_id = messages.id").Joins("JOIN mailboxes mb ON mb.id = mm.mailbox_id")
-		if filter.MailboxID != nil {
-			query = query.Where("mb.id = ?", *filter.MailboxID)
-		}
-		if filter.Folder != "" {
-			query = query.Where("mb.role = ?", filter.Folder)
-		}
+	if filter.IsStarred != nil {
+		// Starred is a scope, not a page filter: the unread count and the bulk
+		// mark-read pass must see the same starred set the feed does.
+		query = query.Where("messages.is_starred = ?", *filter.IsStarred)
+	}
+	switch {
+	case filter.MailboxID != nil && filter.Folder != "":
+		// Both predicates have to hold for the same mapping row, exactly as the
+		// single joined mb row used to satisfy them together.
+		query = query.Where(`EXISTS (SELECT 1 FROM mailbox_messages mm JOIN mailboxes mb ON mb.id = mm.mailbox_id
+			WHERE mm.message_id = messages.id AND mm.mailbox_id = ? AND mb.role = ?)`, *filter.MailboxID, filter.Folder)
+	case filter.MailboxID != nil:
+		// mailboxes is not consulted: mailbox_messages.mailbox_id is a foreign key
+		// with ON DELETE CASCADE, so a mapping row for this id implies the mailbox.
+		query = query.Where("EXISTS (SELECT 1 FROM mailbox_messages mm WHERE mm.message_id = messages.id AND mm.mailbox_id = ?)", *filter.MailboxID)
+	case filter.Folder != "":
+		query = query.Where(`EXISTS (SELECT 1 FROM mailbox_messages mm JOIN mailboxes mb ON mb.id = mm.mailbox_id
+			WHERE mm.message_id = messages.id AND mb.role = ?)`, filter.Folder)
 	}
 	return query
 }
@@ -618,7 +801,7 @@ func (s *Store) UnreadMessageIDs(ctx context.Context, filter ports.MessageFilter
 	}
 	var ids []int64
 	err := query.Where("messages.is_read = 0 AND messages.direction = 'incoming'").
-		Distinct().Order("messages.received_at DESC, messages.id DESC").Limit(limit).
+		Order("messages.received_at DESC, messages.id DESC").Limit(limit).
 		Pluck("messages.id", &ids).Error
 	return ids, err
 }

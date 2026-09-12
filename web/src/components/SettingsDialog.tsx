@@ -1,8 +1,9 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { AtSign, Bell, Image, Keyboard, LogOut, Plus, Trash2, X } from 'lucide-react'
 import { Dialog } from './shared'
 import { providerLabel } from './providers'
 import { accountStatusLabel, formatFullDate, messageOf } from '../lib/format'
+import { accountPalette, defaultAccountColor, normalizeHexColor } from '../lib/accountColors'
 import { APIError, api } from '../lib/api'
 import { notificationPermission, requestNotificationPermission, type Preferences } from '../lib/preferences'
 import type { Account } from '../types'
@@ -18,6 +19,12 @@ export function SettingsDialog({ preferences, accounts, onChange, onClose, onAdd
   const [deleting, setDeleting] = useState<number | null>(null)
   const [deleteError, setDeleteError] = useState('')
   async function askPermission() { setAsking(true); try { setPermission(await requestNotificationPermission()) } finally { setAsking(false) } }
+  function setAccountColor(accountID: number, hex: string | null) {
+    const next = { ...preferences.accountColors }
+    if (hex) next[String(accountID)] = hex
+    else delete next[String(accountID)]
+    onChange({ accountColors: next })
+  }
   async function remove(account: Account) {
     setDeleting(account.id)
     setDeleteError('')
@@ -65,6 +72,7 @@ export function SettingsDialog({ preferences, accounts, onChange, onClose, onAdd
               <span className="shrink-0 rounded-full bg-black/[.05] px-2 py-0.5 text-[9px] font-bold tracking-wide text-black/45">{providerLabel(account.provider)}</span>
             </div>
             <p className="mt-2 text-[11px] text-black/35">{accountStatusLabel(account.status)}{account.last_connected_at ? ` · 最近连接 ${formatFullDate(account.last_connected_at)}` : ''}</p>
+            <AccountColorRow color={preferences.accountColors[String(account.id)]} defaultColor={defaultAccountColor(account.id)} onPick={hex => setAccountColor(account.id, hex)} />
             {account.last_error && <p className="mt-2 break-words rounded-xl bg-red-50 px-2.5 py-2 text-[11px] leading-4 text-red-700" role="alert">{account.last_error}</p>}
             {confirming === account.id
               ? <div className="mt-2.5 rounded-xl bg-red-50 p-3">
@@ -95,5 +103,30 @@ function SettingsToggle({ label, hint, checked, onChange }: { label: string; hin
   return <div className="flex items-start justify-between gap-4">
     <span className="min-w-0"><span className="block text-sm font-semibold">{label}</span><span className="mt-1 block text-xs leading-5 text-black/40">{hint}</span></span>
     <button type="button" role="switch" aria-checked={checked} aria-label={label} onClick={() => onChange(!checked)} className={`relative mt-0.5 h-6 w-11 shrink-0 rounded-full transition ${checked ? 'bg-pine' : 'bg-black/15'}`}><span className={`absolute top-0.5 h-5 w-5 rounded-full bg-white shadow-lift-2 transition-all ${checked ? 'left-[1.375rem]' : 'left-0.5'}`} /></button>
+  </div>
+}
+
+// One account's colour picker: the shared palette, a native colour well and a
+// free-typed hex field all write the same override. `color` is undefined while the
+// account still rides its palette slot, which is what the reset link offers back.
+function AccountColorRow({ color, defaultColor, onPick }: { color?: string; defaultColor: string; onPick: (hex: string | null) => void }) {
+  const current = color ?? defaultColor
+  const [text, setText] = useState(current)
+  // The text field is local state, but a pick from the palette or the well must
+  // not leave it showing a stale value.
+  useEffect(() => setText(current), [current])
+  const invalid = text.trim() !== '' && !normalizeHexColor(text)
+  return <div className="mt-2.5 border-t border-black/5 pt-2.5">
+    <div className="flex items-center justify-between gap-3">
+      <span className="text-[10px] font-bold uppercase tracking-[.18em] text-black/40">专属颜色</span>
+      {color && <button onClick={() => onPick(null)} className="text-[11px] text-black/40 transition hover:text-black/70">恢复默认</button>}
+    </div>
+    <div className="mt-2 flex flex-wrap items-center gap-1.5">
+      {accountPalette.map(hex => <button key={hex} type="button" onClick={() => onPick(hex)} title={hex} aria-label={`使用颜色 ${hex}`} aria-pressed={current === hex} className={`h-6 w-6 rounded-full border transition hover:scale-110 ${current === hex ? 'border-black/50 shadow-lift-1' : 'border-black/10'}`} style={{ backgroundColor: hex }} />)}
+      <input type="color" value={current} onChange={event => onPick(event.target.value)} aria-label="自定义颜色" className="h-6 w-6 cursor-pointer rounded-full border border-black/10 bg-transparent p-0" title="自定义颜色" />
+      <input value={text} onChange={event => { setText(event.target.value); const hex = normalizeHexColor(event.target.value); if (hex) onPick(hex) }} placeholder="#RRGGBB" aria-label="输入颜色代码" className={`w-24 rounded-xl border bg-white px-2.5 py-1.5 font-mono text-[11px] outline-none transition ${invalid ? 'border-red-300' : 'border-black/10 focus:border-pine/30'}`} />
+      <span className="h-4 w-4 rounded-full border border-black/10" style={{ backgroundColor: normalizeHexColor(text) ? text : current }} aria-hidden />
+    </div>
+    {invalid && <p className="mt-1.5 text-[11px] text-red-600" role="alert">颜色代码格式应为 #RRGGBB 或 #RGB</p>}
   </div>
 }

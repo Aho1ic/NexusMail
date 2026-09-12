@@ -50,7 +50,12 @@ func (s *Supervisor) onMessageConn(ctx context.Context, messageID int64, fn func
 
 func (s *Supervisor) SetFlags(ctx context.Context, messageID int64, isRead, isStarred *bool) error {
 	return s.onMessageConn(ctx, messageID, func(_ *runtime, client *imapclient.Client, location ports.MessageLocation) error {
-		if _, err := client.Select(location.Mailbox.RemoteName, nil).Wait(); err != nil {
+		// A stale UID here would set \Seen or \Flagged on whichever message now
+		// holds that number. Marking mail the user has never opened as read is the
+		// one outcome they cannot notice: nothing in the UI distinguishes it from
+		// mail they read and forgot, so the message is simply missed. Failing sends
+		// the click back as 503 instead.
+		if err := selectForStoredUID(client, location.Mailbox, nil); err != nil {
 			return err
 		}
 		uidSet := goimap.UIDSetNum(goimap.UID(location.UID))
@@ -94,7 +99,13 @@ func (s *Supervisor) archiveOn(ctx context.Context, rt *runtime, client *imapcli
 	if destination.ID == location.Mailbox.ID {
 		return nil
 	}
-	if _, err := client.Select(location.Mailbox.RemoteName, nil).Wait(); err != nil {
+	// After a renumber, MOVE or COPY+EXPUNGE on the stored UID would archive — and
+	// with the fallback path delete — whichever message now holds that number.
+	// Failing is the only honest answer: returning nil would let MoveMessageLocation
+	// record the archive locally, so the user sees the message filed while it sits
+	// untouched in their inbox on every other client, and some unrelated mail has
+	// quietly moved. The error reaches the UI as 503.
+	if err := selectForStoredUID(client, location.Mailbox, nil); err != nil {
 		return err
 	}
 	uidSet := goimap.UIDSetNum(goimap.UID(location.UID))
@@ -336,7 +347,12 @@ func (s *Supervisor) setSeenAccount(ctx context.Context, accountID int64, byMail
 			rt.unlock()
 			return nil, ports.Unavailablef("account is offline")
 		}
-		if _, err := client.Select(group[0].Mailbox.RemoteName, nil).Wait(); err != nil {
+		// Per mailbox, not per account: one renumbered folder must not discard the
+		// flags the other folders already stored. Skipping leaves these ids out of
+		// done, which is what stops the caller writing the rows read locally — a
+		// mark-all-read that silently hid unopened mail would be indistinguishable
+		// from one that worked.
+		if err := selectForStoredUID(client, group[0].Mailbox, nil); err != nil {
 			failures = append(failures, fmt.Errorf("select %q: %w", group[0].Mailbox.RemoteName, err))
 			rt.unlock()
 			continue

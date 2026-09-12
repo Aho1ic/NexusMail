@@ -41,11 +41,27 @@ func TestBruteForceLoginHitsTheCeiling(t *testing.T) {
 	}
 }
 
-// The correct key must also be refused once the window is spent: a throttle that
-// let the right key through would leak whether a guess was correct by timing the
-// response class, and it would let an attacker keep trying past the ceiling by
-// mixing in one known-bad attempt.
-func TestBruteForceCeilingAppliesToTheValidKeyToo(t *testing.T) {
+// Renamed from TestBruteForceCeilingAppliesToTheValidKeyToo, and its assertion is
+// now the inverse. That is the fix, not a regression — do not change it back.
+//
+// The old test pinned the defect as a contract. The throttle was a middleware in
+// front of createSession that counted every request, successes included, and no
+// path ever reset a bucket. Under a reverse proxy whose address is not declared in
+// NEXUSMAIL_TRUSTED_PROXIES, ClientIP() falls back to the proxy's own address and
+// the whole deployment shares one bucket, so five anonymous requests a minute
+// locked the real user out for as long as the attacker kept going, with no
+// credential involved. The key is now checked before the ceiling is consulted, so
+// only wrong keys are counted — the policy the X-API-Key channel in authenticate()
+// has always followed — and the right key gets in.
+//
+// The old rationale was a timing oracle. It does not hold: an attacker cannot
+// produce a success, so the 201 they can never reach tells them nothing, and the
+// 401/429 split they can reach was already observable. Whoever sees the 201 held a
+// valid key before the request. Refusing it bought nothing and cost the account.
+//
+// Brute-force coverage is unchanged and asserted below: five wrong keys are
+// evaluated, the sixth is refused.
+func TestValidKeyIsAcceptedAfterFailedAttemptsSpentTheWindow(t *testing.T) {
 	h := newHarness(t)
 	for i := 0; i < loginRateLimit; i++ {
 		response := httptest.NewRecorder()
@@ -54,10 +70,40 @@ func TestBruteForceCeilingAppliesToTheValidKeyToo(t *testing.T) {
 			t.Fatalf("attempt %d = %d", i, response.Code)
 		}
 	}
-	response := httptest.NewRecorder()
-	h.router.ServeHTTP(response, loginRequest(testAPIKey, ""))
-	if response.Code != http.StatusTooManyRequests {
-		t.Fatalf("the valid key returned %d after the window was spent, want 429", response.Code)
+	// One more wrong key proves the ceiling is really spent.
+	if code := postLogin(h.router, "wrong-key-of-a-plausible-length-here", ""); code != http.StatusTooManyRequests {
+		t.Fatalf("the sixth wrong key returned %d, want 429", code)
+	}
+	if code := postLogin(h.router, testAPIKey, ""); code != http.StatusCreated {
+		t.Fatalf("the valid key returned %d while the window was spent, want 201", code)
+	}
+}
+
+// A proven credential clears the bucket, so the mistyped attempts that preceded it
+// cannot be charged to the session that follows. Without the reset a user who
+// fumbled their key four times and then got in would be one wrong keystroke away
+// from a 429 on their next login.
+func TestSuccessfulLoginClearsTheBucket(t *testing.T) {
+	h := newHarness(t)
+	for i := 0; i < loginRateLimit-1; i++ {
+		if code := postLogin(h.router, "wrong-key-of-a-plausible-length-here", ""); code != http.StatusUnauthorized {
+			t.Fatalf("attempt %d = %d", i, code)
+		}
+	}
+	if code := postLogin(h.router, testAPIKey, ""); code != http.StatusCreated {
+		t.Fatalf("the valid key returned %d, want 201", code)
+	}
+	// Every login in this test comes from the one address httptest assigns, so an
+	// empty map is the same statement as an empty bucket without pinning that address.
+	h.server.rateMu.Lock()
+	buckets := len(h.server.rate)
+	h.server.rateMu.Unlock()
+	if buckets != 0 {
+		t.Fatalf("%d rate buckets survived a successful login", buckets)
+	}
+	// The decisive part: the next wrong key is evaluated, not refused outright.
+	if code := postLogin(h.router, "wrong-key-of-a-plausible-length-here", ""); code != http.StatusUnauthorized {
+		t.Fatalf("the first failure after a success returned %d, want 401", code)
 	}
 }
 
@@ -156,16 +202,20 @@ func TestBruteForceSessionCookie(t *testing.T) {
 // The window slides: an attacker who waits gets a new budget, and a legitimate
 // user who mistyped their key once is not locked out permanently. Driven by
 // rewinding the recorded timestamps rather than by sleeping a minute.
+//
+// Probed with wrong keys throughout, because a valid one no longer touches the
+// throttle at all and so could not tell a rolled window from a cleared bucket.
 func TestRateWindowRecovers(t *testing.T) {
 	h := newHarness(t)
+	const wrongKey = "wrong-key-of-a-plausible-length-here"
 	for i := 0; i < loginRateLimit; i++ {
 		response := httptest.NewRecorder()
-		h.router.ServeHTTP(response, loginRequest("wrong-key-of-a-plausible-length-here", ""))
+		h.router.ServeHTTP(response, loginRequest(wrongKey, ""))
 		if response.Code != http.StatusUnauthorized {
 			t.Fatalf("attempt %d = %d", i, response.Code)
 		}
 	}
-	if code := postLogin(h.router, testAPIKey, ""); code != http.StatusTooManyRequests {
+	if code := postLogin(h.router, wrongKey, ""); code != http.StatusTooManyRequests {
 		t.Fatalf("status = %d, want 429 before the window rolls", code)
 	}
 
@@ -179,8 +229,8 @@ func TestRateWindowRecovers(t *testing.T) {
 	}
 	h.server.rateMu.Unlock()
 
-	if code := postLogin(h.router, testAPIKey, ""); code != http.StatusCreated {
-		t.Fatalf("status = %d after the window rolled, want 201", code)
+	if code := postLogin(h.router, wrongKey, ""); code != http.StatusUnauthorized {
+		t.Fatalf("status = %d after the window rolled, want the attempt to be evaluated again (401)", code)
 	}
 }
 
@@ -245,12 +295,48 @@ func TestRateLimitIsExactUnderConcurrency(t *testing.T) {
 	}
 }
 
-// Concurrent login attempts through the whole router must respect the same
-// ceiling, and none may produce a session beyond it.
-func TestConcurrentLoginRespectsTheCeiling(t *testing.T) {
+// Concurrent wrong keys through the whole router must respect the ceiling exactly:
+// no more than the limit may be evaluated, and every other caller is refused.
+func TestConcurrentFailedLoginsRespectTheCeiling(t *testing.T) {
 	h := newHarness(t)
 	const callers = 40
-	var created, throttled atomic.Int64
+	var evaluated, throttled atomic.Int64
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for i := 0; i < callers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			response := httptest.NewRecorder()
+			h.router.ServeHTTP(response, loginRequest("wrong-key-of-a-plausible-length-here", ""))
+			switch response.Code {
+			case http.StatusUnauthorized:
+				evaluated.Add(1)
+			case http.StatusTooManyRequests:
+				throttled.Add(1)
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+	if evaluated.Load() != int64(loginRateLimit) {
+		t.Fatalf("%d guesses were evaluated, want exactly %d", evaluated.Load(), loginRateLimit)
+	}
+	if evaluated.Load()+throttled.Load() != callers {
+		t.Fatalf("evaluated %d + throttled %d != %d", evaluated.Load(), throttled.Load(), callers)
+	}
+}
+
+// A burst of correct logins must all be served. This used to be the opposite
+// assertion — the middleware counted successes, so only loginRateLimit of them got
+// a session and the rest saw 429 — which is the same mechanism that let an
+// attacker's failures deny the real user a login. Nothing about a proven
+// credential warrants a ceiling; a tab reopened a dozen times is not an attack.
+func TestConcurrentValidLoginsAreAllServed(t *testing.T) {
+	h := newHarness(t)
+	const callers = 40
+	var created atomic.Int64
 	var wg sync.WaitGroup
 	start := make(chan struct{})
 	for i := 0; i < callers; i++ {
@@ -260,21 +346,15 @@ func TestConcurrentLoginRespectsTheCeiling(t *testing.T) {
 			<-start
 			response := httptest.NewRecorder()
 			h.router.ServeHTTP(response, loginRequest(testAPIKey, ""))
-			switch response.Code {
-			case http.StatusCreated:
+			if response.Code == http.StatusCreated {
 				created.Add(1)
-			case http.StatusTooManyRequests:
-				throttled.Add(1)
 			}
 		}()
 	}
 	close(start)
 	wg.Wait()
-	if created.Load() != int64(loginRateLimit) {
-		t.Fatalf("%d sessions were created, want %d", created.Load(), loginRateLimit)
-	}
-	if created.Load()+throttled.Load() != callers {
-		t.Fatalf("created %d + throttled %d != %d", created.Load(), throttled.Load(), callers)
+	if created.Load() != callers {
+		t.Fatalf("%d of %d concurrent valid logins were served", created.Load(), callers)
 	}
 }
 

@@ -337,6 +337,64 @@ func TestLoadTrustedProxies(t *testing.T) {
 	}
 }
 
+// A malformed entry has to stop the process. Gin refuses the whole list when one
+// entry fails to parse and keeps no trusted CIDR at all, so ClientIP() falls back
+// to the peer address: behind a reverse proxy that is the proxy itself, and every
+// client in the deployment then shares one login-throttle bucket. Five anonymous
+// requests a minute were enough to lock the real user out, with no credential
+// involved — a typo in this variable was a remote denial of service, and it used
+// to be answered with a log line and a running process.
+func TestLoadRejectsMalformedTrustedProxies(t *testing.T) {
+	for name, raw := range map[string]string{
+		"not an address":       "not-a-cidr",
+		"host name":            "proxy.internal",
+		"truncated address":    "10.0.0",
+		"octet out of range":   "10.0.0.256",
+		"prefix too wide":      "10.0.0.0/33",
+		"prefix not numeric":   "10.0.0.0/abc",
+		"missing prefix":       "10.0.0.0/",
+		"empty prefix host":    "/24",
+		"ipv6 prefix too wide": "2001:db8::/129",
+		// One bad entry among good ones is the realistic typo, and it is the case gin
+		// answers by discarding the good ones too.
+		"one bad entry in a list": "10.0.0.1,not-a-cidr,172.16.0.0/12",
+	} {
+		t.Run(name, func(t *testing.T) {
+			withRequiredSecrets(t)
+			t.Setenv("NEXUSMAIL_TRUSTED_PROXIES", raw)
+			_, err := Load()
+			if err == nil {
+				t.Fatalf("accepted NEXUSMAIL_TRUSTED_PROXIES=%q", raw)
+			}
+			if !strings.Contains(err.Error(), "NEXUSMAIL_TRUSTED_PROXIES") {
+				t.Fatalf("error %q does not name the offending setting", err)
+			}
+		})
+	}
+}
+
+// The forms gin accepts must load, including the IPv6 spellings an operator behind
+// a dual-stack proxy has to declare.
+func TestLoadAcceptsEveryTrustedProxyForm(t *testing.T) {
+	for _, raw := range []string{
+		"10.0.0.1",
+		"172.16.0.0/12",
+		"127.0.0.1,10.0.0.0/8,192.168.1.1",
+		"::1",
+		"2001:db8::1",
+		"fd00::/8",
+		"::ffff:10.0.0.1",
+	} {
+		t.Run(raw, func(t *testing.T) {
+			withRequiredSecrets(t)
+			t.Setenv("NEXUSMAIL_TRUSTED_PROXIES", raw)
+			if _, err := Load(); err != nil {
+				t.Fatalf("refused NEXUSMAIL_TRUSTED_PROXIES=%q: %v", raw, err)
+			}
+		})
+	}
+}
+
 // A setting that is present but blank must fall back rather than produce an empty
 // listen address, which would bind every interface on a random port.
 func TestBlankSettingsFallBack(t *testing.T) {

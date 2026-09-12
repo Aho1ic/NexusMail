@@ -6,7 +6,10 @@ import type { Attachment } from '../types'
 // table-laid-out message into one-glyph-per-line columns that read as mojibake.
 // The remaining rules only bound what would otherwise overflow the reading pane.
 const bodyStyles = `
-  html{-webkit-text-size-adjust:100%}
+  /* The frame scrolls under the wheel like the pane around it; its own bar only
+     duplicated the reading pane's chrome, which is hidden for the same reason. */
+  html{-webkit-text-size-adjust:100%;scrollbar-width:none}
+  html::-webkit-scrollbar{width:0;height:0;display:none}
   body{margin:0;font:15px/1.75 system-ui,-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;color:#24332d;overflow-wrap:break-word}
   img{max-width:100%;height:auto}
   a{color:#256b50}

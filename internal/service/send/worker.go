@@ -10,6 +10,7 @@ import (
 	"io"
 	"log/slog"
 	"net/mail"
+	"strings"
 	"sync"
 	"time"
 
@@ -126,9 +127,32 @@ func (w *Worker) enqueue(id int64) {
 	}
 }
 
+// postDeliveryWrite bounds the state write that records a delivery outcome. It
+// runs on a context detached from the caller's, because ctx is cancelled at
+// shutdown while an in-flight SMTP conversation keeps running on socket
+// deadlines: the message is accepted by the provider and every write that follows
+// then fails before database/sql even reaches for a connection, stranding the
+// draft in 'sending' for RecoverSendingDrafts to downgrade to 'unknown' — a
+// delivered message presented to the user as possibly undelivered, which invites
+// a manual resend. Bounded rather than unlimited so a wedged write cannot hold up
+// process exit indefinitely, and generous enough to cover WAL contention plus the
+// remote Sent APPEND of a payload close to maxBytes.
+const postDeliveryWrite = 30 * time.Second
+
+// outcome derives the context the post-SMTP writes use. Everything before the
+// send keeps ctx: cancelling those is correct, since nothing has left the process
+// yet.
+func outcome(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), postDeliveryWrite)
+}
+
 func (w *Worker) deliver(ctx context.Context, id int64) {
 	draft, attachments, err := w.repo.ClaimSendableDraft(ctx, id)
 	if err != nil {
+		return
+	}
+	if err := attachmentBudget(attachments, w.maxBytes); err != nil {
+		w.fail(ctx, draft, err, false, 0)
 		return
 	}
 	account, err := w.repo.GetAccount(ctx, draft.AccountID)
@@ -173,9 +197,11 @@ func (w *Worker) deliver(ctx context.Context, id int64) {
 				// retry as a clean restart: reset attempt_count so a fresh
 				// automatic retry ladder can run instead of falling into
 				// failed on the first temporary blip after recovery.
-				if writeErr := w.repo.SetDraftDelivery(ctx, id, "unknown", 0, nil, &deliveryErr.Code, &text, nil); writeErr != nil {
+				outcomeCtx, cancel := outcome(ctx)
+				if writeErr := w.repo.SetDraftDelivery(outcomeCtx, id, "unknown", 0, nil, &deliveryErr.Code, &text, nil); writeErr != nil {
 					slog.Error("set draft to unknown", "draft_id", id, "error", writeErr)
 				}
+				cancel()
 				w.publish(id, "unknown")
 				return
 			}
@@ -207,7 +233,53 @@ func (w *Worker) ancestry(ctx context.Context, draft domain.Draft) threadRefs {
 	// under the whole thread rather than only under its immediate parent.
 	var inherited []string
 	_ = json.Unmarshal([]byte(source.ReferencesJSON), &inherited)
-	return threadRefs{inReplyTo: parent, references: append(inherited, parent)}
+	return threadRefs{inReplyTo: parent, references: trimReferences(append(inherited, parent))}
+}
+
+// referencesBudget is the octets a References field may occupy unfolded,
+// including its field name but not the final CRLF. RFC 5322 2.1.1 caps a line at
+// 998 octets and RFC 5537 3.4.4 makes that same figure the trigger for trimming
+// the chain; len("References: ") is subtracted here so the budget applies to the
+// value.
+const referencesBudget = 998 - len("References: ")
+
+// protectedReferences is the tail RFC 5537 3.4.4 forbids trimming. The first
+// identifier plus the last two are what threading actually needs: the first roots
+// the conversation for clients that group on it, the last two place the reply
+// under its immediate parent. It is also a floor, not a target — the chain is
+// trimmed to whatever fits the budget above that.
+const protectedReferences = 2
+
+// trimReferences bounds a chain that otherwise grows by one identifier per reply
+// forever. An unfolded References field past 998 octets is beyond what RFC 5322
+// permits on a line, and clients that truncate it lose threading outright, so the
+// middle is dropped: the first identifier is kept and as many of the most recent
+// ancestors as the budget allows. Dropping from the middle rather than the tail is
+// what keeps the ordering invariant RFC 5537 requires, that a message never
+// precedes one of its parents.
+func trimReferences(chain []string) []string {
+	total := 0
+	for _, id := range chain {
+		total += len(id) + 1
+	}
+	if total-1 <= referencesBudget || len(chain) <= protectedReferences+1 {
+		return chain
+	}
+	// The first identifier is never dropped, so its cost comes off the budget
+	// before the tail is measured.
+	remaining := referencesBudget - len(chain[0])
+	kept := 0
+	for i := len(chain) - 1; i > 0; i-- {
+		cost := len(chain[i]) + 1
+		if cost > remaining && kept >= protectedReferences {
+			break
+		}
+		remaining -= cost
+		kept++
+	}
+	trimmed := make([]string, 0, kept+1)
+	trimmed = append(trimmed, chain[0])
+	return append(trimmed, chain[len(chain)-kept:]...)
 }
 
 // threadRefs carries a reply's ancestry from the source message to both the
@@ -225,6 +297,39 @@ func (t threadRefs) referencesJSON() string {
 		return "[]"
 	}
 	return encodeStrings(t.references)
+}
+
+// attachmentBudget rejects a draft whose attachments cannot fit the outbound
+// limit, before any of them is read. compose drains every blob into one in-memory
+// payload, so the len(message) guard downstream only fires after N attachments
+// have already been buffered and base64-expanded — the ceiling on a single upload
+// is per-request and says nothing about their sum. SizeBytes is the stored raw
+// length, so the base64 expansion compose applies is charged here too, otherwise a
+// draft that passes this check still fails after assembly.
+func attachmentBudget(attachments []domain.DraftAttachment, maxBytes int64) error {
+	total := int64(0)
+	for _, attachment := range attachments {
+		// Checked before the multiplication so a corrupt or absurd size_bytes
+		// cannot overflow the running total.
+		if attachment.SizeBytes > maxBytes {
+			return fmt.Errorf("attachments exceed the %d byte message limit", maxBytes)
+		}
+		total += base64Size(attachment.SizeBytes)
+		if total > maxBytes {
+			return fmt.Errorf("attachments exceed the %d byte message limit", maxBytes)
+		}
+	}
+	return nil
+}
+
+// base64Size is the encoded length compose produces for a raw attachment: the 4/3
+// expansion with padding, plus the CRLF the composer inserts every 76 columns.
+func base64Size(raw int64) int64 {
+	encoded := (raw + 2) / 3 * 4
+	if encoded == 0 {
+		return 0
+	}
+	return encoded + 2*((encoded-1)/76)
 }
 
 // compose renders the draft into an RFC 5322 payload and the envelope recipient
@@ -297,34 +402,64 @@ func (w *Worker) complete(ctx context.Context, account domain.Account, draft dom
 		Snippet: snippet(draft.BodyText, 240), BodyText: draft.BodyText, BodyState: "ready", SentAt: &now, ReceivedAt: now,
 		IsRead: true, CreatedAt: now, UpdatedAt: now,
 	}
-	if err := w.repo.CreateSentMessage(ctx, &message, draft.ID); err != nil {
-		w.fail(ctx, draft, err, true, 0)
-		return
+	// Nothing past this point may schedule a retry: the provider has the message,
+	// and a second transmission is not something the user can take back. Every
+	// failure below is local or remote bookkeeping — it is logged and surfaced on
+	// the draft as drift, never turned into a new send.
+	var drift []string
+	outcomeCtx, cancel := outcome(ctx)
+	defer cancel()
+	if err := w.repo.CreateSentMessage(outcomeCtx, &message, draft.ID); err != nil {
+		// Retrying this is what sent the message twice: the draft went to
+		// retry_wait, became due, and was claimed and transmitted again. The Sent
+		// copy is a local record, so losing it costs the user a row in their own
+		// list view, not a delivery.
+		slog.Error("store sent copy", "draft_id", draft.ID, "error", err)
+		drift = append(drift, "the local Sent copy could not be stored: "+err.Error())
 	}
-	if err := w.repo.SetDraftDelivery(ctx, draft.ID, "sent", draft.AttemptCount, nil, nil, nil, &now); err != nil {
-		// SMTP delivery already succeeded; surfacing the local-state drift is
-		// better than silently leaving the outbox in a "queued" state that
-		// would cause the user to send the message twice on retry.
-		slog.Error("set draft to sent", "draft_id", draft.ID, "error", err)
-	}
+	// Written before the two remote calls rather than after them: a crash in
+	// between would otherwise leave the draft in 'sending' for the next
+	// RecoverSendingDrafts to report as 'unknown'.
+	w.markSent(outcomeCtx, draft, now, drift)
 	if w.remoteDraft != nil {
-		if err := w.remoteDraft.DeleteRemoteDraft(ctx, draft.ID); err != nil {
-			// Same rationale: the SMTP send already happened. The remote
-			// Drafts folder will keep a copy until the user deletes it from
-			// another client; that is preferable to re-queuing and sending
-			// the message twice.
+		if err := w.remoteDraft.DeleteRemoteDraft(outcomeCtx, draft.ID); err != nil {
+			// The remote Drafts folder will keep a copy until the user deletes it
+			// from another client; that is preferable to re-queuing.
 			slog.Error("delete remote draft", "draft_id", draft.ID, "error", err)
 		}
-		if preset, err := provider.Get(account.Provider); err == nil && !preset.ServerSavesSent {
-			if appendErr := w.remoteDraft.AppendSent(ctx, account.ID, payload); appendErr != nil {
-				text := "message sent, but remote Sent coordination failed: " + appendErr.Error()
-				if err := w.repo.SetDraftDelivery(ctx, draft.ID, "sent", draft.AttemptCount, nil, nil, &text, &now); err != nil {
-					slog.Error("annotate sent draft", "draft_id", draft.ID, "error", err)
-				}
+		preset, err := provider.Get(account.Provider)
+		if err != nil {
+			// A provider the accounts CHECK constraint admits but the preset table
+			// does not know: the two are edited independently, so one can be added
+			// without the other. Appending is the conservative branch — a duplicate
+			// in Sent is visible and deletable, a missing sent record is neither.
+			slog.Error("provider preset for the sent copy", "draft_id", draft.ID, "provider", account.Provider, "error", err)
+		}
+		if err != nil || !preset.ServerSavesSent {
+			if appendErr := w.remoteDraft.AppendSent(outcomeCtx, account.ID, payload); appendErr != nil {
+				slog.Error("append to remote sent", "draft_id", draft.ID, "error", appendErr)
+				drift = append(drift, "remote Sent coordination failed: "+appendErr.Error())
+				w.markSent(outcomeCtx, draft, now, drift)
 			}
 		}
 	}
 	w.publish(draft.ID, "sent")
+}
+
+// markSent records the terminal state of a delivery that the provider accepted.
+// next_attempt_at is always nil: the state machine picks up a draft that carries
+// one, so writing it here is what would send the message a second time. Any drift
+// collected on the way is reported through last_error, because the user has to be
+// able to tell "delivered" from "delivered, and something local is out of step".
+func (w *Worker) markSent(ctx context.Context, draft domain.Draft, now int64, drift []string) {
+	var text *string
+	if len(drift) > 0 {
+		joined := "message sent, but " + strings.Join(drift, "; ")
+		text = &joined
+	}
+	if err := w.repo.SetDraftDelivery(ctx, draft.ID, "sent", draft.AttemptCount, nil, nil, text, &now); err != nil {
+		slog.Error("set draft to sent", "draft_id", draft.ID, "error", err)
+	}
 }
 
 func (w *Worker) fail(ctx context.Context, draft domain.Draft, err error, temporary bool, code int) {
@@ -350,8 +485,12 @@ func (w *Worker) fail(ctx context.Context, draft domain.Draft, err error, tempor
 	// RecoverSendingDrafts startup, which would mark it 'unknown' and lose
 	// the retry schedule we just computed. Logging is the minimum; the DB
 	// error is rare (WAL contention) and the user-visible consequence is a
-	// stuck retry.
-	if err := w.repo.SetDraftDelivery(ctx, draft.ID, status, draft.AttemptCount, next, codePtr, &text, nil); err != nil {
+	// stuck retry. The write runs detached from ctx for the same reason
+	// complete's does: a shutdown that lands mid-conversation must not be what
+	// turns a classified retry into an 'unknown' the user has to resolve by hand.
+	outcomeCtx, cancel := outcome(ctx)
+	defer cancel()
+	if err := w.repo.SetDraftDelivery(outcomeCtx, draft.ID, status, draft.AttemptCount, next, codePtr, &text, nil); err != nil {
 		slog.Error("set draft delivery", "draft_id", draft.ID, "status", status, "error", err)
 	}
 	w.publish(draft.ID, status)

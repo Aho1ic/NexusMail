@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"net"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -95,6 +96,9 @@ func Load() (Config, error) {
 	if err := validatePublicURL(cfg.PublicURL); err != nil {
 		return Config{}, err
 	}
+	if err := validateTrustedProxies(cfg.TrustedProxies); err != nil {
+		return Config{}, err
+	}
 	return cfg, nil
 }
 
@@ -123,6 +127,32 @@ func validatePublicURL(value string) error {
 		number, convErr := strconv.Atoi(port)
 		if convErr != nil || number < 1 || number > 65535 {
 			return errors.New("NEXUSMAIL_PUBLIC_URL has an invalid port")
+		}
+	}
+	return nil
+}
+
+// validateTrustedProxies refuses at startup what gin would otherwise refuse at
+// route setup. A rejected list is not a partial one: gin ends up with no trusted
+// CIDR at all, so ClientIP() falls back to the peer address — behind a reverse
+// proxy that is the proxy itself, and every client in the deployment then shares
+// one login-throttle bucket. Five requests from anywhere lock the real user out
+// with no credential involved, which is why a typo here has to stop the process
+// instead of downgrading it.
+//
+// The two branches mirror gin's own parse: an entry containing "/" is a CIDR,
+// anything else is a bare address that gin widens to /32 or /128. Accepting
+// something gin later rejects would put the silent downgrade back.
+func validateTrustedProxies(entries []string) error {
+	for _, entry := range entries {
+		if strings.Contains(entry, "/") {
+			if _, _, err := net.ParseCIDR(entry); err != nil {
+				return fmt.Errorf("NEXUSMAIL_TRUSTED_PROXIES entry %q is not a valid CIDR: %w", entry, err)
+			}
+			continue
+		}
+		if net.ParseIP(entry) == nil {
+			return fmt.Errorf("NEXUSMAIL_TRUSTED_PROXIES entry %q is not a valid IP address", entry)
 		}
 	}
 	return nil

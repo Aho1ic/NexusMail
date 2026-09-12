@@ -84,6 +84,7 @@ cd web && npx playwright test e2e/mailbox.spec.ts
 
 - `internal/repository/sqlite/store.go` 用单个 `writeMu` 串行化**全部写操作**；读路径不加锁。新增写方法必须同样持有它，否则在 WAL + 8 连接池下会出现 `SQLITE_BUSY`。
 - migration 运行器按版本号升序遍历 `migrations/*.up.sql`（`parseMigrationName` 取前缀数字），跳过 `schema_migrations` 中已记录的版本。新增一个编号大于现有最大值的 `NNNNNN_*.up.sql` 会被 `go:embed` 打包并自动执行，无需改 `migrate()`；文件名前缀必须是可解析的数字，否则会被静默忽略。已发布的 migration 一律不改，只追加新编号。
+- 重建 `accounts` 这类 CASCADE 父表的 migration，首行必须写 `-- nexusmail:foreign_keys=off`。开启外键时 `DROP TABLE` 会执行隐式 `DELETE FROM` 并触发级联：在本 schema 上实测，只有 mailbox/draft 时迁移**静默成功**且两表清空；有邮件时级联触发 `message_fts` trigger，报 `database table is locked`。`PRAGMA foreign_keys` 在事务内是 no-op，`defer_foreign_keys` 只推迟违规检查而不阻止级联动作，所以只能由运行器在开启事务**之前**关闭外键；提交后它会恢复外键并跑 `PRAGMA foreign_key_check`，有孤儿行即让 migration 失败。回归见 `providerrebuild_test.go`。
 - 消息落库只有批量一条路径 `BatchCreateOrUpdateMessages`（单条写入的 `CreateOrUpdateMessage` 已删除）。它手工展开 `IN (?,?…)`，每个 dedupe key 必须包成 `blobArg`：GORM 会把紧跟 `(` 的 `?` 上绑定的 slice 按元素展开，裸 `[]byte` 会被当成 32 个整数比较，导致每批第一条永远去重失败并撞 unique 索引回滚整批。
 - FTS5：`message_fts` 虚拟表由 3 个 trigger 维护（insert / delete / update of `subject,sender,recipients,body_text`）。绕过这些列直接改正文，或用非 trigger 路径写入，索引会静默失去同步。
 - 分页是 keyset cursor：base64(JSON `{received_at,id}`)，配合 `(received_at DESC, id DESC)` 索引。不要改成 OFFSET。
@@ -92,7 +93,7 @@ cd web && npx playwright test e2e/mailbox.spec.ts
 
 `internal/service/send/worker.go` 的 `deliver` 区分四种结果，其中 `unknown` 最关键：
 
-- `sent` → `CreateSentMessage` + 删除远端草稿；随后仅当 `provider.Preset.ServerSavesSent == false` 时才 APPEND 到远端 Sent（QQ/163 需要，Gmail/Outlook 会自己保存，重复 APPEND 会产生副本）。
+- `sent` → `CreateSentMessage` + 删除远端草稿；随后仅当 `provider.Preset.ServerSavesSent == false` 时才 APPEND 到远端 Sent（QQ/163/126/iCloud 需要，Gmail/Outlook 会自己保存，重复 APPEND 会产生副本）。
 - `retry_wait` → 仅对明确的临时失败，退避阶梯 `5s / 30s / 2m / 10m`，`AttemptCount` 上限 5。**阶梯长度被上限锁定为 4 级**：`ClaimSendableDraft` 已经先自增了 `AttemptCount`，所以第 N 次尝试读第 N-1 级，而 `fail` 的 `AttemptCount < 5` 守卫让排下一次重试最多发生在第 4 次尝试——第 5 次是终态（`failed`）。第 5 级永远索引不到，留着只会让人以为还有一次 30m 重试。改上限必须同步改阶梯长度。
 - `failed` → 永久失败。
 - `unknown` → `DATA` 之后连接中断，**终态，绝不自动重试**（可能已投递）。这类草稿的附件 blob 必须持久保存，不可被 LRU 淘汰。

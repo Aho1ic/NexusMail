@@ -62,9 +62,10 @@ test('completes an OAuth connection in a popup and keeps the mailbox mounted', a
   expect(posted).toEqual([{ provider: 'gmail', display_name: '个人 Gmail', auth: { type: 'oauth2' } }])
   // The dialog closed on success and the account list refreshed. Both are only
   // observable because the mailbox behind the popup was never navigated away —
-  // which is exactly what the old full-page redirect destroyed.
+  // which is exactly what the old full-page redirect destroyed. The refreshed
+  // sidebar row carries the fixture account's title line only.
   await expect(page.getByText('选择邮箱服务商')).toHaveCount(0)
-  await expect(page.getByText('me@gmail.com')).toBeVisible()
+  await expect(page.getByText('Gmail', { exact: true })).toBeVisible()
 })
 
 test('reports the reason when authorization fails and allows a retry', async ({ page }) => {

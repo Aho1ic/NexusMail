@@ -24,7 +24,26 @@ export function formatDate(value: number) { const date = new Date(value); const 
 export function formatFullDate(value: number) { return new Date(value).toLocaleString('zh-CN', { dateStyle: 'long', timeStyle: 'short' }) }
 export function formatBytes(value: number) { if (value < 1024) return `${value} B`; if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`; return `${(value / 1024 / 1024).toFixed(1)} MB` }
 export function messageOf(error: unknown) { return error instanceof Error ? error.message : '发生未知错误' }
+// The seven values accounts.status is constrained to, all of them. The map used to
+// carry five and fall through to the raw code for the other two, so the one state
+// the user has to act on announced itself as "auth_error" — and that state is not
+// rare: a credential the provider has definitively refused parks the account there.
+// The wording says what to do without naming the secret, because which one it is
+// depends on the provider (授权码 for QQ/163/126, App 专用密码 for iCloud, an OAuth
+// consent for Gmail/Outlook) and the call site does not pass it. last_error is
+// rendered separately, so this line carries the remedy, not the provider's text.
+// `error` now has a writer: a panic in either per-account IMAP loop parks the
+// account there deliberately, without restarting it, because a panic is a bug in
+// the gateway rather than a transient provider fault. Its label must not promise a
+// retry the process cannot perform — nothing re-runs on its own and there is no
+// reconnect endpoint, so the account stays parked until the gateway restarts. The
+// panic text is never shown: it can carry a message body or a credential, so
+// last_error is left empty for this state and the stack goes to the log only.
 export function accountStatusLabel(status: string) {
-  const label: Record<string, string> = { connected: '已连接', connecting: '正在连接', syncing: '正在同步', backoff: '连接异常，正在重试', disconnected: '未连接' }
+  const label: Record<string, string> = {
+    connected: '已连接', connecting: '正在连接', syncing: '正在同步',
+    backoff: '连接异常，正在重试', disconnected: '未连接',
+    auth_error: '授权已失效，需重新连接该邮箱', error: '同步出错，请重启网关后重试',
+  }
   return label[status] || status
 }

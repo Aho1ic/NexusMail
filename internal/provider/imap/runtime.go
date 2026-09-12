@@ -44,6 +44,17 @@ func (rt *runtime) lock() {
 
 func (rt *runtime) unlock() { rt.cmdMu.Unlock() }
 
+// withLock runs fn under the foreground command lock and releases it even if fn
+// panics. runAccountLoop recovers that panic and parks the account, so an unwind
+// that skipped the unlock would leave cmdMu held forever: FetchBody, Archive and
+// every other user action on this account would then block on it, which is a
+// quieter outage than the crash the recover was added to prevent.
+func (rt *runtime) withLock(fn func() error) error {
+	rt.lock()
+	defer rt.unlock()
+	return fn()
+}
+
 // lockBackground claims the command connection for opportunistic prefetch and
 // steps aside whenever foreground work is waiting.
 func (rt *runtime) lockBackground(ctx context.Context) bool {

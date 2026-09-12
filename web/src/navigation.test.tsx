@@ -90,9 +90,20 @@ function stubAPI(options: Options = {}) {
 
 const lastFeed = (recorder: Recorder) => recorder.feeds[recorder.feeds.length - 1]
 
-// Each message row also carries its account name as a chip, so the sidebar entry is
-// addressed by the address it shows as a sublabel, which appears nowhere else.
-const navAccount = (email: string) => screen.getByRole('button', { name: new RegExp(email.replace('.', '\\.')) })
+// Each message row also carries its account name as a chip, so a sidebar row is
+// addressed by the title it renders — display name, or the address when no name is
+// set — and scoped to the sidebar landmark, which is the only place that title is a
+// button by itself. The address no longer appears as a sublabel: rows are one line.
+const navAccount = (email: string) => {
+  const account = accounts.find(item => item.email === email)
+  const title = (account?.display_name || email).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  return within(screen.getByRole('complementary')).getByRole('button', { name: new RegExp(title) })
+}
+const findNavAccount = async (email: string) => {
+  const account = accounts.find(item => item.email === email)
+  const title = (account?.display_name || email).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  return within(await screen.findByRole('complementary')).getByRole('button', { name: new RegExp(title) })
+}
 
 describe('view scoping', () => {
   afterEach(cleanup)
@@ -148,6 +159,30 @@ describe('view scoping', () => {
     expect(screen.getByRole('heading', { name: '已发送' })).toBeInTheDocument()
   })
 
+  it('shows every starred message of every account in the favourites view', async () => {
+    const recorder = await boot()
+    fireEvent.click(screen.getByRole('button', { name: '收藏夹' }))
+
+    // The starred view spans accounts and folder roles, so neither scope may ride
+    // along — folder=inbox would silently drop starred mail filed elsewhere.
+    await waitFor(() => expect(lastFeed(recorder).get('is_starred')).toBe('true'))
+    expect(lastFeed(recorder).get('folder')).toBeNull()
+    expect(lastFeed(recorder).get('account_id')).toBeNull()
+    expect(screen.getByRole('heading', { name: '收藏夹' })).toBeInTheDocument()
+
+    // Pressing it again stands still rather than spending another feed load.
+    const scopedFeeds = recorder.feeds.length
+    fireEvent.click(screen.getByRole('button', { name: '收藏夹' }))
+    await act(async () => {})
+    expect(recorder.feeds.length).toBe(scopedFeeds)
+
+    // And choosing any account again drops the starred scope with the rest.
+    fireEvent.click(navAccount('work@qq.com'))
+    await waitFor(() => expect(lastFeed(recorder).get('account_id')).toBe('1'))
+    expect(lastFeed(recorder).get('is_starred')).toBeNull()
+    expect(lastFeed(recorder).get('folder')).toBe('inbox')
+  })
+
   it('returns to every inbox and clears both scopes', async () => {
     const recorder = await boot()
     fireEvent.click(navAccount('work@qq.com'))
@@ -184,14 +219,32 @@ describe('view scoping', () => {
         : { items: reads.slice(0, 40), next_cursor: 'cursor-1', unread_total: 1 },
     })
     // This is the reported bug: the badge counts mail the list has never loaded.
-    expect(screen.queryByRole('button', { name: /深页未读/ })).toBeNull()
+    // Matched by subject text, not by accessible name: a row's name is computed from
+    // its whole subtree, and this only asks whether the subject is on screen.
+    expect(screen.queryByText('深页未读')).toBeNull()
 
     fireEvent.click(screen.getByRole('button', { name: /All Inboxes/ }))
-    const row = await screen.findByRole('button', { name: /深页未读/ })
+    // Waited on by the reveal marker rather than the row's accessible name. Nothing on
+    // this path is timer-driven — the press loads synchronously, the stubbed fetch
+    // settles in microtasks, the 250ms search debounce resolves to the same empty term
+    // and the 80ms realtime coalesce needs a socket event this file never emits — so
+    // the outcome is fixed and only the duration varies, which is what made this the
+    // slowest test in the file: a name query rebuilds the name of all 51 rendered rows
+    // on every poll and again to build a failure message, 4549 getComputedStyle calls
+    // against 1755 for this shape. Charging each call a fixed cost to stand in for a
+    // loaded machine, the name version crossed vitest's 5000ms test timeout at
+    // 1200us/call where this one finished in 2285ms. The selector also keeps the marker
+    // pinned to the pressable row.
+    const row = await waitFor(() => {
+      const revealed = document.querySelector<HTMLElement>('button[data-revealed]')
+      if (!revealed) throw new Error('no row has been revealed yet')
+      return revealed
+    })
 
     expect(lastFeed(recorder).get('limit')).toBe('100')
     expect(lastFeed(recorder).get('folder')).toBe('inbox')
-    expect(row).toHaveAttribute('data-revealed')
+    // The revealed row has to be the deep unread one, not merely some revealed row.
+    expect(within(row).getByText('深页未读')).toBeInTheDocument()
     // Found, not opened: a jump that marked it read would destroy the thing the user
     // was looking for.
     expect(recorder.writes.filter(write => write.method === 'PATCH')).toHaveLength(0)
@@ -528,7 +581,7 @@ describe('session and refresh', () => {
   it('reloads accounts, folders and mail on refresh', async () => {
     const recorder = stubAPI()
     render(<App />)
-    fireEvent.click(await screen.findByRole('button', { name: /work@qq\.com/ }))
+    fireEvent.click(await findNavAccount('work@qq.com'))
     await waitFor(() => expect(lastFeed(recorder).get('account_id')).toBe('1'))
     const before = recorder.all.length
 
@@ -600,7 +653,7 @@ describe('session and refresh', () => {
       return json({})
     }))
     render(<App />)
-    fireEvent.click(await screen.findByRole('button', { name: /work@qq\.com/ }))
+    fireEvent.click(await findNavAccount('work@qq.com'))
     expect(await screen.findByText('文件夹读取失败')).toBeInTheDocument()
   })
 

@@ -43,6 +43,14 @@ func (s *Server) listMessages(c *gin.Context) {
 		}
 		filter.IsRead = &value
 	}
+	if raw := c.Query("is_starred"); raw != "" {
+		value, err := strconv.ParseBool(raw)
+		if err != nil {
+			fail(c, 400, "invalid_filter", "is_starred must be true or false", nil)
+			return
+		}
+		filter.IsStarred = &value
+	}
 	page, err := s.messages.List(c.Request.Context(), filter)
 	if err != nil {
 		writeError(c, err)
@@ -65,6 +73,14 @@ func (s *Server) markMessagesRead(c *gin.Context) {
 		return
 	}
 	filter.AccountID, filter.MailboxID = accountID, mailboxID
+	if raw := c.Query("is_starred"); raw != "" {
+		value, err := strconv.ParseBool(raw)
+		if err != nil {
+			fail(c, 400, "invalid_filter", "is_starred must be true or false", nil)
+			return
+		}
+		filter.IsStarred = &value
+	}
 	result, err := s.messages.MarkRead(c.Request.Context(), filter)
 	if err != nil {
 		// A partial success still changed state on the provider and locally, so it
@@ -192,6 +208,20 @@ func (s *Server) downloadAttachment(c *gin.Context) {
 	}
 	c.Header("Content-Type", contentType)
 	c.Header("Content-Length", strconv.FormatInt(blob.SizeBytes, 10))
-	c.Header("Content-Disposition", mime.FormatMediaType("attachment", map[string]string{"filename": filepath.Base(attachment.Filename)}))
+	c.Header("Content-Disposition", mime.FormatMediaType("attachment", map[string]string{"filename": downloadFilename(attachment.Filename, attachmentID)}))
 	_, _ = io.Copy(c.Writer, reader)
+}
+
+// downloadFilename keeps the Content-Disposition name usable when the part had
+// none. A MIME part with disposition attachment but no filename or name parameter
+// is stored with an empty Filename, and filepath.Base("") is "." by definition, so
+// the browser was offered a file literally called "." — which it cannot save under
+// any sensible name. The id makes the fallback stable across repeat downloads of
+// the same part.
+func downloadFilename(raw string, attachmentID int64) string {
+	name := filepath.Base(raw)
+	if name == "." || name == string(filepath.Separator) || strings.TrimSpace(name) == "" {
+		return "attachment-" + strconv.FormatInt(attachmentID, 10)
+	}
+	return name
 }

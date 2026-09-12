@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import App from './App'
 
@@ -102,7 +102,9 @@ describe('mark the current view read', () => {
 
   it('scopes the request to the selected mailbox rather than the whole inbox', async () => {
     await mount()
-    fireEvent.click(screen.getAllByRole('button', { name: /mail@example\.com/ })[0])
+    // The account row is named by its title line only and is unique inside the
+    // sidebar landmark; the address no longer repeats as a sublabel.
+    fireEvent.click(within(screen.getByRole('complementary')).getByRole('button', { name: 'Mail' }))
     fireEvent.click(await screen.findByRole('button', { name: '归档' }))
 
     fireEvent.click(screen.getByRole('button', { name: '全部已读' }))

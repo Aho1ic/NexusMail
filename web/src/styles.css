@@ -10,10 +10,18 @@
 @layer base {
   * { box-sizing: border-box; }
   html { color-scheme: light; }
+  /* The app is a fixed three-pane shell: scrolling belongs to the panes, never to
+     the document. With a scrollable root, three things nudged the whole stage by a
+     few pixels — sub-pixel overflow at fractional zoom made the root scrollable at
+     all, wheel scrolling chained off the end of every pane onto it, and
+     scrollIntoView centred rows against the viewport as well as the list. Clipping
+     the root removes all three at once; overscroll-behaviour also stops the
+     elastic bounce that reach the stage on trackpad overshoot. */
+  html, body { height: 100%; overflow: hidden; overscroll-behavior: none; }
   /* The body colour is the middle stop of .app-stage, not the old flat paper:
      overscroll and the area behind a short viewport would otherwise show a seam
      where the gradient ends. */
-  body { margin: 0; min-width: 320px; min-height: 100vh; background: #f4f1e8; }
+  body { margin: 0; min-width: 320px; background: #f4f1e8; }
   button, input, textarea, select { font: inherit; }
   button { -webkit-tap-highlight-color: transparent; }
   kbd { @apply rounded border border-black/10 bg-white px-1.5 py-0.5 font-sans shadow-sm; }

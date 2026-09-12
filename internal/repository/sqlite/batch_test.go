@@ -98,24 +98,63 @@ func TestBatchCreateOrUpdateMessages(t *testing.T) {
 	}
 
 	// Run the batch again with a fresh subject for item 0 — every row should
-	// be an update this time, and the FTS index must still have exactly n-1
-	// rows (the dedupe-collision pair shares one row).
+	// be an update this time, and the FTS index must still describe exactly
+	// the rows the table holds (the dedupe-collision pair shares one row).
 	items[0].Message.Subject = "subject-0-update"
 	if _, _, err := store.BatchCreateOrUpdateMessages(ctx, items); err != nil {
 		t.Fatal(err)
 	}
-	var msgCount, ftsCount int
+	var msgCount int
 	if err := store.sqlDB.QueryRowContext(ctx, "SELECT count(*) FROM messages WHERE account_id = ?", acc.ID).Scan(&msgCount); err != nil {
-		t.Fatal(err)
-	}
-	if err := store.sqlDB.QueryRowContext(ctx, "SELECT count(*) FROM message_fts").Scan(&ftsCount); err != nil {
 		t.Fatal(err)
 	}
 	if msgCount != n-1 {
 		t.Errorf("messages table = %d rows, want %d", msgCount, n-1)
 	}
-	if ftsCount != n-1 {
-		t.Errorf("message_fts index = %d rows, want %d (FTS5 trigger kept in sync)", ftsCount, n-1)
+	// count(*) on message_fts cannot report index health: the table is
+	// content='messages', so an unqualified count is answered from the content
+	// table and equals msgCount whatever the index holds. Dropping all three
+	// triggers, or emptying the index with 'delete-all', leaves that count at the
+	// full message total — the exact trap 000003_rebuild_message_fts documents,
+	// where search had silently lost the whole backlog while the count read full.
+	//
+	// integrity-check walks the index against the content table and errors on a
+	// mismatch; a MATCH proves the terms the triggers wrote are actually
+	// retrievable.
+	if _, err := store.sqlDB.ExecContext(ctx, "INSERT INTO message_fts(message_fts) VALUES('integrity-check')"); err != nil {
+		t.Fatalf("FTS integrity-check after batch ingest: %v", err)
+	}
+	var indexed int
+	if err := store.sqlDB.QueryRowContext(ctx,
+		`SELECT count(*) FROM messages JOIN message_fts ON message_fts.rowid = messages.id
+		 WHERE messages.account_id = ? AND message_fts MATCH ?`, acc.ID, `"subject"*`).Scan(&indexed); err != nil {
+		t.Fatalf("FTS match after batch ingest: %v", err)
+	}
+	if indexed != n-1 {
+		t.Errorf("message_fts matched %d of %d ingested subjects; the triggers are not keeping the index in sync", indexed, n-1)
+	}
+	// The update branch has to reindex, not just leave the old term behind.
+	//
+	// The surviving subject on the collision row is item 7's: items 0 and 7 share a
+	// dedupe_key, so both updates land on the same row and the later one in the
+	// batch wins. Item 0's own new subject is therefore expected to be absent, and
+	// asserting that too is what proves the delete half of the AFTER UPDATE trigger
+	// ran rather than leaving the superseded term retrievable.
+	matches := func(term string) int {
+		t.Helper()
+		var count int
+		if err := store.sqlDB.QueryRowContext(ctx,
+			`SELECT count(*) FROM messages JOIN message_fts ON message_fts.rowid = messages.id
+			 WHERE messages.account_id = ? AND message_fts MATCH ?`, acc.ID, term).Scan(&count); err != nil {
+			t.Fatalf("FTS match %s: %v", term, err)
+		}
+		return count
+	}
+	if got := matches(`"subject-7-update"`); got != 1 {
+		t.Errorf("updated subject matched %d rows, want 1 (AFTER UPDATE trigger did not reindex)", got)
+	}
+	if got := matches(`"subject-0-update"`); got != 0 {
+		t.Errorf("superseded subject still matched %d rows, want 0 (stale term left in the index)", got)
 	}
 
 	// Attachments: the batch should accept a per-row attachment list and
@@ -210,6 +249,94 @@ func TestBatchDedupesAcrossCalls(t *testing.T) {
 	}
 	if rows != 2 {
 		t.Errorf("messages table = %d rows, want 2", rows)
+	}
+}
+
+// TestBatchPersistsHasAttachments covers the column the feed reads to draw the
+// paperclip. Nothing assigned it, so it sat at the schema default of 0 for every
+// message ever synced and the indicator never appeared; the update branch has to
+// carry it too, or a re-sync of mail ingested before ingest set the column leaves
+// those rows wrong forever.
+func TestBatchPersistsHasAttachments(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+	account, mailbox := seedAccountMailbox(t, store)
+	now := time.Now().UnixMilli()
+
+	build := func(subject string, hasAttachments bool) *domain.Message {
+		digest := sha256.Sum256([]byte(subject))
+		return &domain.Message{
+			AccountID: account.ID, Direction: "incoming", DedupeKey: digest[:], Subject: subject,
+			Sender: "s@x", Recipients: "r@x",
+			FromJSON: "[]", ToJSON: "[]", CCJSON: "[]", BCCJSON: "[]", ReplyToJSON: "[]", ReferencesJSON: "[]",
+			BodyState: "metadata", HasAttachments: hasAttachments,
+			ReceivedAt: now, CreatedAt: now, UpdatedAt: now,
+		}
+	}
+
+	// Insert branch.
+	withAttachment := build("carries a file", true)
+	plain := build("no files", false)
+	if _, _, err := store.BatchCreateOrUpdateMessages(ctx, []ports.MessageInput{
+		{Message: withAttachment, MailboxID: mailbox.ID, UID: 1, InternalDate: time.UnixMilli(now)},
+		{Message: plain, MailboxID: mailbox.ID, UID: 2, InternalDate: time.UnixMilli(now)},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	stored, _, err := store.GetMessage(ctx, withAttachment.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !stored.HasAttachments {
+		t.Error("ingest stored has_attachments = false for a message that carries one")
+	}
+	if other, _, err := store.GetMessage(ctx, plain.ID); err != nil || other.HasAttachments {
+		t.Errorf("message with no attachments stored has_attachments = %v err=%v", other.HasAttachments, err)
+	}
+
+	// Update branch: the row exists with 0, and a re-sync that now knows about the
+	// attachment has to correct it. This is the half that repairs history.
+	if _, _, err := store.BatchCreateOrUpdateMessages(ctx, []ports.MessageInput{
+		{Message: build("no files", true), MailboxID: mailbox.ID, UID: 2, InternalDate: time.UnixMilli(now)},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	corrected, _, err := store.GetMessage(ctx, plain.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !corrected.HasAttachments {
+		t.Error("re-sync did not correct has_attachments on an existing row")
+	}
+
+	// And the reverse: a provider that no longer reports an attachment part must be
+	// able to clear it, exactly as is_read and is_starred behave on this path.
+	if _, _, err := store.BatchCreateOrUpdateMessages(ctx, []ports.MessageInput{
+		{Message: build("no files", false), MailboxID: mailbox.ID, UID: 2, InternalDate: time.UnixMilli(now)},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if cleared, _, err := store.GetMessage(ctx, plain.ID); err != nil || cleared.HasAttachments {
+		t.Errorf("re-sync left has_attachments = %v err=%v, want false", cleared.HasAttachments, err)
+	}
+
+	// The feed projection has to carry the column, or the client never sees it
+	// however correct the row is.
+	page, err := store.ListMessages(ctx, ports.MessageFilter{AccountID: &account.ID, Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, item := range page.Items {
+		if item.ID == withAttachment.ID {
+			found = true
+			if !item.HasAttachments {
+				t.Error("feed returned has_attachments = false for a message that has one")
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("feed did not return message %d", withAttachment.ID)
 	}
 }
 

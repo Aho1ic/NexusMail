@@ -41,7 +41,9 @@ test('authenticates and renders the unified inbox', async ({ page }) => {
   await login(page)
 
   await expect(page.getByText('NexusMail 已就绪')).toBeVisible()
-  await expect(page.getByRole('button', { name: '工作邮箱 mail@example.com' })).toBeVisible()
+  // The account row is one line: the title only, no address sublabel. exact
+  // because every row's accessible name ends with the account chip's title too.
+  await expect(page.getByRole('button', { name: '工作邮箱', exact: true })).toBeVisible()
 })
 
 test('marks the visible inbox read and reloads it', async ({ page }) => {

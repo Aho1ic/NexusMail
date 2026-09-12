@@ -35,10 +35,14 @@ paths:
                   csrf_token: { type: string }
                   expires_at: { type: integer, format: int64 }
         '401': { $ref: '#/components/responses/Error' }
+        '400': { $ref: '#/components/responses/Error' }
+        '429': { $ref: '#/components/responses/Error' }
     delete:
       summary: End the browser session
       responses:
         '204': { description: Session deleted }
+        '401': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
   /api/v1/accounts:
     get:
       summary: List accounts and connection health
@@ -51,6 +55,7 @@ paths:
                 type: object
                 properties:
                   items: { type: array, items: { $ref: '#/components/schemas/Account' } }
+        '401': { $ref: '#/components/responses/Error' }
     post:
       summary: Add a password account or begin an OAuth flow
       requestBody:
@@ -70,6 +75,8 @@ paths:
                 type: object
                 properties: { authorization_url: { type: string, format: uri } }
         '400': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
   /api/v1/oauth/{provider}/callback:
     get:
       security: []
@@ -102,6 +109,8 @@ paths:
         '204': { description: Account disconnected and its local data deleted }
         '400': { $ref: '#/components/responses/Error' }
         '404': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
   /api/v1/accounts/{id}/mailboxes:
     get:
       summary: List account mailboxes
@@ -115,6 +124,7 @@ paths:
                 type: object
                 properties:
                   items: { type: array, items: { $ref: '#/components/schemas/Mailbox' } }
+        '401': { $ref: '#/components/responses/Error' }
   /api/v1/messages:
     get:
       summary: Query the unified message feed
@@ -123,6 +133,7 @@ paths:
         - { in: query, name: mailbox_id, schema: { type: integer, format: int64 } }
         - { in: query, name: folder, schema: { type: string } }
         - { in: query, name: is_read, schema: { type: boolean } }
+        - { in: query, name: is_starred, description: Only starred (favourited) messages; the starred view spans every account and folder, schema: { type: boolean } }
         - { in: query, name: query, schema: { type: string } }
         - { in: query, name: cursor, schema: { type: string } }
         - in: query
@@ -148,6 +159,7 @@ paths:
                       Unread incoming messages in the whole view, not just on this
                       page. Independent of cursor and limit, so it is the count to
                       show in a badge; items alone cannot produce it.
+        '401': { $ref: '#/components/responses/Error' }
   /api/v1/messages/mark-read:
     post:
       summary: Mark every unread message in the current view as read
@@ -162,6 +174,7 @@ paths:
         - { in: query, name: account_id, schema: { type: integer, format: int64 } }
         - { in: query, name: mailbox_id, schema: { type: integer, format: int64 } }
         - { in: query, name: folder, schema: { type: string } }
+        - { in: query, name: is_starred, schema: { type: boolean } }
         - { in: query, name: query, description: Same full-text term as the feed; restricts the pass to the matching messages, schema: { type: string } }
       responses:
         '200':
@@ -176,6 +189,8 @@ paths:
                   partial: { type: boolean, description: Some accounts failed; the reported messages were still applied }
         '400': { $ref: '#/components/responses/Error' }
         '503': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
   /api/v1/messages/{id}:
     get:
       summary: Read a message; queues body retrieval when necessary
@@ -184,6 +199,7 @@ paths:
         '200': { $ref: '#/components/responses/MessageDetail' }
         '202': { $ref: '#/components/responses/MessageDetail' }
         '404': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/Error' }
     patch:
       summary: Change read/starred state or archive remotely
       description: >-
@@ -211,6 +227,8 @@ paths:
         '400': { $ref: '#/components/responses/Error' }
         '404': { $ref: '#/components/responses/Error' }
         '503': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
   /api/v1/messages/{id}/attachments/{attachment_id}:
     get:
       summary: Fetch and stream an attachment
@@ -222,6 +240,7 @@ paths:
           description: Attachment bytes
           content: { application/octet-stream: { schema: { type: string, contentEncoding: binary } } }
         '404': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/Error' }
   /api/v1/drafts:
     get:
       summary: List drafts or outbox entries
@@ -236,6 +255,7 @@ paths:
                 type: object
                 properties:
                   items: { type: array, items: { $ref: '#/components/schemas/Draft' } }
+        '401': { $ref: '#/components/responses/Error' }
     post:
       summary: Create a local draft
       requestBody:
@@ -245,6 +265,8 @@ paths:
         '201':
           description: Draft created
           content: { application/json: { schema: { $ref: '#/components/schemas/Draft' } } }
+        '401': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
   /api/v1/drafts/{id}:
     get:
       summary: Get a draft and its attachments
@@ -259,6 +281,7 @@ paths:
                 properties:
                   draft: { $ref: '#/components/schemas/Draft' }
                   attachments: { type: array, items: { $ref: '#/components/schemas/DraftAttachment' } }
+        '401': { $ref: '#/components/responses/Error' }
     patch:
       summary: Update a draft using optimistic locking
       parameters:
@@ -274,16 +297,25 @@ paths:
           content: { application/json: { schema: { $ref: '#/components/schemas/Draft' } } }
         '409': { $ref: '#/components/responses/Error' }
         '428': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
     delete:
       summary: Delete a draft
       parameters: [ { $ref: '#/components/parameters/ID' } ]
-      responses: { '204': { description: Draft deleted } }
+      responses:
+        '204': { description: Draft deleted }
+        '401': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
   /api/v1/drafts/{id}/attachments:
     post:
       summary: Add an attachment to a draft
       parameters: [ { $ref: '#/components/parameters/ID' } ]
       requestBody:
         required: true
+        description: >-
+          Multipart field `file`. The whole request is bounded by
+          NEXUSMAIL_MAX_OUTBOUND_BYTES (default 20 MiB); exceeding it is 400
+          `invalid_attachment`.
         content:
           multipart/form-data:
             schema:
@@ -294,28 +326,42 @@ paths:
         '201':
           description: Attachment created
           content: { application/json: { schema: { $ref: '#/components/schemas/DraftAttachment' } } }
+        '400': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
   /api/v1/drafts/{id}/attachments/{attachment_id}:
     delete:
       summary: Remove a draft attachment
       parameters:
         - { $ref: '#/components/parameters/ID' }
         - { in: path, name: attachment_id, required: true, schema: { type: integer, format: int64 } }
-      responses: { '204': { description: Attachment removed } }
+      responses:
+        '204': { description: Attachment removed }
+        '401': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
   /api/v1/drafts/{id}/send:
     post:
       summary: Queue a draft for delivery
       parameters: [ { $ref: '#/components/parameters/ID' } ]
-      responses: { '202': { $ref: '#/components/responses/Queued' } }
+      responses:
+        '202': { $ref: '#/components/responses/Queued' }
+        '401': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
   /api/v1/drafts/{id}/retry:
     post:
       summary: Explicitly retry a failed or unknown delivery
       parameters: [ { $ref: '#/components/parameters/ID' } ]
-      responses: { '202': { $ref: '#/components/responses/Queued' } }
+      responses:
+        '202': { $ref: '#/components/responses/Queued' }
+        '401': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
   /api/v1/ws:
     get:
       summary: Upgrade to the realtime WebSocket stream
       responses:
         '101': { description: WebSocket upgrade }
+        '401': { $ref: '#/components/responses/Error' }
   /healthz:
     get:
       security: []
@@ -367,7 +413,7 @@ components:
       type: object
       required: [provider]
       properties:
-        provider: { type: string, enum: [qq, '163', gmail, outlook] }
+        provider: { type: string, enum: [qq, '163', '126', gmail, outlook, icloud] }
         email: { type: string, format: email }
         display_name: { type: string }
         username: { type: string }
@@ -383,7 +429,7 @@ components:
         id: { type: integer, format: int64 }
         email: { type: string, format: email }
         display_name: { type: string }
-        provider: { type: string, enum: [qq, '163', gmail, outlook] }
+        provider: { type: string, enum: [qq, '163', '126', gmail, outlook, icloud] }
         auth_type: { type: string, enum: [password, oauth2] }
         username: { type: string }
         status: { type: string, enum: [disconnected, connecting, syncing, connected, backoff, auth_error, error] }

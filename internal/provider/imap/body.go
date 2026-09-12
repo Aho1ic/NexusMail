@@ -131,7 +131,12 @@ func (s *Supervisor) fetchBody(ctx context.Context, messageID int64, background 
 	if client == nil {
 		return otpNotice{}, ports.Unavailablef("account is offline")
 	}
-	if _, err := client.Select(location.Mailbox.RemoteName, &goimap.SelectOptions{ReadOnly: true}).Wait(); err != nil {
+	// Fetching a stored UID under a renumbered mailbox would write a stranger's body
+	// — and its verification code — onto this row. Reported as an error rather than
+	// skipped so the deferred rollback above leaves body_state 'error': the next sync
+	// of this mailbox sees the same mismatch, resets it, and re-ingests every UID,
+	// which is what makes the body reachable again.
+	if err := selectForStoredUID(client, location.Mailbox, &goimap.SelectOptions{ReadOnly: true}); err != nil {
 		return otpNotice{}, err
 	}
 	section := &goimap.FetchItemBodySection{Peek: true}

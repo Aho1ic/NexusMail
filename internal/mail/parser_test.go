@@ -4,6 +4,7 @@ import (
 	"net/mail"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestParseCharsetMultipartAndSanitizeHTML(t *testing.T) {
@@ -189,5 +190,25 @@ func TestSanitizeHTMLStyleCannotLeakOrEscape(t *testing.T) {
 				t.Errorf("sanitizeHTML(%q) kept %q: %s", payload, forbidden, got)
 			}
 		}
+	}
+}
+
+// TestSanitizeHTMLIsLinearInNestingDepth records that the HTML side of Parse is not
+// the same class of bomb as MIME nesting. golang.org/x/net/html tokenises rather
+// than building a tree, and bluemonday walks the same stream, so 100 000 nested
+// <div>s (1.1 MB) took 39 ms on the machine this was written on — linear in the
+// input, not quadratic. A 20 000-deep nest therefore has to finish well under a
+// second and still keep the innermost text; if a later change introduces a tree
+// walk whose cost grows with depth, this is the test that notices.
+func TestSanitizeHTMLIsLinearInNestingDepth(t *testing.T) {
+	const depth = 20000
+	input := strings.Repeat("<div>", depth) + "hello" + strings.Repeat("</div>", depth)
+	start := time.Now()
+	got := sanitizeHTML(input)
+	if elapsed := time.Since(start); elapsed >= time.Second {
+		t.Fatalf("sanitizeHTML took %v on a %d-deep nest, want < 1s", elapsed, depth)
+	}
+	if !strings.Contains(got, "hello") {
+		t.Errorf("the innermost text was lost: %q", got[:min(80, len(got))])
 	}
 }

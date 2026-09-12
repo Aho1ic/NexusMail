@@ -1,6 +1,6 @@
-import { render, screen, waitFor } from '@testing-library/react'
+import { cleanup, render, screen, waitFor, within } from '@testing-library/react'
 import { act } from 'react'
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import App from './App'
 
 class FakeSocket {
@@ -29,6 +29,10 @@ function message(id: number, subject: string) {
 }
 
 describe('realtime mail delivery', () => {
+  // Without teardown every render's aside stays in the document, and landmark
+  // queries meant for the current app resolve to the oldest stale one.
+  afterEach(cleanup)
+
   beforeEach(() => {
     sessionStorage.clear()
     FakeSocket.instances = []
@@ -102,7 +106,9 @@ describe('realtime mail delivery', () => {
     expect(await screen.findByText('Existing mail')).toBeInTheDocument()
 
     // Selecting an account rebuilds the message loader; the socket must survive.
-    await act(async () => { screen.getAllByRole('button', { name: /mail@example\.com/ })[0].click() })
+    // The row is named by its title line only — the address no longer repeats as a
+    // sublabel — so it is scoped to the sidebar landmark, where 'Mail' is unique.
+    await act(async () => { within(screen.getByRole('complementary')).getByRole('button', { name: 'Mail' }).click() })
     await waitFor(() => expect(screen.getByRole('heading', { name: 'Mail' })).toBeInTheDocument())
 
     expect(FakeSocket.instances).toHaveLength(1)

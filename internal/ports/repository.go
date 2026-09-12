@@ -13,6 +13,7 @@ type MessageFilter struct {
 	MailboxID *int64
 	Folder    string
 	IsRead    *bool
+	IsStarred *bool
 	Query     string
 	Cursor    string
 	Limit     int

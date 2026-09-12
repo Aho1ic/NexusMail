@@ -131,9 +131,9 @@ export function AccountDialog({ onClose, onCreated }: { onClose: () => void; onC
         <button type="button" aria-label="返回" onClick={back} className="icon-button shrink-0"><ChevronLeft size={19} /></button>
         <Header onClose={onClose} title={`连接 ${selected.label}`} />
       </div>
-      {/* Equal columns while they fit, a horizontal scroller once they do not: five
-          chips at a legible size do not survive a 320px viewport, and wrapping to a
-          second row costs the vertical space this row exists to save. */}
+      {/* Equal columns while they fit, a horizontal scroller once they do not: the
+          full row at a legible size does not survive a 320px viewport, and wrapping
+          to a second row costs the vertical space this row exists to save. */}
       <div className="no-scrollbar mt-6 flex gap-2 overflow-x-auto pb-1">
         {providerOptions.map(option => <button
           type="button"
@@ -151,9 +151,12 @@ export function AccountDialog({ onClose, onCreated }: { onClose: () => void; onC
       {!oauth && <>
         <label htmlFor="account-email" className="field-label">邮箱地址</label>
         <input id="account-email" className="input" type="email" required value={email} onChange={e => setEmail(e.target.value)} />
-        <label htmlFor="account-password" className="field-label">授权码</label>
+        <label htmlFor="account-password" className="field-label">{selected.credential}</label>
         <input id="account-password" className="input" type="password" required value={password} onChange={e => setPassword(e.target.value)} />
-        <p className="mt-2 text-xs text-black/40">请使用邮箱服务商生成的客户端授权码，而非网页登录密码。</p>
+        {/* The space before the interpolation is deliberate: the credential name can
+            start with Latin script ("App 专用密码"), and 生成的App reads as one run
+            without it. */}
+        <p className="mt-2 text-xs text-black/40">请使用邮箱服务商生成的 {selected.credential}，而非网页登录密码。</p>
       </>}
       {oauth && <div className="mt-6 rounded-card bg-sage/50 p-4 text-sm leading-6 text-pine">将打开 {selected.label} 的授权窗口，登录后自动完成连接，无需授权码。部署者必须已配置对应 OAuth Client ID 与 Secret。</div>}
       {error && <p className="mt-3 text-sm text-red-600" role="alert">{error}</p>}

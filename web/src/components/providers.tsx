@@ -11,26 +11,41 @@
 // `backend` is deliberately not `id`. Hotmail is Outlook: the same Microsoft
 // authorization endpoint, the same IMAP host, the same scopes. It is listed
 // separately because a user with an @hotmail.com address does not necessarily
-// know to pick "Outlook", but it posts as `outlook` — the backend provider set is
-// a four-value CHECK constraint on accounts.provider, and duplicating a preset to
-// win a label would need a migration for no behavioural gain.
+// know to pick "Outlook", but it posts as `outlook` — accounts.provider carries an
+// enumerated CHECK constraint, and duplicating a preset to win a label would need
+// a migration for no behavioural gain.
 
-export type ProviderAuth = 'password' | 'oauth2'
-
-export type ProviderOption = {
+type ProviderBase = {
   id: string
   label: string
   backend: string
-  auth: ProviderAuth
   hint: string
 }
 
+// Discriminated on `auth` so the credential label cannot be read on a path that
+// has no credential, and cannot be forgotten on one that does. The dialog derives
+// `auth.type` from this field too, because posting `oauth2` for a password
+// provider — or the reverse — is rejected by the accounts.auth_type CHECK after
+// the preset lookup has already decided the truth.
+//
+// `credential` is what the service itself calls the secret it issues. The Chinese
+// providers issue a 客户端授权码; Apple issues an App 专用密码 and calls it nothing
+// else, so one hardcoded 授权码 label sent an iCloud user looking through Apple ID
+// settings for a thing that does not exist there.
+export type ProviderOption =
+  | (ProviderBase & { auth: 'password'; credential: string })
+  | (ProviderBase & { auth: 'oauth2' })
+
+const CODE = '授权码'
+
 export const providerOptions: ProviderOption[] = [
-  { id: 'qq', label: 'QQ', backend: 'qq', auth: 'password', hint: '使用授权码登录' },
-  { id: '163', label: '163', backend: '163', auth: 'password', hint: '使用授权码登录' },
+  { id: 'qq', label: 'QQ', backend: 'qq', auth: 'password', hint: `使用${CODE}登录`, credential: CODE },
+  { id: '163', label: '163', backend: '163', auth: 'password', hint: `使用${CODE}登录`, credential: CODE },
+  { id: '126', label: '126', backend: '126', auth: 'password', hint: `使用${CODE}登录`, credential: CODE },
   { id: 'gmail', label: 'Gmail', backend: 'gmail', auth: 'oauth2', hint: '使用网页授权登录' },
   { id: 'outlook', label: 'Outlook', backend: 'outlook', auth: 'oauth2', hint: '使用网页授权登录' },
   { id: 'hotmail', label: 'Hotmail', backend: 'outlook', auth: 'oauth2', hint: '使用网页授权登录' },
+  { id: 'icloud', label: 'iCloud', backend: 'icloud', auth: 'password', hint: '使用 App 专用密码登录', credential: 'App 专用密码' },
 ]
 
 // Accounts come back carrying the backend value, so the badge needs the reverse
@@ -40,10 +55,10 @@ export function providerLabel(backend: string): string {
 }
 
 // The marks are drawn inline rather than fetched: an <img> per provider would be
-// five requests for 16px of decoration, and the CSP allows no third-party origin.
-// They are simplified brand-coloured glyphs, not exact logotypes — enough for a
-// 16px chip to be identifiable at a glance. Decorative: every icon sits next to
-// its own text label, so announcing it again would only be noise.
+// one request each for 16px of decoration, and the CSP allows no third-party
+// origin. They are simplified brand-coloured glyphs, not exact logotypes — enough
+// for a 16px chip to be identifiable at a glance. Decorative: every icon sits next
+// to its own text label, so announcing it again would only be noise.
 export function ProviderIcon({ id, size = 16 }: { id: string; size?: number }) {
   const props = { width: size, height: size, viewBox: '0 0 16 16', 'aria-hidden': true, focusable: false } as const
   switch (id) {
@@ -59,6 +74,15 @@ export function ProviderIcon({ id, size = 16 }: { id: string; size?: number }) {
         <rect width="16" height="16" rx="4" fill="#D93327" />
         <path d="M4.3 5.1h7.4v1.3H8.6v.9h3.1v4.6H4.3V7.3h3v-.9H4.3V5.1Zm1.2 3.4v2.2h5v-2.2h-5Z" fill="#fff" />
         <path d="M4.3 3.4h7.4v1.1H4.3V3.4Z" fill="#fff" opacity=".75" />
+      </svg>
+    case '126':
+      // Same NetEase red as 163, since that is the brand's colour for both, with an
+      // envelope rather than a numeral glyph so the two chips do not read as the
+      // same mark at 16px.
+      return <svg {...props}>
+        <rect width="16" height="16" rx="4" fill="#D93327" />
+        <rect x="3.4" y="5.2" width="9.2" height="5.6" rx=".8" fill="#fff" />
+        <path d="M4.4 6.3 8 8.7l3.6-2.4" stroke="#D93327" strokeWidth="1" strokeLinecap="round" fill="none" />
       </svg>
     case 'gmail':
       return <svg {...props}>
@@ -85,6 +109,14 @@ export function ProviderIcon({ id, size = 16 }: { id: string; size?: number }) {
         <rect x="8.6" y="1.4" width="6" height="6" fill="#7FBA00" />
         <rect x="1.4" y="8.6" width="6" height="6" fill="#00A4EF" />
         <rect x="8.6" y="8.6" width="6" height="6" fill="#FFB900" />
+      </svg>
+    case 'icloud':
+      // A cloud on a white plate: the chip sits on the paper background, and a
+      // plain blue cloud on cream reads as a hole rather than a mark.
+      return <svg {...props}>
+        <rect x=".5" y=".5" width="15" height="15" rx="4" fill="#fff" stroke="#E3E3E3" strokeWidth=".6" />
+        <path d="M5.1 11.1a2.1 2.1 0 0 1-.2-4.2 3 3 0 0 1 5.6-.8 2.4 2.4 0 0 1 .4 4.9l-.2.1H5.1Z" fill="#3E9CDC" />
+        <path d="M5.1 11.1a2.1 2.1 0 0 1-.2-4.2 3 3 0 0 1 2.5-1.6 3 3 0 0 0-1.1 5.8H5.1Z" fill="#7BC5EE" />
       </svg>
     default:
       return <svg {...props}><rect width="16" height="16" rx="4" fill="#214F3B" opacity=".2" /></svg>

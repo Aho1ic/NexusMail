@@ -138,27 +138,41 @@ type fullstack struct {
 	cancel context.CancelFunc
 }
 
-func newFullstack(t *testing.T) *fullstack {
+func newFullstack(t *testing.T, options ...harnessOption) *fullstack {
 	t.Helper()
-	h := newHarness(t)
+	h := newHarness(t, options...)
 
-	// A Sent folder so the post-delivery APPEND has somewhere to go: the qq preset
-	// has ServerSavesSent false, which is what makes the append happen at all.
+	// A Sent folder so the post-delivery APPEND has somewhere to go: every preset
+	// this harness runs has ServerSavesSent false, which is what makes the append
+	// happen at all.
 	if err := h.user.Create("Sent", nil); err != nil {
 		t.Fatal(err)
 	}
 
-	// STARTTLS with a private CA rather than a plaintext server: the schema only
-	// admits 'implicit' and 'starttls', and running the encrypted path is what the
-	// real deployment does anyway.
+	// The loopback server speaks whichever dialect the account's preset asks for
+	// rather than one this test picks: 465/implicit for QQ, 163 and 126, and
+	// 587/STARTTLS for iCloud and Outlook. Forcing one of them would leave the
+	// other's dial branch in smtp.Client.Send untested on every provider. A private
+	// CA either way, so the send path runs its real certificate verification.
 	certificate, roots := loopbackCert(t)
 	backend := &recordingSMTP{}
 	smtpServer := gosmtp.NewServer(backend)
 	smtpServer.Domain = "localhost"
-	smtpServer.TLSConfig = &tls.Config{Certificates: []tls.Certificate{certificate}, MinVersion: tls.VersionTLS12}
+	tlsConfig := &tls.Config{Certificates: []tls.Certificate{certificate}, MinVersion: tls.VersionTLS12}
+	smtpServer.TLSConfig = tlsConfig
 	listener, err := net.Listen("tcp", "localhost:0")
 	if err != nil {
 		t.Fatal(err)
+	}
+	address, ok := listener.Addr().(*net.TCPAddr)
+	if !ok {
+		t.Fatalf("unexpected listener address %T", listener.Addr())
+	}
+	if h.account.SMTPTLSMode == "implicit" {
+		// Implicit TLS has no plaintext phase to upgrade from, so the listener
+		// itself is wrapped. The port stays the loopback one; only the handshake
+		// differs from the STARTTLS case.
+		listener = tls.NewListener(listener, tlsConfig)
 	}
 	go func() { _ = smtpServer.Serve(listener) }()
 	// The listener is closed as well as the server: Server.Close only closes the
@@ -167,14 +181,11 @@ func newFullstack(t *testing.T) *fullstack {
 	// the binary on a port that stays open.
 	t.Cleanup(func() { _ = smtpServer.Close(); _ = listener.Close() })
 
-	// The account was created from the qq preset, so its SMTP endpoint points at
-	// smtp.qq.com. Repointing it at the loopback server is the only way to exercise
-	// the send path end to end without touching the compiled-in presets.
-	address, ok := listener.Addr().(*net.TCPAddr)
-	if !ok {
-		t.Fatalf("unexpected listener address %T", listener.Addr())
-	}
-	repointSMTP(t, h, "localhost", address.Port, "starttls")
+	// The account was created from a compiled-in preset, so its SMTP endpoint points
+	// at the real provider. Repointing the host and port at the loopback server is
+	// the only way to exercise the send path end to end; the TLS mode is left as the
+	// preset set it, because that is the behaviour under test.
+	repointSMTP(t, h, "localhost", address.Port, h.account.SMTPTLSMode)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)

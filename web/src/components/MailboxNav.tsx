@@ -1,4 +1,4 @@
-import { Inbox, LogOut, Plus, Send, Settings, SquarePen } from 'lucide-react'
+import { Inbox, LogOut, Plus, Send, Settings, SquarePen, Star } from 'lucide-react'
 import type { Account, Mailbox } from '../types'
 import { Brand, FolderIcon, NavItem } from './shared'
 
@@ -10,8 +10,10 @@ type Props = {
   selectedMailbox: number | null
   unreadCount: number
   foldersCollapsed: boolean
+  starredActive: boolean
   onCompose: () => void
   onSelectAll: () => void
+  onSelectStarred: () => void
   onSelectAccount: (id: number) => void
   onSelectMailbox: (id: number) => void
   onShowOutbox: () => void
@@ -20,13 +22,14 @@ type Props = {
   onLogout: () => void
 }
 
-export function MailboxNav({ visible, accounts, mailboxes, selectedAccount, selectedMailbox, unreadCount, foldersCollapsed, onCompose, onSelectAll, onSelectAccount, onSelectMailbox, onShowOutbox, onShowAccounts, onShowSettings, onLogout }: Props) {
+export function MailboxNav({ visible, accounts, mailboxes, selectedAccount, selectedMailbox, unreadCount, foldersCollapsed, starredActive, onCompose, onSelectAll, onSelectStarred, onSelectAccount, onSelectMailbox, onShowOutbox, onShowAccounts, onShowSettings, onLogout }: Props) {
   return <aside className={`${visible ? 'flex' : 'hidden'} md:flex pane-dark w-full md:w-[260px] shrink-0 flex-col overflow-hidden bg-pine text-white`}>
     <div className="p-6"><Brand light /></div>
     <button onClick={onCompose} className="mx-5 mt-3 flex items-center justify-center gap-2 rounded-card bg-coral px-5 py-3.5 text-sm font-semibold shadow-lift-3 transition hover:-translate-y-0.5 hover:shadow-lift-4"><SquarePen size={18} />写邮件</button>
     <nav className="mt-8 flex-1 overflow-y-auto px-3">
-      <NavItem active={!selectedAccount && !selectedMailbox} icon={<Inbox size={18} />} label="All Inboxes" count={unreadCount} onClick={onSelectAll} />
+      <NavItem active={!starredActive && !selectedAccount && !selectedMailbox} icon={<Inbox size={18} />} label="All Inboxes" count={unreadCount} onClick={onSelectAll} />
       <NavItem active={false} icon={<Send size={18} />} label="草稿与发件箱" onClick={onShowOutbox} />
+      <NavItem active={starredActive} icon={<Star size={18} />} label="收藏夹" onClick={onSelectStarred} />
       <div className="mt-7 px-3 text-[10px] font-bold uppercase tracking-[.22em] text-white/40">账户</div>
       {accounts.map(account => {
         // The subtree only ever renders for the selected account, because mailboxes
@@ -34,8 +37,11 @@ export function MailboxNav({ visible, accounts, mailboxes, selectedAccount, sele
         // selected and not collapsed — there is no per-account flag to keep in sync
         // with a folder list that belongs to whichever account is current.
         const expanded = selectedAccount === account.id && !foldersCollapsed
+        // One line per account: the title is the display name (or the address when
+        // no name was set) and nothing else — the address used to repeat as a
+        // sublabel that carried no information the title did not.
         return <div key={account.id}>
-          <NavItem active={selectedAccount === account.id && !selectedMailbox} expanded={expanded} icon={<span className={`h-2.5 w-2.5 rounded-full ${account.status === 'connected' ? 'bg-emerald-300' : account.status === 'backoff' ? 'bg-amber-300' : 'bg-white/30'}`} />} label={account.display_name || account.email} sublabel={account.email} onClick={() => onSelectAccount(account.id)} />
+          <NavItem active={!starredActive && selectedAccount === account.id && !selectedMailbox} expanded={expanded} icon={<span className={`h-2.5 w-2.5 rounded-full ${account.status === 'connected' ? 'bg-emerald-300' : account.status === 'backoff' ? 'bg-amber-300' : 'bg-white/30'}`} />} label={account.display_name || account.email} onClick={() => onSelectAccount(account.id)} />
           {account.last_error && <p className="mx-3 mt-1 break-words rounded-xl bg-red-400/10 px-2 py-1.5 text-[10px] leading-4 text-red-200" role="alert">同步失败：{account.last_error}</p>}
           {expanded && mailboxes.map(box => <button key={box.id} onClick={() => onSelectMailbox(box.id)} className={`ml-8 flex w-[calc(100%-2.5rem)] items-center gap-2 rounded-2xl px-3 py-2 text-left text-xs transition ${selectedMailbox === box.id ? 'bg-white/12 text-white shadow-lift-1' : 'text-white/50 hover:text-white'}`}><FolderIcon role={box.role} />{box.display_name}</button>)}
         </div>

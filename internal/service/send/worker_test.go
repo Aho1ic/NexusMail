@@ -410,6 +410,11 @@ type backend struct {
 	rcptErr       error
 	dataErr       error
 	dropAfterData bool
+	// onData runs once the server has the body, before it answers. It is what makes
+	// a shutdown racing an in-flight delivery reproducible: the message is already
+	// accepted when the hook cancels the caller's context, which is the ordering
+	// production hits when SIGTERM lands mid-conversation.
+	onData func()
 
 	// Guards the recorded state: one server session runs per connection, and
 	// remote_test.go delivers the same draft from several goroutines at once.
@@ -471,11 +476,14 @@ func (s *session) Data(reader io.Reader) error {
 		return err
 	}
 	s.backend.mu.Lock()
-	drop, dataErr := s.backend.dropAfterData, s.backend.dataErr
+	drop, dataErr, hook := s.backend.dropAfterData, s.backend.dataErr, s.backend.onData
 	if !drop && dataErr == nil {
 		s.backend.received = append(s.backend.received, string(body))
 	}
 	s.backend.mu.Unlock()
+	if hook != nil {
+		hook()
+	}
 	if drop {
 		// The body was accepted and then the connection went away before the reply, so
 		// the client cannot know whether the message was queued.

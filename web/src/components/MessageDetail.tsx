@@ -82,7 +82,10 @@ export function MessageDetail({ selected, details, autoLoadRemoteImages, onBack,
   }
   return <>
     <header className="flex items-center justify-between border-b border-black/5 px-5 py-4"><button onClick={onBack} aria-label="返回列表" className="md:hidden icon-button"><ChevronDown className="rotate-90" size={19} /></button><div className="flex gap-1"><button onClick={onArchive} className="icon-button" title="归档 (e)"><Archive size={18} /></button><button onClick={onStar} className="icon-button" title="星标"><Star size={18} className={message.is_starred ? 'fill-amber-400 text-amber-400' : ''} /></button></div><button onClick={onReply} className="button-secondary"><SquarePen size={16} />回复</button></header>
-    <article className="flex-1 overflow-y-auto px-6 py-8 lg:px-12 xl:px-16">
+    {/* no-scrollbar: the reading pane is the one place the wheel is the primary
+        navigation, and a permanent grey bar down the edge of every mail bought
+        nothing — the wheel, J/K and touch all scroll without it. */}
+    <article className="no-scrollbar flex-1 overflow-y-auto px-6 py-8 lg:px-12 xl:px-16">
       {/* The column was capped at 3xl (768px) while the reading pane now offers well
           over twice that, so fixed-width mail wider than 768px — the norm for a
           newsletter — was pushed into the horizontal scrollbar that .nexusmail-scroll

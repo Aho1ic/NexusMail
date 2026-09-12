@@ -77,10 +77,13 @@ function chip(label: string) {
   return screen.getByRole('button', { name: label })
 }
 
-function fill(fields: { name?: string; email?: string; password?: string }) {
+// The credential field is labelled with whatever the chosen service calls its
+// secret, so the label is a parameter: 授权码 for the Chinese providers, App 专用密码
+// for iCloud.
+function fill(fields: { name?: string; email?: string; password?: string }, credential = '授权码') {
   if (fields.name !== undefined) fireEvent.change(screen.getByLabelText('显示名称'), { target: { value: fields.name } })
   if (fields.email !== undefined) fireEvent.change(screen.getByLabelText('邮箱地址'), { target: { value: fields.email } })
-  if (fields.password !== undefined) fireEvent.change(screen.getByLabelText('授权码'), { target: { value: fields.password } })
+  if (fields.password !== undefined) fireEvent.change(screen.getByLabelText(credential), { target: { value: fields.password } })
 }
 
 function submit() {
@@ -122,16 +125,40 @@ describe('account dialog', () => {
     })
   })
 
-  it('keeps 163 on the password path', async () => {
+  // Each password service posts its own backend value with auth.type password. The
+  // pairing is what matters: posting oauth2 for one of these is refused by the
+  // accounts.auth_type CHECK, and posting a backend value outside the set is
+  // refused by accounts.provider.
+  it.each([
+    { label: '163', backend: '163', email: 'me@163.com', credential: '授权码' },
+    { label: '126', backend: '126', email: 'me@126.com', credential: '授权码' },
+    { label: 'iCloud', backend: 'icloud', email: 'me@icloud.com', credential: 'App 专用密码' },
+  ])('keeps $label on the password path', async ({ label, backend, email, credential }) => {
     const posts = stubAddAccount(() => json({ id: 2 }, 201))
     render(<AccountDialog onClose={() => undefined} onCreated={() => undefined} />)
 
-    pick('163')
-    fill({ name: '备用', email: 'me@163.com', password: 'code' })
+    pick(label)
+    fill({ name: '备用', email, password: 'code' }, credential)
     submit()
 
     await waitFor(() => expect(posts).toHaveLength(1))
-    expect(posts[0].body).toMatchObject({ provider: '163', auth: { type: 'password' } })
+    expect(posts[0].body).toMatchObject({ provider: backend, email, auth: { type: 'password', password: 'code' } })
+  })
+
+  // Apple issues an "App 专用密码" and calls it nothing else. A field labelled 授权码
+  // sends an iCloud user hunting through Apple ID settings for a thing that is not
+  // there, so the label follows the service rather than being one fixed string.
+  it('labels the credential field the way the chosen service names it', () => {
+    stubAddAccount(() => json({}, 201))
+    render(<AccountDialog onClose={() => undefined} onCreated={() => undefined} />)
+
+    pick('iCloud')
+    expect(screen.getByLabelText('App 专用密码')).toBeInTheDocument()
+    expect(screen.getByText(/请使用邮箱服务商生成的 App 专用密码/)).toBeInTheDocument()
+
+    fireEvent.click(chip('126'))
+    expect(screen.getByLabelText('授权码')).toBeInTheDocument()
+    expect(screen.queryByLabelText('App 专用密码')).not.toBeInTheDocument()
   })
 
   it('never shows a credential field for the OAuth providers', () => {
@@ -341,7 +368,7 @@ describe('account dialog', () => {
 
     // The brands are written the way the brands write themselves — the row used to
     // be CSS-uppercased into GMAIL and OUTLOOK.
-    for (const label of ['QQ', '163', 'Gmail', 'Outlook', 'Hotmail']) {
+    for (const label of ['QQ', '163', '126', 'Gmail', 'Outlook', 'Hotmail', 'iCloud']) {
       expect(screen.getByRole('button', { name: new RegExp(`^${label}\\b`) })).toBeInTheDocument()
     }
     // No form until a service is chosen: the fields depend on which one it is.
@@ -363,7 +390,7 @@ describe('account dialog', () => {
     render(<AccountDialog onClose={() => undefined} onCreated={() => undefined} />)
 
     pick('QQ')
-    const labels = ['QQ', '163', 'Gmail', 'Outlook', 'Hotmail']
+    const labels = ['QQ', '163', '126', 'Gmail', 'Outlook', 'Hotmail', 'iCloud']
     const selected = () => labels.filter(label => chip(label).getAttribute('aria-pressed') === 'true')
 
     expect(selected()).toEqual(['QQ'])

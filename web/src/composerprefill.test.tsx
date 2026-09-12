@@ -104,6 +104,50 @@ describe('composer prefill', () => {
     expect(sendButton()).toBeDisabled()
   })
 
+  // The account a reply is answered from must be the one the original arrived on.
+  // Only initialDraft was read here, so every reply composed from a second mailbox
+  // was owned by accounts[0]: the recipient got an answer from an address they never
+  // wrote to, and the copy landed in the wrong account's Sent folder.
+  it('answers from the account the original arrived on', async () => {
+    const calls = stubAPI(call => call.method === 'POST' && call.url === '/api/v1/drafts'
+      ? json(draft({ id: 901, account_id: 2, revision: 1 }), 201)
+      : json({ id: 901, status: 'queued' }, 202))
+    open({ replyTo: message({ account_id: 2 }) })
+    expect(screen.getByRole('combobox')).toHaveValue('2')
+
+    // The picker alone is not the contract: what the draft is actually stored under
+    // is what decides the envelope sender.
+    fireEvent.click(sendButton())
+    await waitFor(() => expect(calls.some(call => call.url.endsWith('/send'))).toBe(true))
+    const created = calls.find(call => call.method === 'POST' && call.url === '/api/v1/drafts')
+    expect(JSON.parse(created!.body!).account_id).toBe(2)
+  })
+
+  it('keeps a reopened draft on its own account, whatever is open behind it', () => {
+    // App passes replyTo=null when it opens a stored draft, but the draft owns a
+    // remote copy under its own account, so its id has to win either way.
+    open({ initialDraft: draft({ account_id: 1 }), replyTo: message({ account_id: 2 }) })
+    expect(screen.getByRole('combobox')).toHaveValue('1')
+  })
+
+  it('falls back to a live account when the reply account no longer exists', async () => {
+    // A message stays open after its account is deleted unless it was the selected
+    // one. The picker cannot show a deleted id — a single-line select with no matching
+    // option resets to the first one — so trusting the reply blindly would
+    // display account 1 while saving the draft under an account the server no longer
+    // has, and every save and the send would be refused with the composer looking fine.
+    const calls = stubAPI(call => call.method === 'POST' && call.url === '/api/v1/drafts'
+      ? json(draft({ id: 902, account_id: 1, revision: 1 }), 201)
+      : json({ id: 902, status: 'queued' }, 202))
+    open({ replyTo: message({ account_id: 99 }) })
+    expect(screen.getByRole('combobox')).toHaveValue('1')
+
+    fireEvent.click(sendButton())
+    await waitFor(() => expect(calls.some(call => call.url.endsWith('/send'))).toBe(true))
+    const created = calls.find(call => call.method === 'POST' && call.url === '/api/v1/drafts')
+    expect(JSON.parse(created!.body!).account_id).toBe(1)
+  })
+
   it('restores every field of a reopened draft and pins its account', () => {
     open({
       initialDraft: draft({

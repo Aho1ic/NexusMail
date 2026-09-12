@@ -100,6 +100,16 @@ func (s *Supervisor) buildFetchedMessage(mailbox domain.Mailbox, fetched *imapcl
 				att.ContentID = &value
 			}
 			attachments = append(attachments, att)
+			// The paperclip in the message list means "this mail carries a file you
+			// can download", so an inline part does not raise it: a CID image the
+			// body references — a signature logo, a tracking pixel — is part of how
+			// the mail is rendered, not something the user has to save, and counting
+			// those would mark most marketing mail as having attachments. Inline
+			// parts are still stored above, because the reading pane resolves the
+			// body's cid: references through them.
+			if dispositionValue == "attachment" {
+				message.HasAttachments = true
+			}
 			return true
 		})
 	}

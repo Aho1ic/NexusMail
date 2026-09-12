@@ -4,7 +4,7 @@
 
 ## 项目概览
 
-NexusMail 是单用户、自托管的统一邮件网关和客户端。一个 Go 进程聚合 QQ、163、Gmail 和 Outlook，提供 IMAP 同步、SQLite FTS5 搜索、SMTP outbox、远端草稿、REST/WebSocket API 和 React UI。
+NexusMail 是单用户、自托管的统一邮件网关和客户端。一个 Go 进程聚合 QQ、163、126、Gmail、Outlook 和 iCloud，提供 IMAP 同步、SQLite FTS5 搜索、SMTP outbox、远端草稿、REST/WebSocket API 和 React UI。
 
 技术栈与运行时基线：
 

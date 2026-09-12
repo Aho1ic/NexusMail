@@ -239,6 +239,43 @@ func (s *Store) CachedBlobBytes(ctx context.Context) (int64, error) {
 	return *total, nil
 }
 
+// UnreferencedDurableBlobs lists durable blobs no row points at any more, oldest
+// first, so the maintenance pass can reclaim the disk they hold.
+//
+// Durable blobs had no reclamation path at all: draft attachments are stored as
+// 'durable' (transport/http/handlers_draft.go), DeleteDraft and
+// DeleteDraftAttachment only remove the database rows, and Evict only ever
+// considers durability='cache'. Every attachment a user ever uploaded therefore
+// stayed on disk for the life of the deployment, invisible to every query.
+//
+// Reclamation has to be by reference count, not by "the draft is gone": storage
+// is content-addressed, so one row is shared by every draft, attachment and raw
+// message that holds the same bytes, and Put upgrades an existing cache row to
+// durable in place rather than writing a second one. All three referencing
+// columns are therefore checked. attachments.blob_id and messages.raw_blob_id are
+// ON DELETE SET NULL, so missing one of them would not fail loudly — it would
+// quietly turn a fetched attachment back into an unfetchable one.
+//
+// The draft_attachments check subsumes the rule that a draft or an 'unknown' send
+// result must keep its bytes (AGENTS.md): those rows live exactly as long as their
+// draft does, and 'unknown' is terminal, so nothing deletes them on the app's own
+// initiative.
+//
+// createdBefore is a grace period. An upload becomes a blob before the
+// draft_attachments row that references it exists — Put and AddDraftAttachment are
+// two statements of one request — so a sweep that ignored age could delete the
+// bytes of an upload still in flight.
+func (s *Store) UnreferencedDurableBlobs(ctx context.Context, createdBefore int64, limit int) ([]domain.BlobObject, error) {
+	var blobs []domain.BlobObject
+	err := s.db.WithContext(ctx).Raw(`SELECT * FROM blob_objects b
+		WHERE b.durability = 'durable' AND b.created_at < ?
+		  AND NOT EXISTS (SELECT 1 FROM draft_attachments da WHERE da.blob_id = b.id)
+		  AND NOT EXISTS (SELECT 1 FROM attachments a WHERE a.blob_id = b.id)
+		  AND NOT EXISTS (SELECT 1 FROM messages m WHERE m.raw_blob_id = b.id)
+		ORDER BY b.created_at, b.id LIMIT ?`, createdBefore, limit).Scan(&blobs).Error
+	return blobs, err
+}
+
 func (s *Store) AddDraftAttachment(ctx context.Context, attachment *domain.DraftAttachment) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
@@ -321,6 +358,16 @@ func (s *Store) DeleteExpiredSessions(ctx context.Context, now int64) error {
 	return s.db.WithContext(ctx).Exec("DELETE FROM web_sessions WHERE expires_at <= ? OR absolute_expires_at <= ?", now, now).Error
 }
 
+// ClaimSendableDraft moves one draft into 'sending' and increments its attempt
+// count, or reports a conflict if it is not eligible.
+//
+// A 'retry_wait' draft is only eligible once its backoff has elapsed. The timer
+// path (ListDueDraftIDs) already filters on next_attempt_at, but worker.Queue is
+// also called directly — the retry button issues one per click — and without the
+// check here that second entry claimed the draft the instant the first attempt
+// wrote its 5s deadline. The ladder was skipped, the attempt budget was spent on
+// back-to-back sends against a server that had just asked for a pause, and the
+// draft reached 'failed' early.
 func (s *Store) ClaimSendableDraft(ctx context.Context, id int64) (domain.Draft, []domain.DraftAttachment, error) {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
@@ -333,8 +380,15 @@ func (s *Store) ClaimSendableDraft(ctx context.Context, id int64) (domain.Draft,
 		if draft.Status != "queued" && draft.Status != "retry_wait" {
 			return ErrConflict
 		}
-		result := tx.Model(&domain.Draft{}).Where("id = ? AND status = ?", id, draft.Status).Updates(map[string]any{
-			"status": "sending", "attempt_count": gorm.Expr("attempt_count + 1"), "updated_at": time.Now().UnixMilli(),
+		now := time.Now().UnixMilli()
+		claim := tx.Model(&domain.Draft{}).Where("id = ? AND status = ?", id, draft.Status)
+		if draft.Status == "retry_wait" {
+			// 'queued' is deliberately untouched: it means "send now", and a queued
+			// draft may still carry the next_attempt_at of an earlier retry round.
+			claim = claim.Where("(next_attempt_at IS NULL OR next_attempt_at <= ?)", now)
+		}
+		result := claim.Updates(map[string]any{
+			"status": "sending", "attempt_count": gorm.Expr("attempt_count + 1"), "updated_at": now,
 		})
 		if result.Error != nil || result.RowsAffected != 1 {
 			if result.Error != nil {
@@ -357,12 +411,19 @@ func (s *Store) ListDueDraftIDs(ctx context.Context, now int64) ([]int64, error)
 	return ids, err
 }
 
+// RecoverSendingDrafts turns drafts that were mid-delivery at shutdown into
+// 'unknown'. attempt_count goes back to 0 for the same reason the SMTP-level
+// unknown in service/send/worker.go resets it: 'unknown' is terminal and only a
+// human can requeue it, so that manual retry has to be a clean restart. Left at
+// its old value, a draft that crashed on attempt 5 was incremented to 6 by the
+// claim, failed the AttemptCount < 5 guard in fail(), and went straight to
+// 'failed' without a single retry.
 func (s *Store) RecoverSendingDrafts(ctx context.Context) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	message := "process stopped while SMTP delivery was in progress; delivery result is unknown"
 	return s.db.WithContext(ctx).Model(&domain.Draft{}).Where("status = 'sending'").Updates(map[string]any{
-		"status": "unknown", "last_error": message, "updated_at": time.Now().UnixMilli(),
+		"status": "unknown", "last_error": message, "attempt_count": 0, "updated_at": time.Now().UnixMilli(),
 	}).Error
 }
 

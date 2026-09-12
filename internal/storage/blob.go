@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -19,10 +20,17 @@ import (
 type Store struct {
 	root     string
 	maxBytes int64
-	repo     ports.BlobRepo
+	repo     blobRepo
 }
 
-func New(root string, maxBytes int64, repo ports.BlobRepo) (*Store, error) {
+// blobRepo is ports.BlobRepo plus the orphan query only this package needs, so
+// the reclamation pass does not widen the port every consumer of it sees.
+type blobRepo interface {
+	ports.BlobRepo
+	UnreferencedDurableBlobs(ctx context.Context, createdBefore int64, limit int) ([]domain.BlobObject, error)
+}
+
+func New(root string, maxBytes int64, repo blobRepo) (*Store, error) {
 	if err := os.MkdirAll(root, 0o750); err != nil {
 		return nil, fmt.Errorf("create blob directory: %w", err)
 	}
@@ -99,13 +107,20 @@ func (s *Store) Open(_ context.Context, blob domain.BlobObject) (io.ReadCloser, 
 }
 
 func (s *Store) Remove(ctx context.Context, blob domain.BlobObject) error {
-	if !safeStorageKey(blob.StorageKey) {
-		return ports.Invalidf("invalid blob storage key")
-	}
-	if err := os.Remove(filepath.Join(s.root, blob.StorageKey)); err != nil && !errors.Is(err, os.ErrNotExist) {
+	if err := s.removeFile(blob.StorageKey); err != nil {
 		return err
 	}
 	return s.repo.DeleteBlob(ctx, blob.ID)
+}
+
+func (s *Store) removeFile(key string) error {
+	if !safeStorageKey(key) {
+		return ports.Invalidf("invalid blob storage key")
+	}
+	if err := os.Remove(filepath.Join(s.root, key)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
 }
 
 // Evict trims the cache tier to maxBytes, least recently used first.
@@ -133,6 +148,54 @@ func (s *Store) Evict(ctx context.Context) error {
 			return err
 		}
 		total -= blob.SizeBytes
+	}
+	return nil
+}
+
+// orphanGrace is how long a durable blob must have existed before the sweep will
+// consider it unreferenced. An upload is stored before the draft_attachments row
+// that references it is written — Put and AddDraftAttachment are two statements of
+// one request — and a client on a slow link can sit between them. An hour is far
+// beyond that window and still lets the 15-minute maintenance pass reclaim the
+// disk on the same day it was orphaned.
+const orphanGrace = time.Hour
+
+// orphanBatch bounds one sweep. Reclaiming is not urgent and the pass repeats
+// every maintenance interval, so a database that has accumulated a large backlog
+// of orphans drains over several ticks instead of holding writeMu for all of them
+// at once.
+const orphanBatch = 256
+
+// ReclaimOrphans deletes durable blobs nothing references any more. It is the only
+// reclamation path for the durable tier: Evict is by construction limited to
+// durability='cache', so without this every draft attachment ever uploaded stays
+// on disk forever.
+//
+// The row goes first and the file second, which is the opposite of Remove. Once
+// the row is gone, draft_attachments.blob_id (ON DELETE RESTRICT) can no longer
+// be pointed at it, so a draft cannot acquire a reference to bytes that are about
+// to be deleted. The residual risk is a leaked file if the process dies between
+// the two steps — the next sweep cannot see it, because it has no row — and that
+// is the cheaper failure: the reverse order can leave a live row whose file is
+// missing, which is an attachment that fails to download.
+func (s *Store) ReclaimOrphans(ctx context.Context) error {
+	blobs, err := s.repo.UnreferencedDurableBlobs(ctx, time.Now().Add(-orphanGrace).UnixMilli(), orphanBatch)
+	if err != nil {
+		return err
+	}
+	for _, blob := range blobs {
+		if !safeStorageKey(blob.StorageKey) {
+			// A key that cannot be joined to a path is not something to delete blindly,
+			// and it is not a reason to abandon the rest of the batch.
+			slog.Warn("skip orphan blob with unsafe storage key", "blob_id", blob.ID)
+			continue
+		}
+		if err := s.repo.DeleteBlob(ctx, blob.ID); err != nil {
+			return err
+		}
+		if err := s.removeFile(blob.StorageKey); err != nil {
+			return err
+		}
 	}
 	return nil
 }

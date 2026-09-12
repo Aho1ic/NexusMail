@@ -4,7 +4,7 @@
 
 ## 1. 总体方案
 
-NexusMail 是单用户、自托管的统一邮件客户端，首版支持 QQ、163、Gmail 与 Outlook 的收取、搜索、状态管理、远端草稿同步和 SMTP 发信。
+NexusMail 是单用户、自托管的统一邮件客户端，支持 QQ、163、126、Gmail、Outlook 与 iCloud 的收取、搜索、状态管理、远端草稿同步和 SMTP 发信。
 
 ```mermaid
 flowchart LR
@@ -44,7 +44,7 @@ flowchart LR
 - IDLE 每 20–25 分钟以抖动间隔退出重建；失败使用 1 秒至 5 分钟、带 full jitter 的指数退避；服务端不支持 IDLE 时每 30 秒轮询。
 - 初始同步优先批量写入 Envelope、Headers 与 BODYSTRUCTURE。正文打开时高优先级抓取，初始同步后低优先级补齐不超过 1 MiB 的文本；正文全局并发 4、每账户 1；附件只在点击时下载。
 - MIME 递归解析 multipart，兼容 UTF-8、GBK、GB2312、Base64 与 Quoted-Printable；HTML 服务端清洗并默认移除远程资源，CID 只解析本地内联附件。
-- Gmail/Outlook 使用 OAuth 2.0 授权码 + PKCE + state。Refresh Token 以 AES-256-GCM 加密落库，Access Token 仅驻留内存；QQ/163 使用客户端授权码。
+- Gmail/Outlook 使用 OAuth 2.0 授权码 + PKCE + state。Refresh Token 以 AES-256-GCM 加密落库，Access Token 仅驻留内存；QQ/163/126 使用客户端授权码，iCloud 使用 App 专用密码（Apple 未对 IMAP/SMTP 开放 OAuth）。
 
 ### 发信与草稿
 
@@ -163,7 +163,7 @@ NexusMail/
 ## 7. 已确认边界与默认值
 
 - 单用户自托管；无注册、租户与 RBAC。
-- 首版仅 QQ、163、Gmail、Outlook；不开放自定义 IMAP。
+- 服务商为编译期 preset：QQ、163、126、Gmail、Outlook、iCloud；不开放自定义 IMAP。新增服务商需要同时改 `internal/provider` 的 preset 与 `accounts.provider` 的 CHECK 约束，后者是一次 accounts 表重建（见 `migrations/000004`）。
 - 不含联系人、日历、规则、PGP/S/MIME 与富文本编辑。
 - Gin + GORM；普通 CRUD 用 GORM，迁移、FTS 和分页热路径用显式 SQL。
 - 固定 `go-imap/v2` beta.8，并由 adapter 隔离预发布 API。

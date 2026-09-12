@@ -146,7 +146,10 @@ func (h *harness) deliver(t *testing.T, subject string) {
 // otherwise unreachable in tests.
 type harnessOption func(*harnessConfig)
 
-type harnessConfig struct{ caps goimap.CapSet }
+type harnessConfig struct {
+	caps     goimap.CapSet
+	provider string
+}
 
 // withoutMoveAndUIDPlus advertises bare IMAP4rev1. IMAP4rev2 implies both MOVE and
 // UIDPLUS, so dropping it is what forces the COPY + \Deleted + EXPUNGE path.
@@ -154,11 +157,19 @@ func withoutMoveAndUIDPlus() harnessOption {
 	return func(cfg *harnessConfig) { cfg.caps = goimap.CapSet{goimap.CapIMAP4rev1: {}} }
 }
 
+// withProvider builds the account from another preset. Everything the supervisor
+// does is driven by the account row, so the preset decides the auth type and the
+// TLS mode the send path dials — which is the only difference between the six
+// providers this app supports that a loopback test can exercise at all.
+func withProvider(name string) harnessOption {
+	return func(cfg *harnessConfig) { cfg.provider = name }
+}
+
 func newHarness(t *testing.T, options ...harnessOption) *harness {
 	t.Helper()
 	const username, password = "mail@example.com", "test-password"
 
-	cfg := harnessConfig{caps: goimap.CapSet{goimap.CapIMAP4rev1: {}, goimap.CapIMAP4rev2: {}}}
+	cfg := harnessConfig{caps: goimap.CapSet{goimap.CapIMAP4rev1: {}, goimap.CapIMAP4rev2: {}}, provider: "qq"}
 	for _, option := range options {
 		option(&cfg)
 	}
@@ -202,7 +213,7 @@ func newHarness(t *testing.T, options ...harnessOption) *harness {
 		t.Fatal(err)
 	}
 	accounts := accountservice.New(repo, box)
-	account, err := accounts.AddPassword(context.Background(), "qq", username, "Test", username, password)
+	account, err := accounts.AddPassword(context.Background(), cfg.provider, username, "Test", username, password)
 	if err != nil {
 		t.Fatal(err)
 	}

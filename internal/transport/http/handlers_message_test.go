@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"mime"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -140,6 +141,11 @@ func TestListMessagesFilters(t *testing.T) {
 	if read.Code != http.StatusOK {
 		t.Fatalf("patch = %d: %s", read.Code, read.Body.String())
 	}
+	// One starred message: the favourites view has to reach it across folders.
+	star := h.do(http.MethodPatch, fmt.Sprintf("/api/v1/messages/%d", fixture.ids[1]), map[string]any{"is_starred": true})
+	if star.Code != http.StatusOK {
+		t.Fatalf("patch = %d: %s", star.Code, star.Body.String())
+	}
 
 	cases := []struct {
 		query string
@@ -153,6 +159,11 @@ func TestListMessagesFilters(t *testing.T) {
 		{"?folder=inbox", 5},
 		{"?is_read=true", 1},
 		{"?is_read=false", 5},
+		{"?is_starred=true", 1},
+		{"?is_starred=false", 5},
+		// Starred spans folder roles: the starred row lives in the inbox, but an
+		// archived star must surface the same way.
+		{"?is_starred=true&folder=archive", 0},
 		{"?query=Archived", 1},
 		{"?query=Message", 4},
 		{"?folder=inbox&is_read=false&account_id=" + fmt.Sprint(fixture.account.ID), 3},
@@ -162,6 +173,10 @@ func TestListMessagesFilters(t *testing.T) {
 			t.Errorf("GET /messages%s returned %d items, want %d", tc.query, got, tc.want)
 		}
 	}
+	if page := h.listMessagePage("?is_starred=true"); page.UnreadTotal != 1 {
+		t.Errorf("starred view unread_total = %d, want 1", page.UnreadTotal)
+	}
+	h.expectError(h.do(http.MethodGet, "/api/v1/messages?is_starred=maybe", nil), 400, "invalid_filter")
 }
 
 func (h *harness) seedAccount2() domain.Account {
@@ -687,6 +702,45 @@ func TestDownloadAttachmentDefaultsTheContentType(t *testing.T) {
 	}
 	if got := response.Header().Get("X-Content-Type-Options"); got != "nosniff" {
 		t.Fatalf("X-Content-Type-Options = %q", got)
+	}
+}
+
+// A MIME part with disposition attachment but neither a filename nor a name
+// parameter is stored with an empty Filename (internal/mail/parser.go keeps the
+// part rather than dropping it), and filepath.Base("") is "." by definition — so
+// the browser was offered a file called ".", which it cannot save under any
+// sensible name. The fallback carries the id so repeat downloads of the same part
+// agree on one name.
+func TestDownloadAttachmentWithoutAFilename(t *testing.T) {
+	h := newHarness(t)
+	fixture := h.seedFeed(1)
+	blob, err := h.blobs.Put(context.Background(), strings.NewReader("unnamed payload"), "cache")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, filename := range map[string]string{
+		"absent":         "",
+		"only spaces":    "   ",
+		"only separator": "/",
+		"dot":            ".",
+	} {
+		t.Run(name, func(t *testing.T) {
+			h.provider.set(func(f *fakeProvider) {
+				f.attachBlob = blob
+				f.attachMeta = domain.Attachment{ID: 11, MessageID: fixture.ids[0], Filename: filename, SizeBytes: blob.SizeBytes}
+			})
+			response := h.do(http.MethodGet, fmt.Sprintf("/api/v1/messages/%d/attachments/11", fixture.ids[0]), nil)
+			if response.Code != http.StatusOK {
+				t.Fatalf("status = %d: %s", response.Code, response.Body.String())
+			}
+			_, params, err := mime.ParseMediaType(response.Header().Get("Content-Disposition"))
+			if err != nil {
+				t.Fatalf("parse Content-Disposition %q: %v", response.Header().Get("Content-Disposition"), err)
+			}
+			if params["filename"] != "attachment-11" {
+				t.Fatalf("filename = %q, want attachment-11", params["filename"])
+			}
+		})
 	}
 }
 

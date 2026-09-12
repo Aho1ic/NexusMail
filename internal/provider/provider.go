@@ -29,6 +29,14 @@ var presets = map[domain.Provider]Preset{
 		Provider: domain.Provider163, IMAPHost: "imap.163.com", IMAPPort: 993, IMAPTLSMode: "implicit",
 		SMTPHost: "smtp.163.com", SMTPPort: 465, SMTPTLSMode: "implicit", AuthType: "password", ServerSavesSent: false,
 	},
+	// 126 is the same NetEase service under a second domain, so it inherits every
+	// quirk 163 already drove: the RFC 2971 ID handshake on connect, the "too many
+	// connections" rate-limit classification, and the absent \Archive special-use
+	// attribute that makes the archive folder something this client has to create.
+	domain.Provider126: {
+		Provider: domain.Provider126, IMAPHost: "imap.126.com", IMAPPort: 993, IMAPTLSMode: "implicit",
+		SMTPHost: "smtp.126.com", SMTPPort: 465, SMTPTLSMode: "implicit", AuthType: "password", ServerSavesSent: false,
+	},
 	domain.ProviderGmail: {
 		Provider: domain.ProviderGmail, IMAPHost: "imap.gmail.com", IMAPPort: 993, IMAPTLSMode: "implicit",
 		SMTPHost: "smtp.gmail.com", SMTPPort: 465, SMTPTLSMode: "implicit", AuthType: "oauth2", ServerSavesSent: true,
@@ -36,6 +44,16 @@ var presets = map[domain.Provider]Preset{
 	domain.ProviderOutlook: {
 		Provider: domain.ProviderOutlook, IMAPHost: "outlook.office365.com", IMAPPort: 993, IMAPTLSMode: "implicit",
 		SMTPHost: "smtp-mail.outlook.com", SMTPPort: 587, SMTPTLSMode: "starttls", AuthType: "oauth2", ServerSavesSent: true,
+	},
+	// Apple publishes no OAuth endpoint for IMAP or SMTP, so iCloud authenticates
+	// with an app-specific password like the Chinese providers rather than through
+	// the OAuth flow its platform peers use. Its SMTP does not file sent mail
+	// either, so ServerSavesSent stays false and the worker APPENDs to Sent.
+	//
+	// 587/STARTTLS is what Apple documents; the implicit-TLS port is not offered.
+	domain.ProviderICloud: {
+		Provider: domain.ProviderICloud, IMAPHost: "imap.mail.me.com", IMAPPort: 993, IMAPTLSMode: "implicit",
+		SMTPHost: "smtp.mail.me.com", SMTPPort: 587, SMTPTLSMode: "starttls", AuthType: "password", ServerSavesSent: false,
 	},
 }
 

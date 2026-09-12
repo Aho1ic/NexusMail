@@ -9,7 +9,16 @@ type Props = { accounts: Account[]; replyTo: Message | null; initialDraft: Draft
 
 export function Composer({ accounts, replyTo, initialDraft, onClose, onSent }: Props) {
   const [draft, setDraft] = useState<Draft | null>(initialDraft)
-  const [accountID, setAccountID] = useState(initialDraft?.account_id ?? accounts[0]?.id ?? 0)
+  // A reply belongs to the account the original arrived on. Reading only initialDraft
+  // left every reply on accounts[0], so a user with more than one mailbox answered
+  // mail delivered to B from A's address — the recipient sees a reply from an address
+  // they never wrote to, and the thread splits at the provider. The reply's account is
+  // only honoured while it still exists: a message stays open after its account is
+  // deleted unless it was the selected one, and an id the option list no longer
+  // carries would blank the picker while leaving send enabled.
+  const [accountID, setAccountID] = useState(initialDraft?.account_id
+    ?? (replyTo && accounts.some(account => account.id === replyTo.account_id) ? replyTo.account_id : accounts[0]?.id)
+    ?? 0)
   const [to, setTo] = useState(initialDraft ? decodeAddressList(initialDraft.to).join(', ') : replyTo?.sender.match(/[\w.+-]+@[\w.-]+/)?.[0] ?? '')
   const [cc, setCC] = useState(initialDraft ? decodeAddressList(initialDraft.cc).join(', ') : '')
   const [bcc, setBCC] = useState(initialDraft ? decodeAddressList(initialDraft.bcc).join(', ') : '')

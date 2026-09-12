@@ -30,6 +30,10 @@ function MailboxApp({ onLogout }: { onLogout: () => void }) {
   const [mailboxes, setMailboxes] = useState<Mailbox[]>([])
   const [selectedAccount, setSelectedAccount] = useState<number | null>(null)
   const [selectedMailbox, setSelectedMailbox] = useState<number | null>(null)
+  // The favourites view is a third axis beside account/mailbox: starred mail
+  // across every account and folder, so it cannot be expressed as a mailbox scope.
+  // Entering it releases the other two, and any scope change releases it.
+  const [starredView, setStarredView] = useState(false)
   const [foldersCollapsed, setFoldersCollapsed] = useState(false)
   const [messages, setMessages] = useState<Message[]>([])
   const [selected, setSelected] = useState<Message | null>(null)
@@ -80,11 +84,16 @@ function MailboxApp({ onLogout }: { onLogout: () => void }) {
   // the search term, which hides mail the button must not touch.
   const viewParams = useCallback(() => {
     const params = new URLSearchParams()
+    if (starredView) {
+      params.set('is_starred', 'true')
+      if (debouncedQuery) params.set('query', debouncedQuery)
+      return params
+    }
     if (selectedAccount) params.set('account_id', String(selectedAccount))
     if (selectedMailbox) params.set('mailbox_id', String(selectedMailbox)); else params.set('folder', 'inbox')
     if (debouncedQuery) params.set('query', debouncedQuery)
     return params
-  }, [selectedAccount, selectedMailbox, debouncedQuery])
+  }, [starredView, selectedAccount, selectedMailbox, debouncedQuery])
 
   const loadAccounts = useCallback(async () => {
     try { const result = await api.accounts(); setAccounts(result.items) }
@@ -290,22 +299,36 @@ function MailboxApp({ onLogout }: { onLogout: () => void }) {
   // the first page and left mark-all-read disabled with work still to do. The page
   // count is the floor for the case where a local read has not been counted yet.
   const unreadCount = useMemo(() => Math.max(unreadTotal, messages.filter(item => !item.is_read).length), [unreadTotal, messages])
-  const listTitle = selectedMailbox
-    ? mailboxes.find(box => box.id === selectedMailbox)?.display_name
-    : selectedAccount ? accountMap.get(selectedAccount)?.display_name || accountMap.get(selectedAccount)?.email : 'All Inboxes'
+  const listTitle = starredView
+    ? '收藏夹'
+    : selectedMailbox
+      ? mailboxes.find(box => box.id === selectedMailbox)?.display_name
+      : selectedAccount ? accountMap.get(selectedAccount)?.display_name || accountMap.get(selectedAccount)?.email : 'All Inboxes'
 
   // Pressing All Inboxes when the badge shows unread mail is a request to be taken
   // to that mail, not just to the top of the list. Leaving another view changes
   // viewParams and the existing effect issues the load, so the flag alone redirects
   // it; standing on All Inboxes already changes nothing, so the load is explicit.
   function selectAll() {
-    const already = selectedAccount === null && selectedMailbox === null
+    const already = !starredView && selectedAccount === null && selectedMailbox === null
+    setStarredView(false)
     setSelectedAccount(null)
     setSelectedMailbox(null)
     setPane('list')
     if (already && unreadCount === 0) return
     pendingReveal.current = true
     if (already) void loadMessages()
+  }
+
+  // The favourites view holds every starred message of every account, newest
+  // first — the feed's own order — so the press only has to switch the view axis.
+  // Standing on it already changes nothing, and re-pressing must not spend a load.
+  function selectStarred() {
+    if (starredView) return
+    setStarredView(true)
+    setSelectedAccount(null)
+    setSelectedMailbox(null)
+    setPane('list')
   }
 
   // Pressing the account row toggles its folder tree. The collapse branch is only
@@ -316,7 +339,8 @@ function MailboxApp({ onLogout }: { onLogout: () => void }) {
   // The pane is left alone too, or on a narrow screen the collapse would be hidden
   // behind the feed the moment it happened.
   function selectAccount(id: number) {
-    if (selectedAccount === id && !selectedMailbox) { setFoldersCollapsed(current => !current); return }
+    if (!starredView && selectedAccount === id && !selectedMailbox) { setFoldersCollapsed(current => !current); return }
+    setStarredView(false)
     setSelectedAccount(id)
     setSelectedMailbox(null)
     setFoldersCollapsed(false)
@@ -345,14 +369,15 @@ function MailboxApp({ onLogout }: { onLogout: () => void }) {
         panes cover the shell edge to edge, so the blur is composited there for
         nothing. Hence the glass is an lg treatment and md stays opaque. */}
     <div className="relative flex h-full w-full overflow-hidden bg-white md:rounded-shell md:border md:border-white/60 md:shadow-stage lg:gap-2.5 lg:bg-white/55 lg:p-2.5 lg:backdrop-blur-2xl">
-      <MailboxNav visible={pane === 'nav'} accounts={accounts} mailboxes={mailboxes} selectedAccount={selectedAccount} selectedMailbox={selectedMailbox} unreadCount={unreadCount} foldersCollapsed={foldersCollapsed}
+      <MailboxNav visible={pane === 'nav'} accounts={accounts} mailboxes={mailboxes} selectedAccount={selectedAccount} selectedMailbox={selectedMailbox} unreadCount={unreadCount} foldersCollapsed={foldersCollapsed} starredActive={starredView}
         onCompose={() => compose()}
         onSelectAll={selectAll}
+        onSelectStarred={selectStarred}
         onSelectAccount={selectAccount}
-        onSelectMailbox={id => { setSelectedMailbox(id); setPane('list') }}
+        onSelectMailbox={id => { setStarredView(false); setSelectedMailbox(id); setPane('list') }}
         onShowOutbox={() => setShowOutbox(true)} onShowAccounts={() => setShowAccounts(true)} onShowSettings={() => setShowSettings(true)} onLogout={logout} />
 
-      <MessageList visible={pane === 'list'} title={listTitle} messages={messages} accountMap={accountMap} selected={selected} unreadCount={unreadCount}
+      <MessageList visible={pane === 'list'} title={listTitle} messages={messages} accountMap={accountMap} selected={selected} unreadCount={unreadCount} accountColors={preferences.accountColors}
         markingRead={markingRead} loading={loading} error={error} query={query} cursor={cursor}
         onOpenNav={() => setPane('nav')} onMarkViewRead={markViewRead} onRefresh={refresh} onQueryChange={setQuery}
         onOpen={openMessage} onLoadMore={() => loadMessages(true, cursor)} revealID={revealID} />

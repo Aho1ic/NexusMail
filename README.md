@@ -1,6 +1,6 @@
 # NexusMail
 
-NexusMail 是一个轻量、自托管、单用户的统一邮件网关和客户端。它在一个 Go 进程中聚合 QQ、163、Gmail 与 Outlook，提供实时 IMAP 同步、SQLite FTS5 搜索、远端草稿、SMTP outbox、REST/WebSocket API 和响应式 React UI。
+NexusMail 是一个轻量、自托管、单用户的统一邮件网关和客户端。它在一个 Go 进程中聚合 QQ、163、126、Gmail、Outlook 与 iCloud，提供实时 IMAP 同步、SQLite FTS5 搜索、远端草稿、SMTP outbox、REST/WebSocket API 和响应式 React UI。
 
 ## 快速开始
 
@@ -17,7 +17,7 @@ openssl rand -base64 32
 docker compose up --build
 ```
 
-打开 `http://localhost:13737`，输入 API Key 换取 HttpOnly 浏览器会话。QQ/163 账户应填写服务商生成的客户端授权码；Gmail/Outlook 还需在 `.env` 配置 OAuth Client，并把回调地址设为：
+打开 `http://localhost:13737`，输入 API Key 换取 HttpOnly 浏览器会话。QQ/163/126 账户填写服务商生成的客户端授权码，iCloud 填写 Apple ID 的 App 专用密码（Apple 未对 IMAP/SMTP 开放 OAuth）。Gmail/Outlook 还需在 `.env` 配置 OAuth Client，并把回调地址设为：
 
 - `http://localhost:13737/api/v1/oauth/gmail/callback`
 - `http://localhost:13737/api/v1/oauth/outlook/callback`

@@ -51,9 +51,7 @@ func bundleAsset(t *testing.T, extension string) string {
 // assertion that matters: a JavaScript module answered as text/html is refused by
 // the browser, so the page loads and then does nothing.
 func TestSPAServesARealAssetAsItself(t *testing.T) {
-	if !hasBundle() {
-		t.Skip("no embedded SPA bundle; run make web-build")
-	}
+	requireBundle(t)
 	h := newHarness(t)
 
 	for _, probe := range []struct{ extension, wantType string }{
@@ -90,9 +88,7 @@ func TestSPAServesARealAssetAsItself(t *testing.T) {
 // silently disables the notification path the OTP feature depends on — and does so
 // without any request failing.
 func TestSPAServesTheServiceWorkerFromTheRoot(t *testing.T) {
-	if !hasBundle() {
-		t.Skip("no embedded SPA bundle; run make web-build")
-	}
+	requireBundle(t)
 	root, err := fs.Sub(static.Files, "dist")
 	if err != nil {
 		t.Fatal(err)
@@ -119,9 +115,7 @@ func TestSPAServesTheServiceWorkerFromTheRoot(t *testing.T) {
 // shell, because that is a stale cached URL after a rebuild changed the hashes,
 // and answering 404 there strands the tab on an empty page.
 func TestSPAFallsBackForAMissingAssetPath(t *testing.T) {
-	if !hasBundle() {
-		t.Skip("no embedded SPA bundle; run make web-build")
-	}
+	requireBundle(t)
 	h := newHarness(t)
 
 	response := h.plain(http.MethodGet, "/assets/index-DOESNOTEXIST.js")
@@ -165,9 +159,7 @@ func bundleDir(t *testing.T) string {
 // embedded file. Only a regular file is an asset; a directory is just another
 // unknown path and gets the shell.
 func TestSPADoesNotListADirectory(t *testing.T) {
-	if !hasBundle() {
-		t.Skip("no embedded SPA bundle; run make web-build")
-	}
+	requireBundle(t)
 	h := newHarness(t)
 	directory := bundleDir(t)
 	root, err := fs.Sub(static.Files, "dist")

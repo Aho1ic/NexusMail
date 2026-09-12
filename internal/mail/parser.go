@@ -12,51 +12,80 @@ import (
 	"strings"
 	"unicode/utf8"
 
-	basemessage "github.com/emersion/go-message"
+	message "github.com/emersion/go-message"
 	messagecharset "github.com/emersion/go-message/charset"
-	message "github.com/emersion/go-message/mail"
 	"github.com/microcosm-cc/bluemonday"
 	"github.com/microcosm-cc/bluemonday/css"
 	"golang.org/x/net/html"
 )
 
+// maxParsedPartBytes bounds one part's decoded body. A part past it is skipped
+// rather than truncated: half a body reads as a whole one to the user, and the
+// full bytes stay fetchable as the raw message blob.
 const maxParsedPartBytes = 4 << 20
 
-type AttachmentMeta struct {
-	PartID      string
-	Filename    string
-	ContentType string
-	Disposition string
-	ContentID   string
-	SizeBytes   int64
-}
+// maxParsedMessageBytes bounds the whole message, which the per-part ceiling
+// cannot: a nesting bomb is built from thousands of parts that are each a few
+// bytes. It exists because the cost is not linear in the message size. Every
+// nested multipart layer re-scans its child's bytes looking for its own boundary,
+// so a part at depth d costs d passes over its own length; measured on the real
+// parser, 1.2 MB at depth 16000 took 29 s and 4.5 MB at depth 60000 took 523 s,
+// quadrupling for every doubling of depth. Parse runs while fetchBody holds the
+// account's IMAP command connection and never checks ctx, so that time is time
+// the account cannot sync, send or archive — and the background body prefetcher
+// reaches every message in a synced mailbox without the user opening anything.
+//
+// 48 MiB is Gmail's 25 MB attachment ceiling after base64 (25 × 4/3 ≈ 34 MB)
+// plus headers, a text alternative, and a little slack. A leading attachment
+// still has to be drained to find the next boundary even though we never adopt
+// its body, so the budget has to cover that drain; 32 MiB sat under the encoded
+// 25 MB and could cut a legitimate Gmail message before its text part. Hitting
+// the ceiling is not a parse error: headers and every part already adopted are
+// returned, so a still-larger message (QQ/163 allow 50 MB) keeps its subject
+// and any text that arrived first rather than vanishing from the mailbox.
+// Together with the depth ceiling this bounds the walk to roughly 48 MB × 16
+// passes, around a second, for any input.
+const maxParsedMessageBytes = 48 << 20
+
+// maxParsedMIMEDepth bounds multipart nesting. Real mail bottoms out at four
+// layers (mixed > related > alternative > leaf) and a forward adds none, because
+// message/rfc822 is not a multipart media type and go-message hands it back as an
+// opaque leaf. 16 is therefore several times the deepest legitimate shape while
+// still turning the bomb above into a linear walk. Parts below the ceiling are
+// dropped, not treated as an error: the headers and every part above it are still
+// worth showing.
+const maxParsedMIMEDepth = 16
 
 type Parsed struct {
-	Subject     string
-	From        []*mail.Address
-	To          []*mail.Address
-	CC          []*mail.Address
-	BCC         []*mail.Address
-	MessageID   string
-	InReplyTo   string
-	References  []string
-	Text        string
-	HTML        string
-	Snippet     string
-	Attachments []AttachmentMeta
+	Subject    string
+	From       []*mail.Address
+	To         []*mail.Address
+	CC         []*mail.Address
+	BCC        []*mail.Address
+	MessageID  string
+	InReplyTo  string
+	References []string
+	Text       string
+	HTML       string
+	Snippet    string
 }
 
 func Parse(reader io.Reader) (Parsed, error) {
-	entity, err := message.CreateReader(reader)
+	return parse(reader, maxParsedMessageBytes)
+}
+
+func parse(reader io.Reader, maxMessageBytes int64) (Parsed, error) {
+	capped := &cappedReader{reader: reader, remaining: maxMessageBytes + 1}
+	entity, err := message.Read(capped)
 	// An unrecognised charset is advisory: go-message still returns a usable entity
 	// whose bodies read as raw bytes. Treating it as fatal threw away the whole
 	// message — headers, attachments and all — over a label we could not decode, so
 	// mail tagged with any charset outside x/text's index simply vanished.
 	//
-	// No nil check on entity: CreateReader returns nil only under exactly this
-	// condition, and the entity it wraps comes from message.New, which always returns
-	// one. So a nil here is unreachable rather than unchecked.
-	if err != nil && !basemessage.IsUnknownCharset(err) {
+	// No nil check on entity: Read returns nil only when reading the header itself
+	// failed, which is exactly this branch; otherwise it forwards message.New, which
+	// always returns an entity. So a nil here is unreachable rather than unchecked.
+	if err != nil && !message.IsUnknownCharset(err) {
 		return Parsed{}, fmt.Errorf("create MIME reader: %w", err)
 	}
 	result := Parsed{
@@ -70,57 +99,48 @@ func Parse(reader io.Reader) (Parsed, error) {
 	result.CC, _ = parseAddressList(entity.Header.Get("Cc"))
 	result.BCC, _ = parseAddressList(entity.Header.Get("Bcc"))
 
-	partIndex := 0
-	for {
-		part, err := entity.NextPart()
+	// The descent is explicit rather than go-message's mail.Reader because that
+	// reader has no depth limit and no way to impose one: it pushes every nested
+	// multipart onto its stack unconditionally.
+	readers := []message.MultipartReader{}
+	if root := entity.MultipartReader(); root != nil {
+		readers = append(readers, root)
+	} else {
+		result.adoptTextPart(entity, capped)
+	}
+	for len(readers) > 0 {
+		part, err := readers[len(readers)-1].NextPart()
 		if errors.Is(err, io.EOF) {
-			break
+			readers = readers[:len(readers)-1]
+			continue
 		}
-		// Same advisory error, same reasoning as at CreateReader, but here the blast
-		// radius was every part after the bad one: go-message hands back a readable
-		// part alongside the error and keeps iterating, so aborting cost the reader a
-		// legible HTML alternative and the attachment list because one part carried a
-		// charset label we do not know. A nil part is likewise unreachable — NextPart
-		// dereferences it before returning, so it pairs nil only with EOF or a hard
-		// error, and both are handled above.
-		if err != nil && !basemessage.IsUnknownCharset(err) {
+		// Same advisory error, same reasoning as at Read, but here the blast radius
+		// was every part after the bad one: go-message hands back a readable part
+		// alongside the error and keeps iterating, so aborting cost the reader a
+		// legible HTML alternative because one part carried a charset label we do not
+		// know. A nil part is likewise unreachable — NextPart dereferences it before
+		// returning, so it pairs nil only with EOF or a hard error, and both are
+		// handled here.
+		if err != nil && !message.IsUnknownCharset(err) {
+			// A message cut off at the ceiling is reported by the multipart reader as a
+			// structural error, which it is — but the truncation is ours, so what was
+			// already parsed is returned instead of discarded.
+			if capped.capped {
+				break
+			}
 			return result, fmt.Errorf("read MIME part: %w", err)
 		}
-		partIndex++
-		contentType, params, _ := mime.ParseMediaType(part.Header.Get("Content-Type"))
-		disposition, dispositionParams, _ := mime.ParseMediaType(part.Header.Get("Content-Disposition"))
-		filename := decodeHeader(dispositionParams["filename"])
-		if filename == "" {
-			filename = decodeHeader(params["name"])
-		}
-		if disposition == "attachment" || filename != "" {
-			result.Attachments = append(result.Attachments, AttachmentMeta{
-				PartID: fmt.Sprintf("%d", partIndex), Filename: filename, ContentType: contentType,
-				Disposition: choose(disposition, "attachment"), ContentID: strings.Trim(part.Header.Get("Content-Id"), "<>"),
-			})
+		if inner := part.MultipartReader(); inner != nil {
+			if len(readers) >= maxParsedMIMEDepth {
+				// Not descending leaves this part's body unread; the enclosing reader
+				// drains it while scanning for its own next boundary, so the walk stays
+				// correct and the deeper layers cost one pass instead of one per level.
+				continue
+			}
+			readers = append(readers, inner)
 			continue
 		}
-		limited := io.LimitReader(part.Body, maxParsedPartBytes+1)
-		body, readErr := io.ReadAll(limited)
-		if readErr != nil || len(body) > maxParsedPartBytes {
-			continue
-		}
-		// No charset conversion here on purpose. go-message decodes the body to UTF-8
-		// while reading it, so the bytes above are already converted; running the
-		// declared charset over them a second time reinterpreted UTF-8 as gb2312 and
-		// turned every non-ASCII Chinese body into mojibake — the main path for QQ and
-		// 163 mail. The one case it looked like it was handling, a charset go-message
-		// cannot decode, it could not have fixed either: that decoder is the same one.
-		switch strings.ToLower(contentType) {
-		case "text/plain", "":
-			if result.Text == "" {
-				result.Text = normalizeText(string(body))
-			}
-		case "text/html":
-			if result.HTML == "" {
-				result.HTML = sanitizeHTML(string(body))
-			}
-		}
+		result.adoptTextPart(part, capped)
 	}
 	if result.Text == "" && result.HTML != "" {
 		result.Text = strings.TrimSpace(bluemonday.StrictPolicy().Sanitize(result.HTML))
@@ -129,6 +149,68 @@ func Parse(reader io.Reader) (Parsed, error) {
 	return result, nil
 }
 
+// adoptTextPart takes one leaf part's body as the message text or HTML if that slot
+// is still empty.
+func (result *Parsed) adoptTextPart(part *message.Entity, capped *cappedReader) {
+	contentType, params, _ := mime.ParseMediaType(part.Header.Get("Content-Type"))
+	disposition, dispositionParams, _ := mime.ParseMediaType(part.Header.Get("Content-Disposition"))
+	// An attachment's body is never read here: it is fetched on demand by part path,
+	// and slurping it would both hold megabytes in memory and let a text/plain
+	// attachment stand in for the message body.
+	if disposition == "attachment" || dispositionParams["filename"] != "" || params["name"] != "" {
+		return
+	}
+	limited := io.LimitReader(part.Body, maxParsedPartBytes+1)
+	body, readErr := io.ReadAll(limited)
+	// capped means the message ceiling cut this body short, so what was read is a
+	// prefix of the real one rather than the whole part.
+	if readErr != nil || len(body) > maxParsedPartBytes || capped.capped {
+		return
+	}
+	// No charset conversion here on purpose. go-message decodes the body to UTF-8
+	// while reading it, so the bytes above are already converted; running the
+	// declared charset over them a second time reinterpreted UTF-8 as gb2312 and
+	// turned every non-ASCII Chinese body into mojibake — the main path for QQ and
+	// 163 mail. The one case it looked like it was handling, a charset go-message
+	// cannot decode, it could not have fixed either: that decoder is the same one.
+	switch strings.ToLower(contentType) {
+	case "text/plain", "":
+		if result.Text == "" {
+			result.Text = normalizeText(string(body))
+		}
+	case "text/html":
+		if result.HTML == "" {
+			result.HTML = sanitizeHTML(string(body))
+		}
+	}
+}
+
+// cappedReader stops the source at a byte ceiling and records that it did. It hands
+// over one byte past the ceiling so capped is exact: a message of precisely the
+// ceiling's length is not reported as truncated.
+type cappedReader struct {
+	reader    io.Reader
+	remaining int64
+	capped    bool
+}
+
+func (r *cappedReader) Read(target []byte) (int, error) {
+	if r.remaining <= 0 {
+		r.capped = true
+		return 0, io.EOF
+	}
+	if int64(len(target)) > r.remaining {
+		target = target[:r.remaining]
+	}
+	read, err := r.reader.Read(target)
+	r.remaining -= int64(read)
+	return read, err
+}
+
+// sanitizeHTML is not given a nesting ceiling of its own. golang.org/x/net/html
+// tokenises rather than building a tree, and bluemonday walks the same stream, so
+// cost is linear in the input: 100 000 nested <div>s (1.1 MB) took 39 ms. A
+// quadratic walk would be TestSanitizeHTMLIsLinearInNestingDepth's job to catch.
 func sanitizeHTML(input string) string {
 	policy := bluemonday.UGCPolicy()
 	policy.AllowAttrs("class").OnElements("pre", "code")
@@ -285,11 +367,4 @@ func snippet(input string, maxRunes int) string {
 	}
 	runes := []rune(input)
 	return string(runes[:maxRunes]) + "…"
-}
-
-func choose(value, fallback string) string {
-	if value == "" {
-		return fallback
-	}
-	return value
 }

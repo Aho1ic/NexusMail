@@ -1,8 +1,14 @@
+import { normalizeHexColor } from './accountColors'
+
 export type Preferences = {
   desktopNotifications: boolean
   verificationCodeNotifications: boolean
   autoLoadRemoteImages: boolean
   keyboardShortcuts: boolean
+  // account id (as string) -> #rrggbb. Colours are identity chrome, not session
+  // state, so they ride with the other preferences in localStorage rather than
+  // earning a server round-trip and a contract field.
+  accountColors: Record<string, string>
 }
 
 const storageKey = 'nexusmail.preferences'
@@ -14,10 +20,24 @@ export const defaultPreferences: Preferences = {
   verificationCodeNotifications: true,
   autoLoadRemoteImages: false,
   keyboardShortcuts: true,
+  accountColors: {},
 }
 
 function coerce(value: unknown, fallback: boolean) {
   return typeof value === 'boolean' ? value : fallback
+}
+
+// Stored colour maps come from free-typed hex and older shapes, so every entry is
+// re-validated; anything that is not a colour is dropped and the account falls
+// back to its palette slot.
+function coerceColors(value: unknown): Record<string, string> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {}
+  const out: Record<string, string> = {}
+  for (const [key, raw] of Object.entries(value as Record<string, unknown>)) {
+    const hex = typeof raw === 'string' ? normalizeHexColor(raw) : null
+    if (hex) out[key] = hex
+  }
+  return out
 }
 
 // localStorage throws in private browsing modes and when storage is blocked, and
@@ -33,6 +53,7 @@ export function loadPreferences(): Preferences {
       verificationCodeNotifications: coerce(parsed?.verificationCodeNotifications, defaultPreferences.verificationCodeNotifications),
       autoLoadRemoteImages: coerce(parsed?.autoLoadRemoteImages, defaultPreferences.autoLoadRemoteImages),
       keyboardShortcuts: coerce(parsed?.keyboardShortcuts, defaultPreferences.keyboardShortcuts),
+      accountColors: coerceColors(parsed?.accountColors),
     }
   } catch { return defaultPreferences }
 }

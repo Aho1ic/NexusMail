@@ -37,9 +37,19 @@ describe('preferences storage', () => {
     const stored: Preferences = {
       desktopNotifications: false, verificationCodeNotifications: false,
       autoLoadRemoteImages: true, keyboardShortcuts: false,
+      accountColors: { '3': '#5E87B0' },
     }
     savePreferences(stored)
-    expect(loadPreferences()).toEqual(stored)
+    expect(loadPreferences()).toEqual({ ...stored, accountColors: { '3': '#5e87b0' } })
+  })
+
+  it('keeps only well-formed colour overrides', () => {
+    // Free-typed hex and older shapes must not poison the chip styles: valid
+    // entries survive normalised, everything else falls back to the palette.
+    localStorage.setItem(storageKey, JSON.stringify({
+      accountColors: { '1': '#ABC', '2': 'nope', '3': 5, '4': '#5e87b0ff' },
+    }))
+    expect(loadPreferences().accountColors).toEqual({ '1': '#aabbcc' })
   })
 
   it('falls back per field when the stored shape is older or wrong', () => {

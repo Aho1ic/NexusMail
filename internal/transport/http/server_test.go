@@ -225,11 +225,14 @@ func TestLoginRateLimit(t *testing.T) {
 	if code := postLogin(router, "wrong-key", ""); code != http.StatusTooManyRequests {
 		t.Fatalf("attempt past the limit returned %d, want 429", code)
 	}
-	// The limit is on attempts, not on failures, so a correct key offered after the
-	// budget is spent is still refused. That is the intended trade: the alternative
-	// lets an attacker probe indefinitely as long as they occasionally succeed.
-	if code := postLogin(router, testAPIKey, ""); code != http.StatusTooManyRequests {
-		t.Fatalf("valid key after limit returned %d, want 429", code)
+	// The limit is on failures, not on attempts: a correct key offered after the
+	// budget is spent still gets in. Counting successes was the previous trade and it
+	// was the wrong one — it gave anyone who could reach the endpoint a way to spend
+	// the real user's budget and lock them out without holding any credential, which
+	// is a worse outcome than an attacker who occasionally guesses right (and who, by
+	// definition, already has the key).
+	if code := postLogin(router, testAPIKey, ""); code != http.StatusCreated {
+		t.Fatalf("valid key after the failure budget was spent returned %d, want 201", code)
 	}
 }
 

@@ -78,20 +78,29 @@ func (s *Server) routes() *gin.Engine {
 	// attacker could get a fresh bucket per request just by varying the header —
 	// and grow the bucket map without bound while doing it. Only addresses the
 	// deployment actually declares are trusted.
+	//
+	// A rejection here is not recoverable and must not be downgraded. Gin keeps no
+	// trusted CIDR at all when the list fails to parse, so ClientIP() falls back to
+	// the peer address — the reverse proxy itself — and every client in the
+	// deployment shares one throttle bucket, which five anonymous requests can spend
+	// to lock the real user out. config.Load already validates the same list with
+	// gin's own parse rules, so reaching this panic means the two disagree: a build
+	// problem, not an operator one.
 	if err := router.SetTrustedProxies(s.cfg.TrustedProxies); err != nil {
-		slog.Warn("invalid NEXUSMAIL_TRUSTED_PROXIES, falling back to no trusted proxies", "error", err)
-		_ = router.SetTrustedProxies(nil)
+		panic(fmt.Sprintf("trusted proxies passed config validation but gin rejected them: %v", err))
 	}
 	// gin.Recovery writes its panic report to gin.DefaultErrorWriter, and its dump
 	// masks only Authorization: the broken-pipe branch would print the session
 	// cookie, X-API-Key and X-CSRF-Token in the clear, outside the slog handler.
 	// The nil writer removes that path entirely and recoveredPanic logs the panic
 	// through slog with the request identity only.
-	router.Use(gin.RecoveryWithWriter(nil, recoveredPanic), requestID(), s.securityHeaders())
+	router.Use(gin.RecoveryWithWriter(nil, recoveredPanic), requestID(), s.securityHeaders(), cacheHeaders())
 	router.GET("/healthz", func(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"status": "ok"}) })
 	router.GET("/readyz", s.ready)
 	api := router.Group("/api/v1")
-	api.POST("/auth/session", s.rateLimitLogin(), s.createSession)
+	// The login throttle lives inside createSession rather than in front of it: only
+	// a failed attempt may be counted, and that is not known until the key is checked.
+	api.POST("/auth/session", s.createSession)
 	api.GET("/oauth/:provider/callback", s.oauthCallback)
 	protected := api.Group("")
 	protected.Use(s.authenticate())

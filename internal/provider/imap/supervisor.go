@@ -126,8 +126,10 @@ func (s *Supervisor) StartAccount(parent context.Context, account domain.Account
 	s.runtimes[account.ID] = rt
 	s.mu.Unlock()
 	s.wg.Add(2)
-	go func() { defer s.wg.Done(); s.commandLoop(ctx, rt) }()
-	go func() { defer s.wg.Done(); s.idleLoop(ctx, rt) }()
+	// Both loops go through runAccountLoop so a panic in either one is recovered
+	// and restarted instead of terminating the process — see its comment.
+	go func() { defer s.wg.Done(); s.runAccountLoop(ctx, rt, "command", s.commandLoop) }()
+	go func() { defer s.wg.Done(); s.runAccountLoop(ctx, rt, "idle", s.idleLoop) }()
 }
 
 // StopAccount tears down one account's loops, leaving every other account running.

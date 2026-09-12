@@ -363,9 +363,10 @@ func TestRunStartsTheSupervisorForStoredAccounts(t *testing.T) {
 }
 
 type countingMaint struct {
-	sessions atomic.Int64
-	evicted  atomic.Int64
-	stamp    atomic.Int64
+	sessions  atomic.Int64
+	evicted   atomic.Int64
+	reclaimed atomic.Int64
+	stamp     atomic.Int64
 }
 
 func (c *countingMaint) DeleteExpiredSessions(_ context.Context, before int64) error {
@@ -379,6 +380,14 @@ func (c *countingMaint) Evict(context.Context) error {
 	return nil
 }
 
+// ReclaimOrphans is the durable tier's only reclamation path, and it is reached
+// from nowhere but this ticker: an unwired call is not a failing test anywhere
+// else, it is disk that is never given back.
+func (c *countingMaint) ReclaimOrphans(context.Context) error {
+	c.reclaimed.Add(1)
+	return nil
+}
+
 func TestMaintenanceSweepsOnEveryTick(t *testing.T) {
 	counter := &countingMaint{}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -388,13 +397,13 @@ func TestMaintenanceSweepsOnEveryTick(t *testing.T) {
 
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
-		if counter.sessions.Load() >= 2 && counter.evicted.Load() >= 2 {
+		if counter.sessions.Load() >= 2 && counter.evicted.Load() >= 2 && counter.reclaimed.Load() >= 2 {
 			break
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	if sessions, evicted := counter.sessions.Load(), counter.evicted.Load(); sessions < 2 || evicted < 2 {
-		t.Fatalf("after repeated ticks: %d session sweeps and %d evictions, want at least 2 of each", sessions, evicted)
+	if sessions, evicted, reclaimed := counter.sessions.Load(), counter.evicted.Load(), counter.reclaimed.Load(); sessions < 2 || evicted < 2 || reclaimed < 2 {
+		t.Fatalf("after repeated ticks: %d session sweeps, %d evictions and %d orphan reclaims, want at least 2 of each", sessions, evicted, reclaimed)
 	}
 	// The cutoff has to be the current time, or expired sessions are never collected.
 	if stamp := counter.stamp.Load(); stamp <= 0 || time.Since(time.UnixMilli(stamp)) > time.Minute {
@@ -423,8 +432,8 @@ func TestMaintenanceStopsWithoutSweepingWhenCancelledFirst(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("maintenance did not return on an already-cancelled context")
 	}
-	if counter.sessions.Load() != 0 || counter.evicted.Load() != 0 {
-		t.Errorf("a cancelled maintenance loop did %d sweeps and %d evictions, want none",
-			counter.sessions.Load(), counter.evicted.Load())
+	if counter.sessions.Load() != 0 || counter.evicted.Load() != 0 || counter.reclaimed.Load() != 0 {
+		t.Errorf("a cancelled maintenance loop did %d sweeps, %d evictions and %d reclaims, want none",
+			counter.sessions.Load(), counter.evicted.Load(), counter.reclaimed.Load())
 	}
 }

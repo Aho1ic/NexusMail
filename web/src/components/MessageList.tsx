@@ -1,6 +1,7 @@
 import { useEffect, useRef } from 'react'
 import { CheckCheck, LoaderCircle, Menu, Paperclip, RefreshCw, Search, Star, X } from 'lucide-react'
 import { displaySender, formatDate } from '../lib/format'
+import { accountColor, chipStyle } from '../lib/accountColors'
 import type { Account, Message } from '../types'
 import { EmptyState } from './shared'
 import { providerLabel } from './providers'
@@ -17,6 +18,7 @@ type Props = {
   error: string
   query: string
   cursor?: string
+  accountColors?: Record<string, string>
   onOpenNav: () => void
   onMarkViewRead: () => void
   onRefresh: () => void
@@ -26,7 +28,7 @@ type Props = {
   revealID: number | null
 }
 
-export function MessageList({ visible, title, messages, accountMap, selected, unreadCount, markingRead, loading, error, query, cursor, onOpenNav, onMarkViewRead, onRefresh, onQueryChange, onOpen, onLoadMore, revealID }: Props) {
+export function MessageList({ visible, title, messages, accountMap, selected, unreadCount, markingRead, loading, error, query, cursor, accountColors, onOpenNav, onMarkViewRead, onRefresh, onQueryChange, onOpen, onLoadMore, revealID }: Props) {
   // The divider only exists while the panes are flush; from lg they are separate
   // cards and the gap does that job. The background stays opaque — a translucent
   // one here would force the shell's blur to repaint on every scrolled row.
@@ -45,23 +47,36 @@ export function MessageList({ visible, title, messages, accountMap, selected, un
       {error && <div role="alert" className="m-3 rounded-card bg-red-50 p-3 text-xs text-red-700 shadow-lift-1">{error}</div>}
       {!loading && messages.length === 0 && <EmptyState />}
       <div role="list" aria-label="邮件列表">
-        {messages.map(message => <div role="listitem" key={message.id}><MessageRow message={message} account={accountMap.get(message.account_id)} active={selected?.id === message.id} revealed={revealID === message.id} onClick={() => onOpen(message)} /></div>)}
+        {messages.map(message => <div role="listitem" key={message.id}><MessageRow message={message} account={accountMap.get(message.account_id)} accountColors={accountColors} active={selected?.id === message.id} revealed={revealID === message.id} onClick={() => onOpen(message)} /></div>)}
       </div>
       {cursor && <button disabled={loading} onClick={onLoadMore} className="my-3 w-full rounded-2xl py-3 text-xs font-semibold text-pine/60 transition hover:bg-sage/40">{loading ? '加载中…' : '加载更多'}</button>}
     </div>
   </section>
 }
 
-function MessageRow({ message, account, active, revealed, onClick }: { message: Message; account?: Account; active: boolean; revealed: boolean; onClick: () => void }) {
+function MessageRow({ message, account, accountColors, active, revealed, onClick }: { message: Message; account?: Account; accountColors?: Record<string, string>; active: boolean; revealed: boolean; onClick: () => void }) {
   const node = useRef<HTMLButtonElement>(null)
   // The revealed row is the one the user was sent here to find, and it is normally
   // below the fold — jumping to it is the whole point of the trip, so it happens on
   // render rather than waiting for a scroll the user has no reason to make.
   useEffect(() => {
     if (!revealed) return
-    // jsdom has no scrollIntoView. Optional-call the method so unit tests do not
-    // crash; Playwright is what proves the row actually moves into view.
-    node.current?.scrollIntoView?.({ block: 'center', inline: 'nearest' })
+    const row = node.current
+    if (!row) return
+    // scrollIntoView centres the row against EVERY scrollable ancestor, the
+    // viewport included, so the whole stage shifted along with the list. Walk up to
+    // the list's own scroll container and move only that one.
+    let box: HTMLElement | null = row.parentElement
+    while (box) {
+      const overflow = getComputedStyle(box).overflowY
+      if (overflow === 'auto' || overflow === 'scroll') break
+      box = box.parentElement
+    }
+    if (!box) { row.scrollIntoView?.({ block: 'center', inline: 'nearest' }); return }
+    const boxRect = box.getBoundingClientRect()
+    const rowRect = row.getBoundingClientRect()
+    const centered = box.scrollTop + rowRect.top - boxRect.top - (boxRect.height - rowRect.height) / 2
+    box.scrollTop = Math.max(centered, 0)
   }, [revealed])
   // The lift is only offered to inactive rows: the selected row already sits at a
   // fixed higher elevation, and .row-lift's hover shadow would drop it back down.
@@ -74,6 +89,8 @@ function MessageRow({ message, account, active, revealed, onClick }: { message: 
     {!message.is_read && <span className="sr-only">未读</span>}
     <div className={`mt-1 truncate text-sm ${!message.is_read ? 'font-semibold' : 'text-black/55'}`}>{message.subject || '（无主题）'}</div>
     <p className="mt-1.5 line-clamp-2 text-xs leading-5 text-black/40">{message.snippet || '正文尚未同步'}</p>
-    <div className="mt-3 flex items-center justify-between"><span className="rounded-full bg-black/[.04] px-2 py-1 text-[9px] font-bold tracking-wide text-black/35">{account?.display_name || (account ? providerLabel(account.provider) : 'Mail')}</span><div className="flex gap-2 text-black/25">{message.has_attachments && <Paperclip size={13} />}{message.is_starred && <Star size={13} className="fill-amber-400 text-amber-400" />}</div></div>
+    <div className="mt-3 flex items-center justify-between">{account
+      ? <span style={chipStyle(accountColor(account.id, accountColors))} className="rounded-full px-2 py-1 text-[9px] font-bold tracking-wide">{account.display_name || providerLabel(account.provider)}</span>
+      : <span className="rounded-full bg-black/[.04] px-2 py-1 text-[9px] font-bold tracking-wide text-black/35">Mail</span>}<div className="flex gap-2 text-black/25">{message.has_attachments && <Paperclip size={13} />}{message.is_starred && <Star size={13} className="fill-amber-400 text-amber-400" />}</div></div>
   </button>
 }

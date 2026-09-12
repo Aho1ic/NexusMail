@@ -21,11 +21,24 @@ func (s *Server) createSession(c *gin.Context) {
 		fail(c, 400, "invalid_request", "api_key is required", nil)
 		return
 	}
+	throttle := loginThrottleKey(c)
 	token, csrf, expires, err := s.sessions.Create(c.Request.Context(), input.APIKey)
 	if err != nil {
+		// Only failed attempts are counted, which is the policy the X-API-Key channel
+		// in authenticate() already follows. The throttle used to run as middleware
+		// ahead of this handler and counted every request, successes included, with no
+		// path that ever reset a bucket: five anonymous requests a minute were enough
+		// to spend the budget the real user needs and lock them out for as long as the
+		// attacker kept going, no credential involved. Deciding the 429 after the key
+		// is checked means the ceiling can only ever refuse a wrong key.
+		if !s.allowAttempt(throttle, loginRateLimit) {
+			fail(c, 429, "rate_limited", "too many login attempts", nil)
+			return
+		}
 		fail(c, http.StatusUnauthorized, "invalid_api_key", "invalid API key", nil)
 		return
 	}
+	s.clearAttempts(throttle)
 	secure := strings.HasPrefix(s.cfg.PublicURL, "https://")
 	http.SetCookie(c.Writer, &http.Cookie{Name: sessionservice.CookieName, Value: token, Path: "/", HttpOnly: true, Secure: secure, SameSite: http.SameSiteStrictMode, Expires: time.UnixMilli(expires)})
 	c.JSON(http.StatusCreated, gin.H{"csrf_token": csrf, "expires_at": expires})

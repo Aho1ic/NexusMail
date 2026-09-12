@@ -470,6 +470,65 @@ func TestCreateAccountStoresAndStartsSync(t *testing.T) {
 	}
 }
 
+// Every password preset has to survive a real POST. The preset table and the
+// accounts.provider CHECK constraint are two independent lists of the same set,
+// and nothing in the service layer compares them: a provider added to one and not
+// the other passes provider.Get, gets its credential sealed, and is then refused
+// by SQLite — a 500 on a request that looked entirely valid. The account-service
+// tests cannot see it because they run against a fake store.
+//
+// The stored endpoint is asserted too, because the preset is the only thing that
+// decides where the account will connect and the JSON hides those fields.
+func TestCreateAccountAcceptsEveryPasswordPreset(t *testing.T) {
+	for _, tc := range []struct {
+		provider string
+		email    string
+		imapHost string
+		smtpHost string
+		smtpPort int
+		smtpTLS  string
+	}{
+		{"qq", "user@qq.com", "imap.qq.com", "smtp.qq.com", 465, "implicit"},
+		{"163", "user@163.com", "imap.163.com", "smtp.163.com", 465, "implicit"},
+		{"126", "user@126.com", "imap.126.com", "smtp.126.com", 465, "implicit"},
+		{"icloud", "user@icloud.com", "imap.mail.me.com", "smtp.mail.me.com", 587, "starttls"},
+	} {
+		t.Run(tc.provider, func(t *testing.T) {
+			h := newHarness(t)
+			response := h.do(http.MethodPost, "/api/v1/accounts", map[string]any{
+				"provider": tc.provider, "email": tc.email,
+				"auth": map[string]string{"type": "password", "password": "authorization-code"},
+			})
+			if response.Code != http.StatusCreated {
+				t.Fatalf("status = %d: %s", response.Code, response.Body.String())
+			}
+			stored, err := h.repo.ListAccounts(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(stored) != 1 {
+				t.Fatalf("stored accounts = %d", len(stored))
+			}
+			account := stored[0]
+			if account.Provider != tc.provider || account.AuthType != "password" {
+				t.Errorf("provider=%q auth_type=%q", account.Provider, account.AuthType)
+			}
+			// The username defaults to the full address for every one of these: none
+			// of them authenticates with a local part.
+			if account.Username != tc.email {
+				t.Errorf("username = %q, want %q", account.Username, tc.email)
+			}
+			if account.IMAPHost != tc.imapHost || account.IMAPPort != 993 || account.IMAPTLSMode != "implicit" {
+				t.Errorf("imap = %s:%d/%s", account.IMAPHost, account.IMAPPort, account.IMAPTLSMode)
+			}
+			if account.SMTPHost != tc.smtpHost || account.SMTPPort != tc.smtpPort || account.SMTPTLSMode != tc.smtpTLS {
+				t.Errorf("smtp = %s:%d/%s, want %s:%d/%s",
+					account.SMTPHost, account.SMTPPort, account.SMTPTLSMode, tc.smtpHost, tc.smtpPort, tc.smtpTLS)
+			}
+		})
+	}
+}
+
 func TestCreateAccountValidation(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
