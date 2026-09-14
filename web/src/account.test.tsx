@@ -20,9 +20,21 @@ function json(payload: unknown, status = 200) {
 
 type Posted = { url: string; method: string; csrf: string | null; body: Record<string, unknown> }
 
+// The dialog also reads the deployment's OAuth client status on mount, which is not
+// what any case here is about: this stub answers it as configured — the state every
+// working deployment is in — and keeps it out of `posts`, so the recorded calls stay
+// the account posts each case is asserting on. The unconfigured half of that
+// behaviour lives in oauthclient.test.tsx.
+const configuredClients = ['gmail', 'outlook'].map(provider => ({
+  provider, configured: true, source: 'environment', client_id: `${provider}-client-id`,
+  redirect_uri: `http://localhost:13737/api/v1/oauth/${provider}/callback`,
+  env_client_id_key: 'NEXUSMAIL_OAUTH_CLIENT_ID', env_client_secret_key: 'NEXUSMAIL_OAUTH_CLIENT_SECRET',
+}))
+
 function stubAddAccount(reply: (posted: Posted) => Response) {
   const posts: Posted[] = []
   const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    if (String(input) === '/api/v1/oauth/clients') return json({ items: configuredClients })
     const posted: Posted = {
       url: String(input),
       method: (init?.method ?? 'GET').toUpperCase(),

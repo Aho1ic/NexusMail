@@ -28,6 +28,7 @@ import (
 	accountservice "nexusmail/internal/service/account"
 	draftservice "nexusmail/internal/service/draft"
 	messageservice "nexusmail/internal/service/message"
+	oauthclientservice "nexusmail/internal/service/oauthclient"
 	sessionservice "nexusmail/internal/service/session"
 	"nexusmail/internal/storage"
 
@@ -218,6 +219,7 @@ type harness struct {
 	blobs    *storage.Store
 	provider *fakeProvider
 	sender   *fakeSender
+	box      *cryptobox.Box
 	blobDir  string
 }
 
@@ -244,13 +246,26 @@ func newHarness(t *testing.T) *harness {
 	cfg := config.Config{PublicURL: "http://localhost:13737", APIKey: testAPIKey, MaxOutboundBytes: 4096}
 	drafts := draftservice.New(repo, hub, remote)
 	t.Cleanup(drafts.Close)
+	oauthManager := oauth.New(cfg)
+	oauthClients := oauthclientservice.New(repo, box, cfg)
+	oauthManager.SetClientStore(oauthClients)
 	server := New(cfg, repo, blobs,
 		accountservice.New(repo, box),
 		messageservice.New(repo, remote, hub),
 		drafts,
 		sessionservice.New(repo, testAPIKey, time.Hour, 24*time.Hour),
-		oauth.New(cfg), remote, sender, hub, context.Background())
-	return &harness{t: t, server: server, router: server.routes(), repo: repo, blobs: blobs, provider: remote, sender: sender, blobDir: filepath.Join(dir, "blobs")}
+		oauthManager, oauthClients, remote, sender, hub, context.Background())
+	return &harness{t: t, server: server, router: server.routes(), repo: repo, blobs: blobs, provider: remote, sender: sender, box: box, blobDir: filepath.Join(dir, "blobs")}
+}
+
+// rebuildOAuth re-creates the manager and the client service against the server's
+// current config. Both hold it by value, so a test that changes the environment
+// pair has to rebuild them - which is exactly what a restart does in production.
+func (h *harness) rebuildOAuth() {
+	h.t.Helper()
+	h.server.oauth = oauth.New(h.server.cfg)
+	h.server.oauthClients = oauthclientservice.New(h.repo, h.box, h.server.cfg)
+	h.server.oauth.SetClientStore(h.server.oauthClients)
 }
 
 // storedBlobFiles counts the blob files actually on disk. The blobs table only
@@ -271,11 +286,18 @@ func (h *harness) storedBlobFiles() int {
 // clients use and the one that skips CSRF.
 func (h *harness) do(method, path string, body any) *httptest.ResponseRecorder {
 	h.t.Helper()
+	return h.doRaw(jsonRequest(h.t, method, path, body))
+}
+
+// jsonRequest builds an unauthenticated request with a JSON body, or no body at
+// all when there is nothing to send.
+func jsonRequest(t *testing.T, method, path string, body any) *http.Request {
+	t.Helper()
 	var reader io.Reader
 	if body != nil {
 		encoded, err := json.Marshal(body)
 		if err != nil {
-			h.t.Fatal(err)
+			t.Fatal(err)
 		}
 		reader = bytes.NewReader(encoded)
 	}
@@ -283,7 +305,7 @@ func (h *harness) do(method, path string, body any) *httptest.ResponseRecorder {
 	if body != nil {
 		request.Header.Set("Content-Type", "application/json")
 	}
-	return h.doRaw(request)
+	return request
 }
 
 func (h *harness) doRaw(request *http.Request) *httptest.ResponseRecorder {
@@ -577,20 +599,19 @@ func TestCreateAccountRejectsMalformedJSON(t *testing.T) {
 
 // An OAuth provider answers with an authorization URL instead of an account, and
 // nothing is stored until the callback returns. With no client credentials
-// configured the attempt has to fail — but as a classified 400 that says which
-// provider is missing, because in a self-hosted deployment the person clicking
-// is the same person who must add the NEXUSMAIL_*_CLIENT_* variables, and a
-// redacted "internal server error" tells them nothing. This was once 500 by
-// design (a deployment detail the client must not be told); the deployer is the
-// client here, so the message is the contract.
+// configured the attempt has to fail as a 400 whose code the UI keys off to
+// offer the credential form: a generic invalid_request would look like a bad
+// display name, and a 500 would tell the deployer they cannot fix it from the
+// page. The same code is used for both Google and Microsoft because the page
+// already knows which provider it asked for.
 func TestCreateAccountOAuthNeedsConfiguration(t *testing.T) {
 	h := newHarness(t)
-	envelope := h.expectError(h.do(http.MethodPost, "/api/v1/accounts", map[string]any{"provider": "gmail"}), 400, "invalid_request")
-	if !strings.Contains(envelope.Error.Message, "missing Google OAuth client credentials") {
+	envelope := h.expectError(h.do(http.MethodPost, "/api/v1/accounts", map[string]any{"provider": "gmail"}), 400, "oauth_not_configured")
+	if !strings.Contains(envelope.Error.Message, "OAuth client is not configured") {
 		t.Fatalf("message = %q, want the missing-credentials reason", envelope.Error.Message)
 	}
-	outlook := h.expectError(h.do(http.MethodPost, "/api/v1/accounts", map[string]any{"provider": "outlook", "display_name": "工作邮箱"}), 400, "invalid_request")
-	if !strings.Contains(outlook.Error.Message, "missing Microsoft OAuth client credentials") {
+	outlook := h.expectError(h.do(http.MethodPost, "/api/v1/accounts", map[string]any{"provider": "outlook", "display_name": "工作邮箱"}), 400, "oauth_not_configured")
+	if !strings.Contains(outlook.Error.Message, "OAuth client is not configured") {
 		t.Fatalf("outlook message = %q, want the missing-credentials reason", outlook.Error.Message)
 	}
 	if started, _, _, _ := h.provider.counts(); started != 0 {

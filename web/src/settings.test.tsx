@@ -32,10 +32,20 @@ function message(id: number, subject: string) {
 
 const inbox = [message(1, 'First mail'), message(2, 'Second mail')]
 
+// The settings panel reads the deployment's OAuth clients on mount. Answering it
+// here keeps that section in its configured shape rather than its cannot-read
+// fallback, which is what a running gateway looks like; oauthclient.test.tsx owns
+// the other states.
+const oauthClients = [
+  { provider: 'gmail', configured: true, source: 'environment', client_id: 'gmail-client-id', redirect_uri: 'http://localhost:13737/api/v1/oauth/gmail/callback', env_client_id_key: 'NEXUSMAIL_GOOGLE_CLIENT_ID', env_client_secret_key: 'NEXUSMAIL_GOOGLE_CLIENT_SECRET' },
+  { provider: 'outlook', configured: true, source: 'environment', client_id: 'outlook-client-id', redirect_uri: 'http://localhost:13737/api/v1/oauth/outlook/callback', env_client_id_key: 'NEXUSMAIL_MICROSOFT_CLIENT_ID', env_client_secret_key: 'NEXUSMAIL_MICROSOFT_CLIENT_SECRET' },
+]
+
 function stubAPI(accounts: unknown[] = [account]) {
   vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
     const url = String(input)
     if (url === '/api/v1/accounts') return json({ items: accounts })
+    if (url === '/api/v1/oauth/clients') return json({ items: oauthClients })
     if (url.includes('/mailboxes')) return json({ items: [] })
     if (/^\/api\/v1\/messages\/\d+$/.test(url)) {
       const id = Number(url.split('/').pop())

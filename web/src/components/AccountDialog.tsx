@@ -1,10 +1,12 @@
 import { FormEvent, useCallback, useEffect, useRef, useState } from 'react'
-import { ChevronLeft, ChevronRight, LoaderCircle, X } from 'lucide-react'
-import { api } from '../lib/api'
+import { ChevronDown, ChevronLeft, ChevronRight, ExternalLink, LoaderCircle, X } from 'lucide-react'
+import { APIError, api } from '../lib/api'
 import { onOAuthResult } from '../lib/oauthbridge'
 import { Dialog } from './shared'
 import { messageOf } from '../lib/format'
+import { OAuthClientForm } from './OAuthClientForm'
 import { ProviderIcon, providerOptions, type ProviderOption } from './providers'
+import type { OAuthClientStatus } from '../types'
 
 // Connecting a mailbox is two decisions, and they used to share one screen: a row
 // of four chips over a form whose fields changed under the user depending on which
@@ -17,6 +19,15 @@ import { ProviderIcon, providerOptions, type ProviderOption } from './providers'
 // the catalogue rather than from a list re-typed here, because posting `oauth2` for
 // a password provider — or the reverse — is rejected by the accounts.auth_type
 // CHECK constraint after the preset lookup has already decided the truth.
+//
+// Whether the deployment holds an OAuth client for a provider is asked once on
+// mount, because a dialog that offers 使用网页授权 to a gateway with no client ID
+// sends the user into a consent window that comes back
+// "missing Microsoft OAuth client credentials" — the failure this probe exists to
+// pre-empt. A probe that fails or has not answered yet is treated as configured:
+// the button is the working path for every correctly deployed gateway, and hiding
+// it because a status call did not come back would break the common case to warn
+// about the rare one. Only an explicit `configured: false` swaps in the form.
 
 type Phase = 'idle' | 'waiting'
 
@@ -29,6 +40,11 @@ export function AccountDialog({ onClose, onCreated }: { onClose: () => void; onC
   const [busy, setBusy] = useState(false)
   const [phase, setPhase] = useState<Phase>('idle')
   const popup = useRef<Window | null>(null)
+  // Keyed by backend value, so Outlook and Hotmail — one Microsoft client, two
+  // chips — read the same entry. A provider missing from the map is unknown, which
+  // is deliberately indistinguishable from configured at every use.
+  const [clients, setClients] = useState<Record<string, OAuthClientStatus>>({})
+  const [manual, setManual] = useState(false)
 
   const settle = useCallback(() => {
     popup.current = null
@@ -57,9 +73,34 @@ export function AccountDialog({ onClose, onCreated }: { onClose: () => void; onC
 
   useEffect(() => () => popup.current?.close(), [])
 
+  // One read on mount. Every failure mode — no such route on an older gateway, a
+  // 500, a dropped connection — lands in the same place as "not answered yet", and
+  // that state renders the flow the dialog has always rendered.
+  const readClients = useCallback(async () => {
+    try {
+      const result = await api.oauthClients()
+      if (!Array.isArray(result?.items)) return
+      setClients(Object.fromEntries(result.items.map(item => [item.provider, item])))
+    } catch { /* unknown stays configured */ }
+  }, [])
+
+  useEffect(() => { void readClients() }, [readClients])
+
+  // The server has its own name for "this deployment has no client for that
+  // provider", and it is the only 400 a credential form fixes. The probe can miss
+  // it — a client cleared from another tab, a gateway that could not answer at
+  // mount — so the answer to the request itself is what re-reads the status and
+  // swaps the form in, rather than leaving the user reading the English message the
+  // original report was made of.
+  const reportError = useCallback((err: unknown) => {
+    setError(messageOf(err))
+    if (err instanceof APIError && err.code === 'oauth_not_configured') void readClients()
+  }, [readClients])
+
   function choose(option: ProviderOption) {
     setSelected(option)
     setError('')
+    setManual(false)
   }
 
   function back() {
@@ -67,11 +108,15 @@ export function AccountDialog({ onClose, onCreated }: { onClose: () => void; onC
     settle()
     setSelected(null)
     setError('')
+    setManual(false)
   }
 
   async function submit(event: FormEvent) {
     event.preventDefault()
     if (!selected) return
+    // The form still wraps the client-id fields when they are shown, and Enter in
+    // a field would otherwise start the popup flow that cannot work yet.
+    if (selected.auth === 'oauth2' && clients[selected.backend]?.configured === false) return
     setBusy(true)
     setError('')
     // The window has to be opened synchronously inside the click that triggered
@@ -97,7 +142,7 @@ export function AccountDialog({ onClose, onCreated }: { onClose: () => void; onC
     } catch (err) {
       popup.current?.close()
       settle()
-      setError(messageOf(err))
+      reportError(err)
     }
   }
 
@@ -116,7 +161,10 @@ export function AccountDialog({ onClose, onCreated }: { onClose: () => void; onC
           <ProviderIcon id={option.id} size={22} />
           <span className="min-w-0 flex-1">
             <span className="block text-sm font-semibold">{option.label}</span>
-            <span className="block text-[11px] text-black/40">{option.hint}</span>
+            {/* The catalogue promises 网页授权 for every OAuth provider. On a gateway
+                holding no client for one of them that promise is false, and the
+                picker is where it is read before a click is spent on it. */}
+            <span className="block text-[11px] text-black/40">{option.auth === 'oauth2' && clients[option.backend]?.configured === false ? '需先配置 OAuth Client' : option.hint}</span>
           </span>
           <ChevronRight size={17} className="shrink-0 text-black/25" />
         </button>)}
@@ -125,6 +173,9 @@ export function AccountDialog({ onClose, onCreated }: { onClose: () => void; onC
   </Dialog>
 
   const oauth = selected.auth === 'oauth2'
+  const client = oauth ? clients[selected.backend] : undefined
+  // Explicitly unconfigured. Unknown is not this.
+  const unconfigured = client?.configured === false
   return <Dialog label="连接邮箱" onClose={onClose} className={panel}>
     <form onSubmit={submit} className="p-7">
       <div className="flex items-center gap-2">
@@ -158,12 +209,29 @@ export function AccountDialog({ onClose, onCreated }: { onClose: () => void; onC
             without it. */}
         <p className="mt-2 text-xs text-black/40">请使用邮箱服务商生成的 {selected.credential}，而非网页登录密码。</p>
       </>}
-      {oauth && <div className="mt-6 rounded-card bg-sage/50 p-4 text-sm leading-6 text-pine">将打开 {selected.label} 的授权窗口，登录后自动完成连接，无需授权码。部署者必须已配置对应 OAuth Client ID 与 Secret。</div>}
+      {oauth && !unconfigured && <div className="mt-6 rounded-card bg-sage/50 p-4 text-sm leading-6 text-pine">将打开 {selected.label} 的授权窗口，登录后自动完成连接，无需授权码。若浏览器打不开授权窗口，可用下方的「手动输入授权码」。</div>}
+      {oauth && unconfigured && client && <div className="mt-6 rounded-card bg-amber-50 p-4 text-amber-900">
+        <p className="text-sm font-semibold">还不能授权：缺少 {selected.label} 的 OAuth Client</p>
+        <p className="mt-1.5 text-xs leading-5">先在 {selected.label} 服务商后台创建 OAuth 客户端，把 Client ID 与 Client Secret 填在下面保存；也可以写入 docker 部署目录 .env 的对应变量后重启网关。保存后即可开始授权。</p>
+        <OAuthClientForm status={client} label={selected.label} onSaved={next => { setError(''); setClients(current => ({ ...current, [next.provider]: next })) }} />
+      </div>}
       {error && <p className="mt-3 text-sm text-red-600" role="alert">{error}</p>}
-      <button disabled={busy} className="button-primary mt-7 w-full">
+      {(!oauth || !unconfigured) && <button disabled={busy} className="button-primary mt-7 w-full">
         {busy && <LoaderCircle className="animate-spin" size={17} />}
         {phase === 'waiting' ? '等待授权完成…' : oauth ? '使用网页授权' : '继续'}
-      </button>
+      </button>}
+      {/* The manual channel is the way out of every environment where the popup
+          cannot come back: a gateway published on a host the redirect URI does not
+          match, a browser that blocks the window, a consent screen finished on a
+          different machine. The user carries the code across by hand. Keyed on the
+          chip so switching provider cannot leave a state issued for the other one. */}
+      {oauth && !unconfigured && <div className="mt-4 border-t border-black/5 pt-4">
+        <button type="button" onClick={() => setManual(!manual)} aria-expanded={manual}
+          className="flex w-full items-center gap-1.5 text-xs font-semibold text-pine">
+          <ChevronDown size={14} className={`transition ${manual ? '' : '-rotate-90'}`} />手动输入授权码
+        </button>
+        {manual && <ManualCode key={selected.id} provider={selected.backend} label={selected.label} displayName={name} onCreated={onCreated} onNotConfigured={readClients} />}
+      </div>}
     </form>
   </Dialog>
 }
@@ -175,5 +243,83 @@ function Header({ title, onClose }: { title: string; onClose: () => void }) {
       <h2 className="truncate font-serif text-3xl">{title}</h2>
     </div>
     <button type="button" aria-label="关闭" onClick={onClose} className="icon-button shrink-0"><X size={19} /></button>
+  </div>
+}
+
+// The paste-the-code path. Two server calls with a state in between: `authorize`
+// issues the consent URL and a state the server will honour exactly once, and
+// `code` trades the pasted value for the account. Because the state is single-use,
+// any failure of the second call has spent it — so a failure drops the link and
+// asks for a new one rather than letting the user retype into a state the server
+// will never accept again.
+//
+// The whole callback URL is accepted, not just the code: the value the user can
+// actually reach is the address bar of the tab the provider landed on, and picking
+// `code=` out of it by hand is where this goes wrong. The server parses it.
+function ManualCode({ provider, label, displayName, onCreated, onNotConfigured }: { provider: string; label: string; displayName: string; onCreated: () => void; onNotConfigured: () => void }) {
+  const [link, setLink] = useState<{ url: string; state: string } | null>(null)
+  const [code, setCode] = useState('')
+  const [busy, setBusy] = useState<'link' | 'submit' | null>(null)
+  const [error, setError] = useState('')
+
+  async function fetchLink() {
+    setBusy('link')
+    setError('')
+    try {
+      const result = await api.startOAuth(provider, displayName)
+      setLink({ url: result.authorization_url, state: result.state })
+      setCode('')
+    } catch (err) {
+      setError(messageOf(err))
+      if (err instanceof APIError && err.code === 'oauth_not_configured') onNotConfigured()
+    } finally { setBusy(null) }
+  }
+
+  async function connect() {
+    if (!link || code.trim() === '') return
+    setBusy('submit')
+    setError('')
+    try {
+      await api.completeOAuth(provider, link.state, code.trim())
+      onCreated()
+    } catch (err) {
+      // A missing client is not a spent state, and telling the user to fetch a new
+      // link would send them around a loop that cannot close.
+      if (err instanceof APIError && err.code === 'oauth_not_configured') {
+        setError(messageOf(err))
+        onNotConfigured()
+        return
+      }
+      setLink(null)
+      setError(`${messageOf(err)}（授权链接已失效，请重新获取链接后再试）`)
+    } finally { setBusy(null) }
+  }
+
+  const codeKey = `oauth-manual-code-${provider}`
+  return <div className="mt-3">
+    <p className="text-[11px] leading-5 text-black/45">在新标签页打开下面的链接，登录 {label} 并同意授权。浏览器跳回后地址栏会带上 <span className="font-mono">code=</span>，把它后面的值复制到下面；整条回跳地址直接粘贴也可以。</p>
+    {!link && <button type="button" onClick={fetchLink} disabled={busy !== null} className="button-secondary mt-3">
+      {busy === 'link' && <LoaderCircle className="animate-spin" size={15} />}获取授权链接
+    </button>}
+    {link && <>
+      <a href={link.url} target="_blank" rel="noreferrer" className="mt-3 flex items-start gap-1.5 break-all rounded-card bg-sage/50 px-3 py-2.5 font-mono text-[11px] leading-5 text-pine underline">
+        <ExternalLink size={13} className="mt-0.5 shrink-0" />{link.url}
+      </a>
+      <label htmlFor={codeKey} className="field-label">授权码或回跳地址</label>
+      {/* Enter inside this field must not submit the form around it: that form is
+          the popup path, and pressing it here would open a consent window instead
+          of finishing the handshake the user is already halfway through. */}
+      <input id={codeKey} className="input font-mono text-xs" value={code} autoComplete="off" spellCheck={false}
+        onChange={event => setCode(event.target.value)}
+        onKeyDown={event => { if (event.key === 'Enter') { event.preventDefault(); void connect() } }}
+        placeholder="4/0Ax4Xk… 或 http://localhost:13737/api/v1/oauth/…?code=…" />
+      <div className="mt-3 flex flex-wrap gap-2">
+        <button type="button" onClick={connect} disabled={busy !== null || code.trim() === ''} className="button-primary">
+          {busy === 'submit' && <LoaderCircle className="animate-spin" size={15} />}完成连接
+        </button>
+        <button type="button" onClick={fetchLink} disabled={busy !== null} className="button-secondary">重新获取链接</button>
+      </div>
+    </>}
+    {error && <p className="mt-2 break-words text-xs text-red-600" role="alert">{error}</p>}
   </div>
 }

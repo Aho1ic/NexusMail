@@ -1,12 +1,13 @@
 import { useEffect, useState } from 'react'
-import { AtSign, Bell, Image, Keyboard, LogOut, Plus, Trash2, X } from 'lucide-react'
+import { AtSign, Bell, Image, Keyboard, KeyRound, LogOut, Plus, Trash2, X } from 'lucide-react'
 import { Dialog } from './shared'
+import { OAuthClientForm } from './OAuthClientForm'
 import { providerLabel } from './providers'
 import { accountStatusLabel, formatFullDate, messageOf } from '../lib/format'
 import { accountPalette, defaultAccountColor, normalizeHexColor } from '../lib/accountColors'
 import { APIError, api } from '../lib/api'
 import { notificationPermission, requestNotificationPermission, type Preferences } from '../lib/preferences'
-import type { Account } from '../types'
+import type { Account, OAuthClientStatus } from '../types'
 
 type Props = { preferences: Preferences; accounts: Account[]; onChange: (patch: Partial<Preferences>) => void; onClose: () => void; onAddAccount: () => void; onDeleted: (id: number) => void; onLogout: () => void }
 
@@ -87,6 +88,8 @@ export function SettingsDialog({ preferences, accounts, onChange, onClose, onAdd
           </div>)}
           <button onClick={onAddAccount} className="button-secondary w-full justify-center"><Plus size={15} />连接邮箱</button>
         </SettingsSection>
+
+        <OAuthClientSection />
       </div>
       <footer className="flex shrink-0 items-center justify-between gap-3 border-t border-black/5 px-7 py-5"><button onClick={onLogout} className="flex items-center gap-2 text-xs font-semibold text-red-600 hover:text-red-700"><LogOut size={15} />退出登录</button><button onClick={onClose} className="button-primary">完成</button></footer>
   </Dialog>
@@ -97,6 +100,57 @@ function SettingsSection({ icon, title, children }: { icon: React.ReactNode; tit
     <h3 className="flex items-center gap-2 text-[10px] font-bold uppercase tracking-[.18em] text-pine/50">{icon}{title}</h3>
     <div className="mt-3 grid gap-2.5">{children}</div>
   </section>
+}
+
+// The OAuth client credentials, for the deployment rather than for one account.
+// They used to live only in the two environment variables the gateway reads at
+// startup, so a self-hoster who had not set them met the failure on the first press
+// of 使用网页授权 and had to go edit a file beside the compose file to get past it.
+//
+// The list degrades to one line when it cannot be read: an older gateway has no
+// such route, and a settings panel that reported that as a failure would be
+// reporting on a feature the user did not come here for. Silent, and never a
+// role="alert" — the environment path is still documented in the line it prints.
+function OAuthClientSection() {
+  const [items, setItems] = useState<OAuthClientStatus[] | null>(null)
+
+  useEffect(() => {
+    let live = true
+    void (async () => {
+      try {
+        const result = await api.oauthClients()
+        if (live && Array.isArray(result?.items)) setItems(result.items)
+      } catch { /* stays null: the section prints its fallback line */ }
+    })()
+    return () => { live = false }
+  }, [])
+
+  async function reload() {
+    try {
+      const result = await api.oauthClients()
+      if (Array.isArray(result?.items)) setItems(result.items)
+    } catch { /* the row the form just wrote is already on screen */ }
+  }
+
+  return <SettingsSection icon={<KeyRound size={14} />} title="OAuth 客户端">
+    {items === null && <p className="rounded-card bg-black/[.03] px-3.5 py-3 text-xs leading-5 text-black/45">暂时读不到 OAuth 客户端配置。也可以在 docker 部署目录的 .env 里填写各服务商的 Client ID 与 Secret，然后重启网关。</p>}
+    {items?.length === 0 && <p className="rounded-card bg-black/[.03] px-3.5 py-3 text-xs text-black/45">没有需要配置的 OAuth 服务商。</p>}
+    {items?.map(item => <div key={item.provider} className="rounded-card border border-black/5 bg-paper/60 p-3.5 shadow-lift-1">
+      <div className="flex items-center gap-2.5">
+        <span className="min-w-0 flex-1 truncate text-sm font-semibold">{providerLabel(item.provider)}</span>
+        <span className={`shrink-0 rounded-full px-2 py-0.5 text-[9px] font-bold tracking-wide ${item.configured ? 'bg-emerald-100 text-emerald-800' : 'bg-amber-100 text-amber-800'}`}>
+          {item.configured ? (item.source === 'database' ? '已配置 · 页面' : '已配置 · 环境变量') : '未配置'}
+        </span>
+      </div>
+      {item.source === 'database' && item.updated_at && <p className="mt-1.5 text-[11px] text-black/35">最近更新 {formatFullDate(item.updated_at)}</p>}
+      <OAuthClientForm status={item} label={providerLabel(item.provider)} onSaved={next => {
+        setItems(current => current?.map(entry => entry.provider === next.provider ? next : entry) ?? [next])
+        // A clear returns 204, so what stands behind it — an environment variable or
+        // nothing — is only knowable from the server. Re-read rather than guess.
+        if (!next.configured) void reload()
+      }} />
+    </div>)}
+  </SettingsSection>
 }
 
 function SettingsToggle({ label, hint, checked, onChange }: { label: string; hint: string; checked: boolean; onChange: (value: boolean) => void }) {

@@ -58,6 +58,12 @@ paths:
         '401': { $ref: '#/components/responses/Error' }
     post:
       summary: Add a password account or begin an OAuth flow
+      description: >-
+        A password provider is created inline and answers 201. An oauth2 provider
+        answers 202 with the consent URL instead, and needs a client for that
+        provider first: with none stored through
+        `PUT /api/v1/oauth/clients/{provider}` and none in the environment the
+        call is 400 `oauth_not_configured`.
       requestBody:
         required: true
         content:
@@ -74,6 +80,39 @@ paths:
               schema:
                 type: object
                 properties: { authorization_url: { type: string, format: uri } }
+        '400': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
+  /api/v1/oauth/{provider}/authorize:
+    post:
+      summary: Start an OAuth flow and return the consent URL to the caller
+      description: >-
+        Same authorization URL the accounts endpoint hands back in 202, except the
+        state is returned with it, so a caller whose callback is unreachable can
+        finish through `POST /api/v1/oauth/{provider}/code` instead of waiting for
+        the redirect. 400 `oauth_not_configured` means no client is stored for the
+        provider and its environment variables are empty too.
+      parameters: [ { $ref: '#/components/parameters/Provider' } ]
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                display_name: { type: string }
+      responses:
+        '200':
+          description: Consent URL and the state that pairs with it
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [authorization_url, state, redirect_uri]
+                properties:
+                  authorization_url: { type: string, format: uri }
+                  state: { type: string, description: Opaque single-use value to send back with the pasted code }
+                  redirect_uri: { type: string, format: uri }
         '400': { $ref: '#/components/responses/Error' }
         '401': { $ref: '#/components/responses/Error' }
         '403': { $ref: '#/components/responses/Error' }
@@ -95,6 +134,83 @@ paths:
         - { in: query, name: code, required: true, schema: { type: string } }
       responses:
         '302': { description: Redirect to the SPA carrying the outcome }
+  /api/v1/oauth/{provider}/code:
+    post:
+      summary: Complete an OAuth flow from a manually pasted authorization code
+      description: >-
+        Escape hatch for deployments where the callback cannot reach the server:
+        the user copies the address bar of the failed redirect and pastes it here.
+        `code` takes either the bare authorization code or the whole redirect URL,
+        whose query string is parsed server-side. `state` comes from the authorize
+        call and is single-use — an expired state, a rejected code or a failed
+        exchange all consume it and answer 400, so the client must call authorize
+        again for a fresh one. 409 means the address is already connected.
+      parameters: [ { $ref: '#/components/parameters/Provider' } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [state, code]
+              properties:
+                state: { type: string, description: State returned by the authorize call }
+                code: { type: string, description: Bare authorization code or the full redirect URL carrying it }
+      responses:
+        '201':
+          description: Account connected
+          content: { application/json: { schema: { $ref: '#/components/schemas/Account' } } }
+        '400': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error' }
+  /api/v1/oauth/clients:
+    get:
+      summary: List the OAuth client configuration status of every provider
+      description: >-
+        One entry per OAuth provider in a fixed order. `source` says where the
+        credentials in effect come from: a client stored through this API wins over
+        the environment variables named in the entry.
+      responses:
+        '200':
+          description: Client status per provider
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/OAuthClientStatus' } }
+        '401': { $ref: '#/components/responses/Error' }
+  /api/v1/oauth/clients/{provider}:
+    put:
+      summary: Store the OAuth client of a provider
+      description: >-
+        The secret is encrypted with the master key before it is written and is
+        never read back. Takes effect immediately and overrides the provider's
+        environment variables until it is deleted.
+      parameters: [ { $ref: '#/components/parameters/Provider' } ]
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/OAuthClientInput' } } }
+      responses:
+        '200':
+          description: Stored client status
+          content: { application/json: { schema: { $ref: '#/components/schemas/OAuthClientStatus' } } }
+        '400': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
+    delete:
+      summary: Delete the stored OAuth client and fall back to the environment
+      description: >-
+        Idempotent. Afterwards the provider reads its environment variables again
+        and reports source none when those are empty too.
+      parameters: [ { $ref: '#/components/parameters/Provider' } ]
+      responses:
+        '204': { description: Stored client deleted }
+        '400': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
   /api/v1/accounts/{id}:
     delete:
       summary: Disconnect an account and delete its local mail
@@ -437,6 +553,24 @@ components:
         last_connected_at: { type: [integer, 'null'], format: int64 }
         created_at: { type: integer, format: int64 }
         updated_at: { type: integer, format: int64 }
+    OAuthClientInput:
+      type: object
+      required: [client_id, client_secret]
+      properties:
+        client_id: { type: string, minLength: 1 }
+        client_secret: { type: string, minLength: 1 }
+    OAuthClientStatus:
+      type: object
+      required: [provider, configured, source, client_id, redirect_uri, env_client_id_key, env_client_secret_key]
+      properties:
+        provider: { type: string, enum: [gmail, outlook] }
+        configured: { type: boolean, description: A usable Client ID and secret are in effect from either source }
+        source: { type: string, enum: [database, environment, none], description: none whenever configured is false }
+        client_id: { type: string, description: Empty when nothing is configured; client_secret is never returned by any endpoint }
+        redirect_uri: { type: string, format: uri, description: Callback to register with the provider }
+        env_client_id_key: { type: string, description: Name of the environment variable read for the Client ID }
+        env_client_secret_key: { type: string, description: Name of the environment variable read for the secret }
+        updated_at: { type: integer, format: int64, description: UTC ms the stored client was last written; present only when source is database }
     Mailbox:
       type: object
       properties:

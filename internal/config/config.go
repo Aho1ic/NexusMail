@@ -44,6 +44,22 @@ type Config struct {
 	TrustedProxies []string
 }
 
+// OAuthEnv returns the environment-supplied OAuth client for a provider, or a
+// zero value when the deployment configured none. Callers resolve by provider
+// name — the settings API and the OAuth manager both do — and without this each
+// one carried its own switch over Google/Microsoft, which is one place per caller
+// to forget when a third provider is added.
+func (c Config) OAuthEnv(name string) OAuthProvider {
+	switch name {
+	case "gmail":
+		return c.Google
+	case "outlook":
+		return c.Microsoft
+	default:
+		return OAuthProvider{}
+	}
+}
+
 func Load() (Config, error) {
 	dataDir := env("NEXUSMAIL_DATA_DIR", "./data")
 	secrets, err := secretEnvs(

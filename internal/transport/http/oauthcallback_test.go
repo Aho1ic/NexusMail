@@ -48,7 +48,7 @@ func configureOAuth(t *testing.T, h *harness) string {
 	h.server.cfg.Google = cfg.Google
 	h.server.oauth = oauth.New(cfg)
 
-	raw, err := h.server.oauth.Start("gmail", "Personal")
+	raw, _, err := h.server.oauth.Start("gmail", "Personal")
 	if err != nil {
 		t.Fatal(err)
 	}

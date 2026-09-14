@@ -167,6 +167,14 @@ type SessionRepo interface {
 	DeleteExpiredSessions(context.Context, int64) error
 }
 
+// OAuthClientRepo persists the deployment's OAuth application per provider. There
+// is at most one row per provider, so the write is an upsert on the provider name.
+type OAuthClientRepo interface {
+	UpsertOAuthClient(context.Context, *domain.OAuthClient) error
+	ListOAuthClients(context.Context) ([]domain.OAuthClient, error)
+	DeleteOAuthClient(context.Context, string) error
+}
+
 // Repository is every subject area plus the connection lifecycle. Only the
 // process assembly in main.go and the components that genuinely span most of the
 // schema (the IMAP supervisor) should depend on this breadth.
@@ -178,6 +186,7 @@ type Repository interface {
 	OutboxRepo
 	BlobRepo
 	SessionRepo
+	OAuthClientRepo
 	Ping(context.Context) error
 	Close() error
 }

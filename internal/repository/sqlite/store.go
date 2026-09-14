@@ -355,6 +355,37 @@ func (s *Store) DeleteAccount(ctx context.Context, id int64) error {
 	return s.db.WithContext(ctx).Delete(&domain.Account{}, id).Error
 }
 
+// UpsertOAuthClient writes the deployment's OAuth application for one provider.
+// The row is keyed on the provider name, so re-saving the same provider replaces
+// the credentials in place and preserves created_at: the settings page shows when
+// the pair was last changed, and a rewrite is a change, not a new client.
+func (s *Store) UpsertOAuthClient(ctx context.Context, client *domain.OAuthClient) error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	return s.db.WithContext(ctx).Exec(`INSERT INTO oauth_clients
+        (provider, client_id, client_secret_ciphertext, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(provider) DO UPDATE SET
+        client_id=excluded.client_id, client_secret_ciphertext=excluded.client_secret_ciphertext,
+        updated_at=excluded.updated_at`, client.Provider, client.ClientID,
+		blobArg(client.ClientSecretCiphertext), client.CreatedAt, client.UpdatedAt).Error
+}
+
+func (s *Store) ListOAuthClients(ctx context.Context) ([]domain.OAuthClient, error) {
+	var items []domain.OAuthClient
+	err := s.db.WithContext(ctx).Order("provider ASC").Find(&items).Error
+	return items, err
+}
+
+// DeleteOAuthClient drops the stored pair so the provider falls back to whatever
+// the environment supplies. A provider with no row is not an error: the caller is
+// asking for the absence, which is already the case.
+func (s *Store) DeleteOAuthClient(ctx context.Context, providerName string) error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	return s.db.WithContext(ctx).Where("provider = ?", providerName).Delete(&domain.OAuthClient{}).Error
+}
+
 // UpsertMailbox records what LIST reported about a mailbox: its name, delimiter,
 // role and sync tier.
 //

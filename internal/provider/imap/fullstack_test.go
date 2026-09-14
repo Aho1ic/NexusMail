@@ -201,7 +201,7 @@ func newFullstack(t *testing.T, options ...harnessOption) *fullstack {
 	// The transport's hub only serves the websocket endpoint, which these tests do
 	// not use; the events they assert on go to the recorder the supervisor and the
 	// services publish into.
-	api := httptransport.New(cfg, h.repo, blobs, h.accounts, messages, drafts, sessions, nil, h.supervisor, sender, realtime.New(), ctx)
+	api := httptransport.New(cfg, h.repo, blobs, h.accounts, messages, drafts, sessions, nil, nil, h.supervisor, sender, realtime.New(), ctx)
 
 	if err := h.supervisor.Start(ctx); err != nil {
 		t.Fatal(err)

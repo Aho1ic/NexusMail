@@ -78,12 +78,15 @@ func (s *Server) createAccount(c *gin.Context) {
 		return
 	}
 	if preset.AuthType == "oauth2" {
-		url, err := s.oauth.Start(input.Provider, input.DisplayName)
+		// state is discarded here: the popup completes through the callback, which
+		// looks the state up itself. Only the manual flow needs it handed back, and
+		// that has its own endpoint.
+		authURL, _, err := s.oauth.Start(input.Provider, input.DisplayName)
 		if err != nil {
-			writeError(c, err)
+			writeOAuthError(c, err)
 			return
 		}
-		c.JSON(http.StatusAccepted, gin.H{"authorization_url": url})
+		c.JSON(http.StatusAccepted, gin.H{"authorization_url": authURL})
 		return
 	}
 	account, err := s.accounts.AddPassword(c.Request.Context(), input.Provider, input.Email, input.DisplayName, input.Username, input.Auth.Password)

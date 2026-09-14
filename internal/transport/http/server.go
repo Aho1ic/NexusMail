@@ -16,6 +16,7 @@ import (
 	accountservice "nexusmail/internal/service/account"
 	draftservice "nexusmail/internal/service/draft"
 	messageservice "nexusmail/internal/service/message"
+	oauthclientservice "nexusmail/internal/service/oauthclient"
 	sessionservice "nexusmail/internal/service/session"
 
 	"github.com/coder/websocket"
@@ -44,26 +45,27 @@ type Sender interface {
 }
 
 type Server struct {
-	cfg       config.Config
-	repo      ports.Repository
-	blobs     ports.BlobStore
-	accounts  *accountservice.Service
-	messages  *messageservice.Service
-	drafts    *draftservice.Service
-	sessions  *sessionservice.Service
-	oauth     *oauth.Manager
-	sync      Syncer
-	sender    Sender
-	hub       Hub
-	appCtx    context.Context
-	router    *gin.Engine
-	rateMu    sync.Mutex
-	rate      map[string][]time.Time
-	rateSwept time.Time
+	cfg          config.Config
+	repo         ports.Repository
+	blobs        ports.BlobStore
+	accounts     *accountservice.Service
+	messages     *messageservice.Service
+	drafts       *draftservice.Service
+	sessions     *sessionservice.Service
+	oauth        *oauth.Manager
+	oauthClients *oauthclientservice.Service
+	sync         Syncer
+	sender       Sender
+	hub          Hub
+	appCtx       context.Context
+	router       *gin.Engine
+	rateMu       sync.Mutex
+	rate         map[string][]time.Time
+	rateSwept    time.Time
 }
 
-func New(cfg config.Config, repo ports.Repository, blobs ports.BlobStore, accounts *accountservice.Service, messages *messageservice.Service, drafts *draftservice.Service, sessions *sessionservice.Service, oauthManager *oauth.Manager, syncer Syncer, sender Sender, hub Hub, appCtx context.Context) *Server {
-	s := &Server{cfg: cfg, repo: repo, blobs: blobs, accounts: accounts, messages: messages, drafts: drafts, sessions: sessions, oauth: oauthManager, sync: syncer, sender: sender, hub: hub, appCtx: appCtx, rate: make(map[string][]time.Time)}
+func New(cfg config.Config, repo ports.Repository, blobs ports.BlobStore, accounts *accountservice.Service, messages *messageservice.Service, drafts *draftservice.Service, sessions *sessionservice.Service, oauthManager *oauth.Manager, oauthClients *oauthclientservice.Service, syncer Syncer, sender Sender, hub Hub, appCtx context.Context) *Server {
+	s := &Server{cfg: cfg, repo: repo, blobs: blobs, accounts: accounts, messages: messages, drafts: drafts, sessions: sessions, oauth: oauthManager, oauthClients: oauthClients, sync: syncer, sender: sender, hub: hub, appCtx: appCtx, rate: make(map[string][]time.Time)}
 	s.router = s.routes()
 	return s
 }
@@ -109,6 +111,11 @@ func (s *Server) routes() *gin.Engine {
 	protected.GET("/accounts", s.listAccounts)
 	protected.GET("/accounts/:id/mailboxes", s.listMailboxes)
 	protected.DELETE("/accounts/:id", s.deleteAccount)
+	protected.GET("/oauth/clients", s.listOAuthClients)
+	protected.PUT("/oauth/clients/:provider", s.putOAuthClient)
+	protected.DELETE("/oauth/clients/:provider", s.deleteOAuthClient)
+	protected.POST("/oauth/:provider/authorize", s.startOAuth)
+	protected.POST("/oauth/:provider/code", s.completeOAuth)
 	protected.GET("/messages", s.listMessages)
 	protected.POST("/messages/mark-read", s.markMessagesRead)
 	protected.GET("/messages/:id", s.getMessage)

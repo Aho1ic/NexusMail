@@ -43,6 +43,35 @@ type Manager struct {
 	// after construction because the account service that implements it is built
 	// on top of this manager, and taking it in New would close that cycle.
 	credentials CredentialStore
+	// clients resolves the OAuth application configured at runtime. Optional for
+	// the same reason: it is built on the repository this manager knows nothing
+	// about, and nil means the environment alone decides.
+	clients ClientStore
+}
+
+// ClientStore resolves the OAuth client id and secret a provider was configured
+// with at runtime. The deployment writes those through the settings page and they
+// are sealed at rest like every other credential; the environment stays the boot
+// default, which providerConfig falls back to when nothing is stored.
+//
+// The lookup takes no context and must not block: AccessToken calls it on the
+// IMAP reconnect path, so the implementation is expected to answer from memory.
+type ClientStore interface {
+	ClientCredentials(provider string) (id, secret string, configured bool)
+}
+
+// SetClientStore wires the runtime resolver. Like SetCredentialStore this happens
+// after construction to keep the service cycle open.
+func (m *Manager) SetClientStore(store ClientStore) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.clients = store
+}
+
+func (m *Manager) clientStore() ClientStore {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.clients
 }
 
 // CredentialStore writes a refreshed refresh token back to the account's sealed
@@ -67,14 +96,22 @@ func New(cfg config.Config) *Manager {
 	return &Manager{cfg: cfg, states: make(map[string]stateEntry), tokens: make(map[int64]*cachedToken)}
 }
 
-func (m *Manager) Start(provider, displayName string) (string, error) {
+// Start issues an authorization URL and returns the opaque state it is bound to.
+//
+// The state is returned, not only remembered, because the consent screen does not
+// always come back through the callback: a deployment whose public URL the browser
+// cannot reach leaves the user holding the redirect in their address bar, and
+// completing that by hand means presenting the same state to Exchange. It is safe
+// to hand out — it is a CSRF nonce, not a credential, and the PKCE verifier that
+// makes the code redeemable never leaves this process.
+func (m *Manager) Start(provider, displayName string) (authURL, state string, err error) {
 	oauthConfig, err := m.providerConfig(provider)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
-	state, err := randomToken(32)
+	state, err = randomToken(32)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	verifier := oauth2.GenerateVerifier()
 	m.mu.Lock()
@@ -89,7 +126,7 @@ func (m *Manager) Start(provider, displayName string) (string, error) {
 	if provider == "gmail" {
 		options = append(options, oauth2.SetAuthURLParam("prompt", "consent"))
 	}
-	return oauthConfig.AuthCodeURL(state, options...), nil
+	return oauthConfig.AuthCodeURL(state, options...), state, nil
 }
 
 func (m *Manager) Exchange(ctx context.Context, provider, state, code string) (email, displayName, refreshToken string, err error) {
@@ -98,7 +135,12 @@ func (m *Manager) Exchange(ctx context.Context, provider, state, code string) (e
 	delete(m.states, state)
 	m.mu.Unlock()
 	if !ok || entry.Provider != provider || time.Now().After(entry.ExpiresAt) {
-		return "", "", "", errors.New("invalid or expired OAuth state")
+		// Classified as bad input so the manual-completion endpoint answers 400
+		// rather than 500: a state is single-use and expires in ten minutes, so the
+		// usual cause is a user finishing an authorization the callback already
+		// consumed, or one they left open too long. Both are retried by asking for a
+		// fresh authorization URL.
+		return "", "", "", ports.Invalidf("invalid or expired OAuth state")
 	}
 	oauthConfig, err := m.providerConfig(provider)
 	if err != nil {
@@ -196,30 +238,78 @@ func classifyRefreshError(err error) error {
 	return fmt.Errorf("refresh OAuth token: %w", err)
 }
 
+// ErrClientNotConfigured reports that neither source supplied an OAuth client for
+// the provider, which is a setup problem rather than a bad request: the transport
+// maps it to its own error code so the UI can offer the credential form instead of
+// showing a failed authorization. It wraps ErrInvalidInput so any caller that only
+// classifies by the ports sentinels still answers 400.
+var ErrClientNotConfigured = fmt.Errorf("%w: OAuth client is not configured", ports.ErrInvalidInput)
+
+// providerEndpoints holds the per-provider halves of the OAuth config that do not
+// depend on which client credentials are in force. Splitting them out is what lets
+// resolution be one lookup: the credentials come from the store or the
+// environment, and everything else is fixed by the provider.
+var providerEndpoints = map[string]struct {
+	Endpoint oauth2.Endpoint
+	Scopes   []string
+}{
+	"gmail": {
+		Endpoint: google.Endpoint,
+		Scopes:   []string{"openid", "email", "https://mail.google.com/"},
+	},
+	"outlook": {
+		Endpoint: oauth2.Endpoint{AuthURL: "https://login.microsoftonline.com/common/oauth2/v2.0/authorize", TokenURL: "https://login.microsoftonline.com/common/oauth2/v2.0/token"},
+		Scopes:   []string{"openid", "email", "profile", "offline_access", "https://outlook.office.com/IMAP.AccessAsUser.All", "https://outlook.office.com/SMTP.Send"},
+	},
+}
+
+// providerConfig assembles the OAuth config for a provider from whichever source
+// currently supplies its client credentials.
+//
+// The store wins over the environment. The environment is the value the container
+// booted with and changing it costs a restart; the settings page is the live
+// setting, and a deployment that saves a client there has said which one it means.
+// A store that answers "not configured" is not an error — most deployments store
+// nothing and run entirely on the environment.
 func (m *Manager) providerConfig(provider string) (*oauth2.Config, error) {
-	switch provider {
-	case "gmail":
-		if m.cfg.Google.ClientID == "" || m.cfg.Google.ClientSecret == "" {
-			return nil, ports.Invalidf("missing Google OAuth client credentials")
-		}
-		return &oauth2.Config{
-			ClientID: m.cfg.Google.ClientID, ClientSecret: m.cfg.Google.ClientSecret,
-			RedirectURL: m.cfg.PublicURL + "/api/v1/oauth/gmail/callback", Endpoint: google.Endpoint,
-			Scopes: []string{"openid", "email", "https://mail.google.com/"},
-		}, nil
-	case "outlook":
-		if m.cfg.Microsoft.ClientID == "" || m.cfg.Microsoft.ClientSecret == "" {
-			return nil, ports.Invalidf("missing Microsoft OAuth client credentials")
-		}
-		return &oauth2.Config{
-			ClientID: m.cfg.Microsoft.ClientID, ClientSecret: m.cfg.Microsoft.ClientSecret,
-			RedirectURL: m.cfg.PublicURL + "/api/v1/oauth/outlook/callback",
-			Endpoint:    oauth2.Endpoint{AuthURL: "https://login.microsoftonline.com/common/oauth2/v2.0/authorize", TokenURL: "https://login.microsoftonline.com/common/oauth2/v2.0/token"},
-			Scopes:      []string{"openid", "email", "profile", "offline_access", "https://outlook.office.com/IMAP.AccessAsUser.All", "https://outlook.office.com/SMTP.Send"},
-		}, nil
-	default:
-		return nil, errors.New("provider does not support OAuth")
+	endpoints, ok := providerEndpoints[provider]
+	if !ok {
+		// Classified as bad input: the provider name arrives from the request path,
+		// so a password provider or a typo is the caller's mistake. Unclassified it
+		// would be redacted into a 500 that tells the user nothing they can act on.
+		return nil, ports.Invalidf("provider does not support OAuth")
 	}
+	clientID, clientSecret := "", ""
+	if store := m.clientStore(); store != nil {
+		clientID, clientSecret, _ = store.ClientCredentials(provider)
+	}
+	if clientID == "" || clientSecret == "" {
+		env := m.cfg.OAuthEnv(provider)
+		clientID, clientSecret = env.ClientID, env.ClientSecret
+	}
+	if clientID == "" || clientSecret == "" {
+		return nil, ErrClientNotConfigured
+	}
+	return &oauth2.Config{
+		ClientID: clientID, ClientSecret: clientSecret,
+		RedirectURL: m.RedirectURI(provider),
+		Endpoint:    endpoints.Endpoint,
+		Scopes:      endpoints.Scopes,
+	}, nil
+}
+
+// RedirectURI is the callback the provider must have registered for this
+// deployment. It is derived from the public URL by concatenation, the same way the
+// authorization request forms it, so what the settings page shows the user to
+// paste into the provider console cannot drift from what is actually sent.
+func (m *Manager) RedirectURI(provider string) string {
+	return m.cfg.PublicURL + "/api/v1/oauth/" + provider + "/callback"
+}
+
+// Configured reports whether an authorization URL can be built for the provider.
+func (m *Manager) Configured(provider string) bool {
+	_, err := m.providerConfig(provider)
+	return err == nil
 }
 
 // mailScopes lists the scope each provider must grant for IMAP and SMTP access.

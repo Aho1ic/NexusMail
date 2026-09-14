@@ -302,6 +302,15 @@ func TestLoadReadsOAuthCredentials(t *testing.T) {
 	if cfg.Microsoft.ClientID != "ms-id" || cfg.Microsoft.ClientSecret != "ms-secret" {
 		t.Fatalf("Microsoft = %+v", cfg.Microsoft)
 	}
+	if got := cfg.OAuthEnv("gmail"); got != cfg.Google {
+		t.Fatalf("OAuthEnv(gmail) = %+v, want the Google pair", got)
+	}
+	if got := cfg.OAuthEnv("outlook"); got != cfg.Microsoft {
+		t.Fatalf("OAuthEnv(outlook) = %+v, want the Microsoft pair", got)
+	}
+	if got := cfg.OAuthEnv("qq"); got != (OAuthProvider{}) {
+		t.Fatalf("OAuthEnv(qq) = %+v, want empty", got)
+	}
 }
 
 func TestLoadTrustedProxies(t *testing.T) {

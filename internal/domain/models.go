@@ -162,3 +162,18 @@ type BlobObject struct {
 }
 
 func (BlobObject) TableName() string { return "blob_objects" }
+
+// OAuthClient is the deployment's OAuth application for one provider, configured
+// at runtime instead of only through the environment. The secret is sealed with
+// the same envelope as an account credential and never leaves the service layer;
+// ClientID is not a secret (it travels in every authorization URL) and is what
+// the settings page shows to identify the configured client.
+type OAuthClient struct {
+	Provider               string `json:"provider" gorm:"primaryKey"`
+	ClientID               string `json:"client_id"`
+	ClientSecretCiphertext []byte `json:"-"`
+	CreatedAt              int64  `json:"created_at"`
+	UpdatedAt              int64  `json:"updated_at"`
+}
+
+func (OAuthClient) TableName() string { return "oauth_clients" }

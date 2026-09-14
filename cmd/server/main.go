@@ -22,6 +22,7 @@ import (
 	accountservice "nexusmail/internal/service/account"
 	draftservice "nexusmail/internal/service/draft"
 	messageservice "nexusmail/internal/service/message"
+	oauthclientservice "nexusmail/internal/service/oauthclient"
 	sendservice "nexusmail/internal/service/send"
 	sessionservice "nexusmail/internal/service/session"
 	"nexusmail/internal/storage"
@@ -75,6 +76,16 @@ func run(rootCtx context.Context) error {
 	// Without it a rotated refresh token lives only in the manager's cache and the
 	// next boot re-authorizes with a token the provider has already invalidated.
 	oauthManager.SetCredentialStore(accountSvc)
+	// The OAuth client credentials configured through the settings page live in the
+	// database and are cached in memory: the manager resolves them on the IMAP
+	// reconnect path, which has no context and must not perform a read. Loading
+	// before the sync supervisor starts is what makes an account authorized against
+	// a page-configured client reconnect on a cold boot.
+	oauthClientSvc := oauthclientservice.New(repo, box, cfg)
+	if err := oauthClientSvc.Load(rootCtx); err != nil {
+		return err
+	}
+	oauthManager.SetClientStore(oauthClientSvc)
 	syncer := imapprovider.NewSupervisor(repo, blobStore, accountSvc, oauthManager, hub)
 	messageSvc := messageservice.New(repo, syncer, hub)
 	draftSvc := draftservice.New(repo, hub, syncer)
@@ -122,7 +133,7 @@ func run(rootCtx context.Context) error {
 		maintenance(workerCtx, repo, blobStore, maintenanceInterval)
 	}()
 
-	api := httptransport.New(cfg, repo, blobStore, accountSvc, messageSvc, draftSvc, sessionSvc, oauthManager, syncer, sender, hub, rootCtx)
+	api := httptransport.New(cfg, repo, blobStore, accountSvc, messageSvc, draftSvc, sessionSvc, oauthManager, oauthClientSvc, syncer, sender, hub, rootCtx)
 	server := &http.Server{Addr: cfg.ListenAddr, Handler: api.Handler(), ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 30 * time.Second, WriteTimeout: 2 * time.Minute, IdleTimeout: 60 * time.Second}
 	errCh := make(chan error, 1)
 	go func() {

@@ -1,6 +1,7 @@
 package provider
 
 import (
+	"slices"
 	"strings"
 	"unicode"
 
@@ -63,6 +64,22 @@ func Get(name string) (Preset, error) {
 		return Preset{}, ports.Invalidf("unsupported email provider")
 	}
 	return preset, nil
+}
+
+// OAuthProviders lists the providers whose presets authenticate with OAuth, in a
+// stable order. It is derived from the presets rather than re-typed as a literal
+// so a preset that switches AuthType cannot leave a second list behind: the
+// settings page, the client-credential store and the migration's CHECK all have
+// to agree on the same set.
+func OAuthProviders() []domain.Provider {
+	names := make([]domain.Provider, 0, len(presets))
+	for name, preset := range presets {
+		if preset.AuthType == "oauth2" {
+			names = append(names, name)
+		}
+	}
+	slices.Sort(names)
+	return names
 }
 
 // roleRule maps a mailbox name to a role. ASCII keywords are matched as whole

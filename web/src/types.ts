@@ -31,3 +31,12 @@ export type Draft = {
 }
 export type DraftInput = { account_id: number; to: string[]; cc: string[]; bcc: string[]; subject: string; body_text: string }
 export type EventEnvelope = { type: string; sequence: number; occurred_at: number; data: Record<string, unknown> }
+// One OAuth provider's client credentials as the server reports them. The secret is
+// never returned, so `configured` is the only way to know a secret exists at all,
+// and `source` says which of the two places it came from: a page-stored row wins
+// over the environment. `updated_at` only exists for the stored row.
+export type OAuthClientStatus = {
+  provider: string; configured: boolean; source: 'database' | 'environment' | 'none';
+  client_id: string; redirect_uri: string; env_client_id_key: string; env_client_secret_key: string;
+  updated_at?: number;
+}

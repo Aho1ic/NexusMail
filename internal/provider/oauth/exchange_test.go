@@ -112,7 +112,7 @@ func tokenJSON(refresh, scope string, expiresIn int) string {
 
 func TestStartBuildsAPKCEAuthorizationURL(t *testing.T) {
 	manager := configuredManager()
-	raw, err := manager.Start("gmail", "Personal")
+	raw, _, err := manager.Start("gmail", "Personal")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -146,7 +146,7 @@ func TestStartBuildsAPKCEAuthorizationURL(t *testing.T) {
 // consent prompt.
 func TestStartForOutlook(t *testing.T) {
 	manager := configuredManager()
-	raw, err := manager.Start("outlook", "Work")
+	raw, _, err := manager.Start("outlook", "Work")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -177,7 +177,7 @@ func TestStartIssuesDistinctState(t *testing.T) {
 	manager := configuredManager()
 	seen := map[string]bool{}
 	for i := 0; i < 25; i++ {
-		raw, err := manager.Start("gmail", "")
+		raw, _, err := manager.Start("gmail", "")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -196,13 +196,13 @@ func TestStartIssuesDistinctState(t *testing.T) {
 func TestStartRequiresConfiguration(t *testing.T) {
 	manager := New(config.Config{PublicURL: "http://localhost:13737"})
 	for _, provider := range []string{"gmail", "outlook"} {
-		if _, err := manager.Start(provider, ""); err == nil {
+		if _, _, err := manager.Start(provider, ""); err == nil {
 			t.Fatalf("%s started without client credentials", provider)
 		}
 	}
 	// A provider that has no OAuth support at all is a different failure and must
 	// not be silently treated as unconfigured.
-	if _, err := configuredManager().Start("qq", ""); err == nil {
+	if _, _, err := configuredManager().Start("qq", ""); err == nil {
 		t.Fatal("qq started an OAuth flow")
 	}
 }
@@ -244,7 +244,7 @@ func TestExchangeStoresTheRefreshTokenAndEmail(t *testing.T) {
 // the only way a caller ever learns it.
 func stateOf(t *testing.T, manager *Manager, provider, displayName string) string {
 	t.Helper()
-	raw, err := manager.Start(provider, displayName)
+	raw, _, err := manager.Start(provider, displayName)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -1,4 +1,4 @@
-import type { Account, Attachment, Draft, DraftInput, Mailbox, MarkReadResult, Message, MessageDetails, MessagePage } from '../types'
+import type { Account, Attachment, Draft, DraftInput, Mailbox, MarkReadResult, Message, MessageDetails, MessagePage, OAuthClientStatus } from '../types'
 
 const csrfKey = 'nexusmail.csrf'
 const expiryKey = 'nexusmail.session-expires'
@@ -114,6 +114,18 @@ export const api = {
   uploadAttachment: (id: number, file: File) => { const body = new FormData(); body.set('file', file); return request(`/api/v1/drafts/${id}/attachments`, { method: 'POST', body }) },
   sendDraft: (id: number) => request(`/api/v1/drafts/${id}/send`, { method: 'POST' }),
   retryDraft: (id: number) => request(`/api/v1/drafts/${id}/retry`, { method: 'POST' }),
+  oauthClients: () => request<{ items: OAuthClientStatus[] }>('/api/v1/oauth/clients'),
+  saveOAuthClient: (provider: string, clientID: string, clientSecret: string) =>
+    request<OAuthClientStatus>(`/api/v1/oauth/clients/${provider}`, { method: 'PUT', body: JSON.stringify({ client_id: clientID, client_secret: clientSecret }) }),
+  clearOAuthClient: (provider: string) => request(`/api/v1/oauth/clients/${provider}`, { method: 'DELETE' }),
+  // The manual channel: `startOAuth` hands back the same consent URL the popup flow
+  // navigates to, plus the state the server will only accept once, and `completeOAuth`
+  // trades a pasted code for the account. Both exist because a deployment behind a
+  // redirect the browser cannot reach still has to be able to connect a mailbox.
+  startOAuth: (provider: string, displayName: string) =>
+    request<{ authorization_url: string; state: string; redirect_uri: string }>(`/api/v1/oauth/${provider}/authorize`, { method: 'POST', body: JSON.stringify({ display_name: displayName }) }),
+  completeOAuth: (provider: string, state: string, code: string) =>
+    request<Account>(`/api/v1/oauth/${provider}/code`, { method: 'POST', body: JSON.stringify({ state, code }) }),
 }
 
 export function isAuthenticated() { return Boolean(csrfToken()) && !sessionExpired() }

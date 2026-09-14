@@ -18,7 +18,7 @@ import (
 func TestModelColumnsMatchSchema(t *testing.T) {
 	store := openTestStore(t)
 	models := []any{&domain.Account{}, &domain.Mailbox{}, &domain.Message{}, &domain.Attachment{},
-		&domain.Draft{}, &domain.DraftAttachment{}, &domain.BlobObject{}}
+		&domain.Draft{}, &domain.DraftAttachment{}, &domain.BlobObject{}, &domain.OAuthClient{}}
 	for _, model := range models {
 		parsed, err := schema.Parse(model, &sync.Map{}, schema.NamingStrategy{})
 		if err != nil {

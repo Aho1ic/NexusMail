@@ -17,10 +17,17 @@ openssl rand -base64 32
 docker compose up --build
 ```
 
-打开 `http://localhost:13737`，输入 API Key 换取 HttpOnly 浏览器会话。QQ/163/126 账户填写服务商生成的客户端授权码，iCloud 填写 Apple ID 的 App 专用密码（Apple 未对 IMAP/SMTP 开放 OAuth）。Gmail/Outlook 还需在 `.env` 配置 OAuth Client，并把回调地址设为：
+打开 `http://localhost:13737`，输入 API Key 换取 HttpOnly 浏览器会话。QQ/163/126 账户填写服务商生成的客户端授权码，iCloud 填写 Apple ID 的 App 专用密码（Apple 未对 IMAP/SMTP 开放 OAuth）。Gmail/Outlook 需要一份对应服务商的 OAuth Client，两种配置方式任选其一：
+
+- 写入 docker 根目录 `.env` 的 `NEXUSMAIL_GOOGLE_CLIENT_ID` / `NEXUSMAIL_GOOGLE_CLIENT_SECRET` 和 `NEXUSMAIL_MICROSOFT_CLIENT_ID` / `NEXUSMAIL_MICROSOFT_CLIENT_SECRET`，然后重启容器生效。
+- 直接在页面「设置 → OAuth」填写 Client ID 与 Secret：Secret 用主密钥加密后落库，保存即生效，无需重启，且优先于上述环境变量。
+
+两种方式都要在服务商控制台把回调地址设为：
 
 - `http://localhost:13737/api/v1/oauth/gmail/callback`
 - `http://localhost:13737/api/v1/oauth/outlook/callback`
+
+完成登录后，如果回调地址在当前部署环境不可达（例如只在内网监听，或服务商只接受已备案的公开域名），可以在连接对话框改用「手动输入授权码」：在新标签页完成登录后，把浏览器地址栏里的 `code` 参数（或整条回跳地址）粘贴回页面即可完成连接。
 
 生产环境必须把 `NEXUSMAIL_PUBLIC_URL` 改为最终 HTTPS 地址。所有 secret 均支持同名 `_FILE` 变量，例如 `NEXUSMAIL_MASTER_KEY_FILE=/run/secrets/master_key`。
 
