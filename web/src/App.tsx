@@ -363,6 +363,30 @@ function MailboxApp({ onLogout }: { onLogout: () => void }) {
     } catch (err) { setError(messageOf(err)) }
   }
 
+  // Optimistically mark a batch of unread mail read, scoped so a later load
+  // cannot resurrect it, and PATCH each id. Shared by openMessage and the
+  // consecutive-stack path.
+  function markReadIDs(ids: number[], source?: Message[]) {
+    if (ids.length === 0) return
+    const scope = viewParams().toString()
+    const idSet = new Set(ids)
+    for (const id of ids) pendingReads.current.set(id, scope)
+    setMessages(items => items.map(item => idSet.has(item.id) ? { ...item, is_read: true } : item))
+    if (source) {
+      setStackFocus(current => current && source.some(row => idSet.has(row.id))
+        ? { ...current, messages: current.messages.map(item => idSet.has(item.id) ? { ...item, is_read: true } : item) }
+        : current)
+    }
+    setUnreadTotal(total => Math.max(total - ids.length, 0))
+    for (const id of ids) {
+      api.patchMessage(id, { is_read: true }).catch(() => {
+        pendingReads.current.delete(id)
+        setMessages(items => items.map(row => row.id === id ? { ...row, is_read: false } : row))
+        setUnreadTotal(total => total + 1)
+      })
+    }
+  }
+
   // Opening a stack replaces the reading pane with that sender's mail list. The
   // consecutive mode also marks the stack read: the user has acknowledged the
   // batch by choosing to look at it, which is what the advanced setting promises.
@@ -374,26 +398,7 @@ function MailboxApp({ onLogout }: { onLogout: () => void }) {
     setPane('detail')
     setStackFocus({ key: entry.key, label: entry.label, email: entry.email, messages: entry.messages, loading: true })
     if (stackMode === 'consecutive') {
-      const unread = entry.messages.filter(item => !item.is_read)
-      if (unread.length > 0) {
-        const scope = viewParams().toString()
-        for (const item of unread) {
-          pendingReads.current.set(item.id, scope)
-        }
-        const ids = new Set(unread.map(item => item.id))
-        setMessages(items => items.map(item => ids.has(item.id) ? { ...item, is_read: true } : item))
-        setStackFocus(current => current && current.key === entry.key
-          ? { ...current, messages: current.messages.map(item => ids.has(item.id) ? { ...item, is_read: true } : item) }
-          : current)
-        setUnreadTotal(total => Math.max(total - unread.length, 0))
-        for (const item of unread) {
-          api.patchMessage(item.id, { is_read: true }).catch(() => {
-            pendingReads.current.delete(item.id)
-            setMessages(items => items.map(row => row.id === item.id ? { ...row, is_read: false } : row))
-            setUnreadTotal(total => total + 1)
-          })
-        }
-      }
+      markReadIDs(entry.messages.filter(item => !item.is_read).map(item => item.id), entry.messages)
     }
     try {
       const params = new URLSearchParams()
@@ -404,9 +409,16 @@ function MailboxApp({ onLogout }: { onLogout: () => void }) {
       else if (selectedMailbox) params.set('mailbox_id', String(selectedMailbox))
       else params.set('folder', 'inbox')
       const page = await api.messages(params)
+      const merged = applyPendingReads(page).items
       setStackFocus(current => current && current.key === entry.key
-        ? { ...current, messages: applyPendingReads(page).items, loading: false }
+        ? { ...current, messages: merged, loading: false }
         : current)
+      // The server page can hold unread mail past the loaded feed subset. The
+      // consecutive promise is "opening the stack marks it read", so finish the
+      // job for those ids too.
+      if (stackMode === 'consecutive') {
+        markReadIDs(merged.filter(item => !item.is_read).map(item => item.id), merged)
+      }
     } catch (err) {
       // The already-shown local subset stays: a failed expand must not blank the pane.
       setStackError(messageOf(err))
