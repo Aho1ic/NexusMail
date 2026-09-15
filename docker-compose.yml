@@ -2,6 +2,8 @@ services:
   nexusmail:
     build:
       context: .
+      args:
+        VERSION: ${VERSION:-0.7.0}
     image: nexusmail:local
     restart: unless-stopped
     init: true

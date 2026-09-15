@@ -67,6 +67,47 @@ test('opens a sender stack and then an individual message', async ({ page }) => 
   await expect(page.getByRole('heading', { name: 'A-3' })).toBeVisible()
 })
 
+test('consecutive stacks mark the batch read on open', async ({ page }) => {
+  const items = [
+    message(3, 'A-3', 'a@x.com'),
+    message(2, 'A-2', 'a@x.com'),
+  ]
+  const patches: string[] = []
+  await page.routeWebSocket('**/api/v1/ws', () => undefined)
+  await page.route('**/api/v1/**', async route => {
+    const url = new URL(route.request().url())
+    const json = (body: unknown, status = 200) => route.fulfill({ status, contentType: 'application/json', body: JSON.stringify(body) })
+    if (url.pathname === '/api/v1/auth/session') return json({ csrf_token: 'e2e-csrf', expires_at: Date.now() + 60_000 }, 201)
+    if (url.pathname === '/api/v1/accounts') return json({ items: [account] })
+    if (route.request().method() === 'PATCH') {
+      patches.push(url.pathname)
+      const id = Number(url.pathname.split('/').pop())
+      const found = (items as Array<{ id: number; is_read: boolean }>).find(item => item.id === id)
+      if (found) found.is_read = true
+      return json(found)
+    }
+    if (url.pathname.startsWith('/api/v1/messages/') && route.request().method() === 'GET') {
+      const id = Number(url.pathname.split('/').pop())
+      return json({ message: (items as Array<unknown>).find(item => (item as { id: number }).id === id), attachments: [] })
+    }
+    if (url.pathname === '/api/v1/messages') {
+      return json({ items, unread_total: (items as Array<{ is_read: boolean }>).filter(item => !item.is_read).length })
+    }
+    return json({})
+  })
+  await login(page)
+
+  await page.getByRole('button', { name: '设置' }).click()
+  await page.getByRole('switch', { name: '进阶：连续同发件人堆叠' }).click()
+  await page.getByRole('button', { name: '完成' }).click()
+
+  const stack = page.getByRole('button', { name: 'Sender 的 2 封邮件' })
+  await expect(stack).toBeVisible()
+  await stack.click()
+  await expect(page.getByText('Sender stack')).toBeVisible()
+  await expect.poll(() => patches.length).toBeGreaterThanOrEqual(2)
+})
+
 test('detail overflow menu lists share and junk actions', async ({ page }) => {
   await stub(page, [message(7, '一封邮件', 'a@x.com', true)])
   await login(page)
