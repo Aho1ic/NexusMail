@@ -36,14 +36,22 @@ export function notify() {
   catch { /* notifications are best-effort */ }
 }
 
-export function useRealtime(onChange: () => void, onEvent: (payload: EventEnvelope) => void) {
+export function useRealtime(onChange: () => void, onEvent: (payload: EventEnvelope) => void, onResync: () => void) {
   // Events are not persisted server-side, so the socket must outlive filter
   // changes. Holding the callbacks in refs keeps one connection for the
   // session instead of reconnecting whenever the mailbox or query changes.
   const handler = useRef(onChange)
   const events = useRef(onEvent)
+  // Separate from onChange because the two have different costs: an event only
+  // needs the feed (the hot path, deliberately cheap), while a reconnect has to
+  // re-read everything that is carried by an event it may have missed. Account
+  // status is the one that bites — the transition back to 'connected' is sent
+  // once per session, so a socket that was down for it never learns the account
+  // came back and the dot stays grey until a manual reload.
+  const resync = useRef(onResync)
   useEffect(() => { handler.current = onChange }, [onChange])
   useEffect(() => { events.current = onEvent }, [onEvent])
+  useEffect(() => { resync.current = onResync }, [onResync])
   useEffect(() => {
     let socket: WebSocket | undefined; let timer = 0; let coalesce = 0; let stopped = false; let delay = 250
     // A backlog of body fetches emits a burst of events; coalesce them into one refresh.
@@ -51,7 +59,9 @@ export function useRealtime(onChange: () => void, onEvent: (payload: EventEnvelo
     const connect = () => {
       const scheme = location.protocol === 'https:' ? 'wss' : 'ws'; socket = new WebSocket(`${scheme}://${location.host}/api/v1/ws`)
       // Any event missed while reconnecting is unrecoverable, so resync on open.
-      socket.onopen = () => { delay = 250; schedule() }
+      // That includes the first open: a page loaded while an account was still
+      // syncing would otherwise keep the offline dot it snapshotted at mount.
+      socket.onopen = () => { delay = 250; resync.current(); schedule() }
       // The payload is forwarded verbatim: only the caller knows whether the event
       // carries a verification code worth notifying about.
       //

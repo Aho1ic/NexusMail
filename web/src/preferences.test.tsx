@@ -37,6 +37,7 @@ describe('preferences storage', () => {
     const stored: Preferences = {
       desktopNotifications: false, verificationCodeNotifications: false,
       autoLoadRemoteImages: true, keyboardShortcuts: false,
+      stackBySender: true, stackConsecutive: false,
       accountColors: { '3': '#5E87B0' },
     }
     savePreferences(stored)

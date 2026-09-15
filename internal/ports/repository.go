@@ -15,8 +15,11 @@ type MessageFilter struct {
 	IsRead    *bool
 	IsStarred *bool
 	Query     string
-	Cursor    string
-	Limit     int
+	// Sender narrows to one mailbox address (case-insensitive). Used by the
+	// sender-stack pane so a stack can list mail past the loaded page.
+	Sender string
+	Cursor string
+	Limit  int
 }
 
 type MessagePage struct {
@@ -144,6 +147,9 @@ type OutboxRepo interface {
 	ListDueDraftIDs(context.Context, int64) ([]int64, error)
 	RecoverSendingDrafts(context.Context) error
 	SetDraftDelivery(context.Context, int64, string, int, *int64, *int, *string, *int64) error
+	// QueueDraftDelivery is the race-safe path into the outbox: it only
+	// transitions from draft/failed/unknown and never rewrites attempt_count.
+	QueueDraftDelivery(context.Context, int64) error
 }
 
 // BlobRepo is the index over content-addressed blobs, including what the LRU

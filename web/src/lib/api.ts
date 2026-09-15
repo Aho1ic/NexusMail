@@ -106,6 +106,7 @@ export const api = {
   markAllRead: (params: URLSearchParams) => request<MarkReadResult>(`/api/v1/messages/mark-read?${params}`, { method: 'POST' }),
   message: (id: number) => request<MessageDetails>(`/api/v1/messages/${id}`),
   patchMessage: (id: number, patch: object) => request<Message>(`/api/v1/messages/${id}`, { method: 'PATCH', body: JSON.stringify(patch) }),
+  translateMessage: (id: number, targetLang: string) => request<{ text: string; detected_source_lang?: string }>(`/api/v1/messages/${id}/translate`, { method: 'POST', body: JSON.stringify({ target_lang: targetLang }) }),
   drafts: (status = '') => request<{ items: Draft[] }>(`/api/v1/drafts${status ? `?status=${status}` : ''}`),
   draft: (id: number) => request<{ draft: Draft; attachments: Attachment[] }>(`/api/v1/drafts/${id}`),
   createDraft: (input: DraftInput) => request<Draft>('/api/v1/drafts', { method: 'POST', body: JSON.stringify(input) }),

@@ -162,6 +162,13 @@ func (f *fakeProvider) Archive(_ context.Context, id int64) error {
 	return f.archiveErr
 }
 
+func (f *fakeProvider) MarkJunk(_ context.Context, id int64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.archived = append(f.archived, id)
+	return f.archiveErr
+}
+
 func (f *fakeProvider) SyncDraft(_ context.Context, id int64) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()

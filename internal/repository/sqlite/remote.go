@@ -83,6 +83,8 @@ func (s *Store) ReconcileMailboxFlags(ctx context.Context, mailboxID int64, stat
 	}
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
+	// Invalidate around the write so a concurrent recount cannot pin a pre-write
+	// unread total after the flags have already landed.
 	s.invalidateUnreadCache()
 	changed := 0
 	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
@@ -140,6 +142,9 @@ func (s *Store) ReconcileMailboxFlags(ctx context.Context, mailboxID int64, stat
 		}
 		return nil
 	})
+	if err == nil {
+		s.invalidateUnreadCache()
+	}
 	return changed, err
 }
 

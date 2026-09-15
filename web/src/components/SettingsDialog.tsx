@@ -55,6 +55,8 @@ export function SettingsDialog({ preferences, accounts, onChange, onClose, onAdd
 
         <SettingsSection icon={<Image size={14} />} title="阅读">
           <SettingsToggle label="自动加载远程图片" hint="关闭时每封邮件的外部图片都需手动加载，可避免发件人通过图片追踪你的阅读行为。" checked={preferences.autoLoadRemoteImages} onChange={value => onChange({ autoLoadRemoteImages: value })} />
+          <SettingsToggle label="相同的发信者进行折叠" hint="当前列表中同一发件人的多封邮件叠成一行，点击后在右侧查看该发件人的邮件列表。" checked={preferences.stackBySender} onChange={value => onChange({ stackBySender: value, stackConsecutive: value ? preferences.stackConsecutive : false })} />
+          <SettingsToggle label="进阶：连续同发件人堆叠" hint="仅把时间上连续的同发件人邮件叠起来（更适合 All Inboxes）。打开堆叠时会自动将其中未读邮件标为已读。开启后覆盖上面的基础折叠。" checked={preferences.stackConsecutive} onChange={value => onChange({ stackConsecutive: value })} />
         </SettingsSection>
 
         <SettingsSection icon={<Keyboard size={14} />} title="快捷键">

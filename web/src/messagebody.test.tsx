@@ -202,4 +202,16 @@ describe('message body rendering', () => {
     expect(subject.className).toContain('font-serif')
     expect(sender).toBeDefined()
   })
+
+  // A bracketed order number is one unbreakable token. The h1 left overflow-wrap at
+  // normal, so from 1280px down it ran straight through the right edge of the column
+  // instead of wrapping inside it.
+  it('lets an unbreakable subject token wrap inside the column', async () => {
+    detail = message({ subject: '您的京东订单【3619484002602023】电子发票已开具' })
+    render(<App />)
+    fireEvent.click(await screen.findByRole('button', { name: /京东订单/ }))
+
+    const subject = await waitFor(() => document.querySelector('article h1') as HTMLElement)
+    expect(subject.className).toContain('break-words')
+  })
 })

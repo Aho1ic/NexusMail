@@ -1,5 +1,8 @@
 .DS_Store
 .aeroric/
+.claude/
+.workbuddy/
+gemini-svg.svg
 .env
 .env.*
 !.env.example

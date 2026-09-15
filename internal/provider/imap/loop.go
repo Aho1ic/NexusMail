@@ -156,6 +156,15 @@ func (s *Supervisor) runSession(ctx context.Context, rt *runtime, client *imapcl
 	}
 	s.enqueueBodyCandidates(ctx, rt.account.ID)
 	_ = s.repo.UpdateAccountStatus(ctx, rt.account.ID, "connected", nil)
+	// The error paths all publish ACCOUNT_STATUS, but this transition did not — and it
+	// is the only one that turns the connection dot back on. A client that read the
+	// account list while the session was still connecting or syncing kept the offline
+	// dot forever: it re-reads that list on mount and on this event, and nothing else
+	// moves it. Sent once per session rather than per loop iteration, so it cannot
+	// flood the hub the way publishing the connecting/syncing rewrites above would.
+	s.events.Publish(ports.Event{Type: "ACCOUNT_STATUS", Data: map[string]any{
+		"account_id": rt.account.ID, "status": "connected",
+	}})
 	if err := s.serveConnected(ctx, rt, client); err != nil {
 		// Reported as a session that ended, not as a classified failure: the
 		// reconnect is immediate and it is the connect that decides whether this

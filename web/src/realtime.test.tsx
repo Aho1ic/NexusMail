@@ -114,4 +114,66 @@ describe('realtime mail delivery', () => {
     expect(FakeSocket.instances).toHaveLength(1)
     expect(FakeSocket.instances[0].closed).toBe(false)
   })
+
+  // The account list is the only carrier of status, and the client re-reads it on
+  // mount and on ACCOUNT_STATUS. Measured against the running gateway, 60s with no
+  // interaction produced exactly one account read (the mount) and zero
+  // ACCOUNT_STATUS frames, so a page that snapshotted a transient status kept that
+  // dot until a manual reload — which is how both accounts read as offline for
+  // twelve minutes after a container restart while the server held 'connected'.
+  // A session transition is sent once, so a socket that was down for it has to
+  // resync on open instead of waiting for the next event.
+  it('re-reads the account list when the socket opens so a transient status recovers', async () => {
+    let accountReads = 0
+    let status = 'connecting'
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.startsWith('/api/v1/accounts')) { accountReads++; return json({ items: [{ ...account, status }] }) }
+      if (url.includes('/mailboxes')) return json({ items: [] })
+      if (url.startsWith('/api/v1/messages')) return json({ items: [] })
+      return json({})
+    }))
+    render(<App />)
+    await waitFor(() => expect(FakeSocket.instances).toHaveLength(1))
+
+    // The mount read landed while the account was still connecting: offline dot.
+    await waitFor(() => expect(dotClass()).toContain('bg-white/30'))
+    expect(accountReads).toBe(1)
+
+    // The server has finished connecting by the time the socket is up. Nothing but
+    // the resync on open can tell this client that.
+    status = 'connected'
+    await act(async () => { FakeSocket.instances[0].onopen?.() })
+    await waitFor(() => expect(dotClass()).toContain('bg-emerald-300'))
+  })
+
+  // The other half of the same contract: once the gateway does report the account
+  // is back, the dot has to follow without a reload.
+  it('turns the connection dot green when the gateway reports a status change', async () => {
+    let status = 'connecting'
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.startsWith('/api/v1/accounts')) return json({ items: [{ ...account, status }] })
+      if (url.includes('/mailboxes')) return json({ items: [] })
+      if (url.startsWith('/api/v1/messages')) return json({ items: [] })
+      return json({})
+    }))
+    render(<App />)
+    await waitFor(() => expect(FakeSocket.instances).toHaveLength(1))
+    const socket = FakeSocket.instances[0]
+    await act(async () => { socket.onopen?.() })
+    await waitFor(() => expect(dotClass()).toContain('bg-white/30'))
+
+    status = 'connected'
+    await act(async () => { socket.emit('ACCOUNT_STATUS') })
+
+    await waitFor(() => expect(dotClass()).toContain('bg-emerald-300'))
+  })
 })
+
+// The connection dot is the first span in the account row: the NavItem icon.
+function dotClass() {
+  const spans = Array.from(screen.getByRole('complementary').querySelectorAll('span'))
+    .filter(span => span.className.includes('w-2.5') && span.className.includes('rounded-full'))
+  return spans[0]?.className ?? ''
+}

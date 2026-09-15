@@ -42,6 +42,10 @@ type Config struct {
 	// the peer address is the client address, which is what a direct bind wants:
 	// otherwise the login throttle can be sidestepped by forging the header.
 	TrustedProxies []string
+	// TranslateURL is an optional HTTP endpoint that accepts
+	// {"text","target_lang"} and answers {"text"}. Empty disables the feature
+	// and the API answers translate_not_configured.
+	TranslateURL string
 }
 
 // OAuthEnv returns the environment-supplied OAuth client for a provider, or a
@@ -83,6 +87,7 @@ func Load() (Config, error) {
 		ShutdownTimeout:  15 * time.Second,
 		LogLevel:         env("NEXUSMAIL_LOG_LEVEL", "info"),
 		TrustedProxies:   splitList(os.Getenv("NEXUSMAIL_TRUSTED_PROXIES")),
+		TranslateURL:     strings.TrimSpace(os.Getenv("NEXUSMAIL_TRANSLATE_URL")),
 		Google: OAuthProvider{
 			ClientID:     secrets["NEXUSMAIL_GOOGLE_CLIENT_ID"],
 			ClientSecret: secrets["NEXUSMAIL_GOOGLE_CLIENT_SECRET"],

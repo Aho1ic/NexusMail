@@ -148,6 +148,20 @@ describe('view scoping', () => {
     expect(navAccount('alt@163.com')).toBeInTheDocument()
   })
 
+  // The list title sits on the toolbar's row, so it needs the guard the dialog headers
+  // already carry: min-w-0 to let it shrink below its longest run, and overflow-wrap to
+  // keep a run wider than its own column inside the title rather than past the pane,
+  // which clips it. jsdom has no layout engine, so the outcome is asserted in web/e2e;
+  // this pins the classes the layout depends on.
+  it('guards a list title that cannot be shrunk', async () => {
+    await boot()
+    fireEvent.click(navAccount('alt@163.com'))
+
+    const title = await screen.findByRole('heading', { name: 'alt@163.com' })
+    expect(title.className).toContain('break-words')
+    expect(title.parentElement?.className).toContain('min-w-0')
+  })
+
   it('scopes to a mailbox and drops the folder role', async () => {
     const recorder = await boot()
     fireEvent.click(navAccount('work@qq.com'))

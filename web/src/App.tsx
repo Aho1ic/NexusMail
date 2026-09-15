@@ -3,6 +3,8 @@ import { APIError, api, isAuthenticated, onSessionInvalidated } from './lib/api'
 import { listenForCopyRequests, registerServiceWorker, showOTPNotification } from './lib/notifications'
 import { loadPreferences, savePreferences, type Preferences } from './lib/preferences'
 import { messageOf } from './lib/format'
+import { buildListEntries, resolveStackMode, type ListEntry } from './lib/stack'
+import { senderEmail, senderLabel } from './lib/sender'
 import { notificationsEnabled, notify, useRealtime } from './hooks/useRealtime'
 import { useKeyboard } from './hooks/useKeyboard'
 import { AccountDialog } from './components/AccountDialog'
@@ -11,10 +13,11 @@ import { Login } from './components/Login'
 import { MailboxNav } from './components/MailboxNav'
 import { MessageDetail } from './components/MessageDetail'
 import { MessageList } from './components/MessageList'
+import { SenderThreadPane } from './components/SenderThreadPane'
 import { OutboxDialog } from './components/OutboxDialog'
 import { SettingsDialog } from './components/SettingsDialog'
 import { Welcome } from './components/shared'
-import type { Account, Draft, EventEnvelope, Mailbox, Message, MessageDetails } from './types'
+import type { Account, Draft, EventEnvelope, Mailbox, Message, MessageDetails, MessagePage } from './types'
 
 type Pane = 'nav' | 'list' | 'detail'
 
@@ -54,6 +57,18 @@ function MailboxApp({ onLogout }: { onLogout: () => void }) {
   const [preferences, setPreferences] = useState<Preferences>(loadPreferences)
   const [toast, setToast] = useState('')
   const [markingRead, setMarkingRead] = useState(false)
+  // Reading-pane fetch failure: the list error banner is the wrong place for
+  // "this message could not be loaded", and leaving details null spun forever.
+  const [detailError, setDetailError] = useState('')
+  const [stackError, setStackError] = useState('')
+  // Open sender stack in the reading pane. Null means the pane shows a message
+  // (or the welcome card), which is the pre-stack behaviour.
+  const [stackFocus, setStackFocus] = useState<{ key: string; label: string; email: string; messages: Message[]; loading: boolean } | null>(null)
+  // Optimistic mark-read ids, keyed by the view they were opened in. The PATCH
+  // that actually writes the flag first talks IMAP, so any feed load that lands
+  // before the local write would otherwise flash the row (and the badge) back to
+  // unread. Loads merge these pending ids back to read until the server agrees.
+  const pendingReads = useRef(new Map<number, string>())
 
   // notify() runs from the socket handler outside React, so the live value is
   // mirrored into a module ref instead of being read from state.
@@ -95,6 +110,26 @@ function MailboxApp({ onLogout }: { onLogout: () => void }) {
     return params
   }, [starredView, selectedAccount, selectedMailbox, debouncedQuery])
 
+  // Applies in-flight mark-reads onto a freshly loaded page so switching views,
+  // refreshing, or a realtime quiet reload cannot resurrect a row the user already
+  // opened. Scoped by view key: a pending id from another mailbox must not lower
+  // this view's badge.
+  const applyPendingReads = useCallback((page: MessagePage): MessagePage => {
+    if (pendingReads.current.size === 0) return page
+    const scope = viewParams().toString()
+    let forced = 0
+    const items = page.items.map(item => {
+      if (item.is_read) {
+        pendingReads.current.delete(item.id)
+        return item
+      }
+      if (pendingReads.current.get(item.id) !== scope) return item
+      forced += 1
+      return { ...item, is_read: true }
+    })
+    return { ...page, items, unread_total: Math.max((page.unread_total ?? 0) - forced, 0) }
+  }, [viewParams])
+
   const loadAccounts = useCallback(async () => {
     try { const result = await api.accounts(); setAccounts(result.items) }
     catch (err) { setError(messageOf(err)) }
@@ -116,6 +151,9 @@ function MailboxApp({ onLogout }: { onLogout: () => void }) {
   // flight, and without this the later-resolving older response wins and renders a
   // view nobody is looking at. Bumped on entry, compared before every write.
   const generation = useRef(0)
+  // True once the user has pulled extra pages. A quiet realtime refresh must not
+  // collapse a paginated list back to page 1 and lose the loaded history.
+  const loadedExtra = useRef(false)
 
   const loadMessages = useCallback(async (append = false, nextCursor?: string, quiet = false) => {
     const current = ++generation.current
@@ -130,10 +168,24 @@ function MailboxApp({ onLogout }: { onLogout: () => void }) {
     params.set('limit', revealing ? '100' : '40')
     if (nextCursor) params.set('cursor', nextCursor)
     try {
-      const page = await api.messages(params)
+      const page = applyPendingReads(await api.messages(params))
       if (current !== generation.current) return
-      setMessages(items => append ? [...items, ...page.items.filter(item => !items.some(existing => existing.id === item.id))] : page.items)
-      setCursor(page.next_cursor)
+      if (append) {
+        loadedExtra.current = true
+        setMessages(items => [...items, ...page.items.filter(item => !items.some(existing => existing.id === item.id))])
+        setCursor(page.next_cursor)
+      } else if (quiet && loadedExtra.current) {
+        // Merge page 1 on top of what load-more already pulled; keep the cursor
+        // that still points past the deepest loaded row.
+        setMessages(items => {
+          const pageIDs = new Set(page.items.map(item => item.id))
+          return [...page.items, ...items.filter(item => !pageIDs.has(item.id))]
+        })
+      } else {
+        if (!quiet) loadedExtra.current = false
+        setMessages(page.items)
+        setCursor(page.next_cursor)
+      }
       setUnreadTotal(page.unread_total ?? 0)
       if (revealing) {
         // Same predicate as the badge's server-side count, so the row picked here is
@@ -145,9 +197,12 @@ function MailboxApp({ onLogout }: { onLogout: () => void }) {
     } catch (err) { if (current === generation.current) setError(messageOf(err)) }
     // The spinner belongs to the newest load, so a superseded one must leave it up.
     finally { if (current === generation.current) setLoading(false) }
-  }, [viewParams, announce])
+  }, [viewParams, announce, applyPendingReads])
 
   useEffect(() => { loadAccounts() }, [loadAccounts])
+  // A stack belongs to one view. Leaving it must not keep the previous sender's
+  // list on the reading pane under a different folder title.
+  useEffect(() => { setStackFocus(null); setSelected(null); setDetails(null) }, [starredView, selectedAccount, selectedMailbox])
   // Only the folder list is loaded here. Clearing the selected mailbox belongs to
   // the two handlers that change the account, which do it in the same render — an
   // effect would clear it one render late and spend a feed request on a mailbox the
@@ -166,6 +221,14 @@ function MailboxApp({ onLogout }: { onLogout: () => void }) {
   // the subject, so a later body pass may carry a better code that should still
   // reach the user, while a repeat of the same code must not notify twice.
   const notifiedCodes = useRef(new Set<string>())
+  // Keep the set from growing for a long-lived tab: codes older than an hour
+  // can safely notify again if the same OTP arrives twice after a reconnect.
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      if (notifiedCodes.current.size > 64) notifiedCodes.current.clear()
+    }, 60 * 60 * 1000)
+    return () => window.clearInterval(timer)
+  }, [])
   // The feed refresh cannot reach the open message: MessageDetail renders the
   // snapshot taken when it was opened, so a body that arrives afterwards left the
   // pane on "will refresh automatically" until the message was reopened. Only an
@@ -210,7 +273,7 @@ function MailboxApp({ onLogout }: { onLogout: () => void }) {
     }
     if (payload.type === 'NEW_EMAIL') notify()
   }, [loadAccounts, preferences.desktopNotifications, preferences.verificationCodeNotifications, refreshOpenMessage])
-  useRealtime(refreshQuietly, handleEvent)
+  useRealtime(refreshQuietly, handleEvent, loadAccounts)
 
   async function markViewRead() {
     setMarkingRead(true)
@@ -229,8 +292,13 @@ function MailboxApp({ onLogout }: { onLogout: () => void }) {
   async function openMessage(message: Message) {
     // The highlight has served its purpose once the row is opened; leaving it on
     // would keep ringing a row the user is already reading.
+    setStackFocus(null)
+    setStackError('')
+    setDetailError('')
     setSelected(message); setPane('detail'); setDetails(null); setRevealID(null)
     if (!message.is_read) {
+      const scope = viewParams().toString()
+      pendingReads.current.set(message.id, scope)
       setMessages(items => items.map(item => item.id === message.id ? { ...item, is_read: true } : item))
       // The badge tracks the server total, so opening a message has to draw it down
       // here as well; otherwise the count only moves on the next feed load.
@@ -241,6 +309,7 @@ function MailboxApp({ onLogout }: { onLogout: () => void }) {
       // found out on the next feed load, which is what "it went unread again after
       // refreshing" looks like. Undoing it puts the truth back on screen at once.
       api.patchMessage(message.id, { is_read: true }).catch(err => {
+        pendingReads.current.delete(message.id)
         setMessages(items => items.map(item => item.id === message.id ? { ...item, is_read: false } : item))
         setUnreadTotal(total => total + 1)
         // A 401 is not a mark-read failure. The session lapsed, the transport has
@@ -259,7 +328,11 @@ function MailboxApp({ onLogout }: { onLogout: () => void }) {
       // highlighted row.
       if (current !== detailGeneration.current) return
       setDetails(loaded)
-    } catch (err) { if (current === detailGeneration.current) setError(messageOf(err)) }
+      setDetailError('')
+    } catch (err) {
+      if (current !== detailGeneration.current) return
+      setDetailError(messageOf(err))
+    }
   }
 
   async function mutateMessage(patch: object) {
@@ -267,8 +340,62 @@ function MailboxApp({ onLogout }: { onLogout: () => void }) {
     try {
       const updated = await api.patchMessage(selected.id, patch)
       setSelected(updated); setMessages(items => items.map(item => item.id === updated.id ? updated : item))
-      if ('archive' in patch) { setMessages(items => items.filter(item => item.id !== selected.id)); setSelected(null); setDetails(null); setPane('list') }
+      if ('archive' in patch || 'junk' in patch) {
+        setMessages(items => items.filter(item => item.id !== selected.id))
+        setSelected(null); setDetails(null); setStackFocus(null); setPane('list')
+      }
     } catch (err) { setError(messageOf(err)) }
+  }
+
+  // Opening a stack replaces the reading pane with that sender's mail list. The
+  // consecutive mode also marks the stack read: the user has acknowledged the
+  // batch by choosing to look at it, which is what the advanced setting promises.
+  async function openStack(entry: Extract<ListEntry, { kind: 'stack' }>) {
+    setSelected(null)
+    setDetails(null)
+    setDetailError('')
+    setStackError('')
+    setPane('detail')
+    setStackFocus({ key: entry.key, label: entry.label, email: entry.email, messages: entry.messages, loading: true })
+    if (stackMode === 'consecutive') {
+      const unread = entry.messages.filter(item => !item.is_read)
+      if (unread.length > 0) {
+        const scope = viewParams().toString()
+        for (const item of unread) {
+          pendingReads.current.set(item.id, scope)
+        }
+        const ids = new Set(unread.map(item => item.id))
+        setMessages(items => items.map(item => ids.has(item.id) ? { ...item, is_read: true } : item))
+        setStackFocus(current => current && current.key === entry.key
+          ? { ...current, messages: current.messages.map(item => ids.has(item.id) ? { ...item, is_read: true } : item) }
+          : current)
+        setUnreadTotal(total => Math.max(total - unread.length, 0))
+        for (const item of unread) {
+          api.patchMessage(item.id, { is_read: true }).catch(() => {
+            pendingReads.current.delete(item.id)
+            setMessages(items => items.map(row => row.id === item.id ? { ...row, is_read: false } : row))
+            setUnreadTotal(total => total + 1)
+          })
+        }
+      }
+    }
+    try {
+      const params = new URLSearchParams()
+      params.set('sender', entry.email)
+      params.set('limit', '100')
+      if (selectedAccount) params.set('account_id', String(selectedAccount))
+      if (starredView) params.set('is_starred', 'true')
+      else if (selectedMailbox) params.set('mailbox_id', String(selectedMailbox))
+      else params.set('folder', 'inbox')
+      const page = await api.messages(params)
+      setStackFocus(current => current && current.key === entry.key
+        ? { ...current, messages: applyPendingReads(page).items, loading: false }
+        : current)
+    } catch (err) {
+      // The already-shown local subset stays: a failed expand must not blank the pane.
+      setStackError(messageOf(err))
+      setStackFocus(current => current && current.key === entry.key ? { ...current, loading: false } : current)
+    }
   }
 
   // The shortcuts are bound to window and every dialog renders as a sibling of the
@@ -294,6 +421,8 @@ function MailboxApp({ onLogout }: { onLogout: () => void }) {
     setSelectedAccount(null); setSelectedMailbox(null); setSelected(null); setDetails(null); setPane('list')
   }
   const accountMap = useMemo(() => new Map(accounts.map(account => [account.id, account])), [accounts])
+  const stackMode = resolveStackMode(preferences.stackBySender, preferences.stackConsecutive)
+  const listEntries = useMemo(() => buildListEntries(messages, stackMode), [messages, stackMode])
   // The server counts the whole view; the loaded page only holds 40 rows, so
   // counting locally reported "0 unread" on any view whose unread mail sits past
   // the first page and left mark-all-read disabled with work still to do. The page
@@ -363,12 +492,17 @@ function MailboxApp({ onLogout }: { onLogout: () => void }) {
         side, against 36px from the padding. (Written without the bracket syntax on
         purpose: Tailwind scans comments too, and spelling the class out here made it
         emit the dead rule this change removes.) Wide screens are safe because the
-        reading pane caps its own text at max-w-3xl, so the extra width becomes
-        margin around the article rather than 200-character lines.
+        reading pane caps its own measure — see the h1 and the prose block there — so
+        the extra width becomes margin around the article rather than 200-character
+        lines.
         The frosted frame is only visible in the padding that starts at lg — at md the
         panes cover the shell edge to edge, so the blur is composited there for
         nothing. Hence the glass is an lg treatment and md stays opaque. */}
     <div className="relative flex h-full w-full overflow-hidden bg-white md:rounded-shell md:border md:border-white/60 md:shadow-stage lg:gap-2.5 lg:bg-white/55 lg:p-2.5 lg:backdrop-blur-2xl">
+      {/* The nav overlays the panes between md and lg, so it needs a way out that is
+          not a folder click. Below md it covers the shell whole and there is nothing
+          to dismiss onto, hence md-only. */}
+      {pane === 'nav' && <button aria-label="关闭文件夹" onClick={() => setPane('list')} className="absolute inset-0 z-20 hidden bg-ink/25 md:block lg:hidden" />}
       <MailboxNav visible={pane === 'nav'} accounts={accounts} mailboxes={mailboxes} selectedAccount={selectedAccount} selectedMailbox={selectedMailbox} unreadCount={unreadCount} foldersCollapsed={foldersCollapsed} starredActive={starredView}
         onCompose={() => compose()}
         onSelectAll={selectAll}
@@ -377,16 +511,22 @@ function MailboxApp({ onLogout }: { onLogout: () => void }) {
         onSelectMailbox={id => { setStarredView(false); setSelectedMailbox(id); setPane('list') }}
         onShowOutbox={() => setShowOutbox(true)} onShowAccounts={() => setShowAccounts(true)} onShowSettings={() => setShowSettings(true)} onLogout={logout} />
 
-      <MessageList visible={pane === 'list'} title={listTitle} messages={messages} accountMap={accountMap} selected={selected} unreadCount={unreadCount} accountColors={preferences.accountColors}
+      <MessageList visible={pane === 'list'} title={listTitle} entries={listEntries} accountMap={accountMap} selected={selected} selectedStackKey={stackFocus?.key ?? null} unreadCount={unreadCount} accountColors={preferences.accountColors}
         markingRead={markingRead} loading={loading} error={error} query={query} cursor={cursor}
         onOpenNav={() => setPane('nav')} onMarkViewRead={markViewRead} onRefresh={refresh} onQueryChange={setQuery}
-        onOpen={openMessage} onLoadMore={() => loadMessages(true, cursor)} revealID={revealID} />
+        onOpen={openMessage} onOpenStack={openStack} onLoadMore={() => loadMessages(true, cursor)} revealID={revealID} />
 
       {/* The reading pane is the top layer: pure white and the strongest shadow of
           the three. The radius and shadow are inline rather than via .pane-light so
           the higher elevation cannot be overwritten by that class's own lg rule. */}
       <main className={`${pane === 'detail' ? 'flex' : 'hidden'} md:flex min-w-0 flex-1 flex-col overflow-hidden bg-white lg:rounded-panel lg:shadow-glass-high`}>
-        {selected ? <MessageDetail selected={selected} details={details} autoLoadRemoteImages={preferences.autoLoadRemoteImages} onBack={() => setPane('list')} onStar={() => mutateMessage({ is_starred: !selected.is_starred })} onArchive={() => mutateMessage({ archive: true })} onReply={() => compose()} onNotice={announce} /> : <Welcome count={unreadCount} />}
+        {stackFocus
+          ? <SenderThreadPane label={stackFocus.label} email={stackFocus.email} messages={stackFocus.messages} loading={stackFocus.loading} error={stackError}
+              onBack={() => { setStackFocus(null); setPane('list') }}
+              onOpen={openMessage} />
+          : selected
+            ? <MessageDetail selected={selected} details={details} loadError={detailError} autoLoadRemoteImages={preferences.autoLoadRemoteImages} onBack={() => setPane('list')} onStar={() => mutateMessage({ is_starred: !selected.is_starred })} onArchive={() => mutateMessage({ archive: true })} onJunk={() => mutateMessage({ junk: true })} onReply={() => compose()} onNotice={announce} />
+            : <Welcome count={unreadCount} />}
       </main>
     </div>
     {showAccounts && <AccountDialog onClose={() => setShowAccounts(false)} onCreated={() => { setShowAccounts(false); loadAccounts() }} />}

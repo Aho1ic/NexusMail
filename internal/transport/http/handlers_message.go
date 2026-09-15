@@ -51,6 +51,7 @@ func (s *Server) listMessages(c *gin.Context) {
 		}
 		filter.IsStarred = &value
 	}
+	filter.Sender = strings.TrimSpace(c.Query("sender"))
 	page, err := s.messages.List(c.Request.Context(), filter)
 	if err != nil {
 		writeError(c, err)
@@ -63,7 +64,7 @@ func (s *Server) listMessages(c *gin.Context) {
 // same query parameters as the feed so "everything I can see" cannot drift
 // between the list and the button acting on it.
 func (s *Server) markMessagesRead(c *gin.Context) {
-	filter := ports.MessageFilter{Folder: c.Query("folder"), Query: strings.TrimSpace(c.Query("query"))}
+	filter := ports.MessageFilter{Folder: c.Query("folder"), Query: strings.TrimSpace(c.Query("query")), Sender: strings.TrimSpace(c.Query("sender"))}
 	accountID, ok := optionalInt64(c, "account_id")
 	if !ok {
 		return
@@ -167,6 +168,7 @@ func (s *Server) patchMessage(c *gin.Context) {
 		IsRead    *bool `json:"is_read"`
 		IsStarred *bool `json:"is_starred"`
 		Archive   bool  `json:"archive"`
+		Junk      bool  `json:"junk"`
 	}
 	if err := c.ShouldBindJSON(&input); err != nil {
 		fail(c, 400, "invalid_request", err.Error(), nil)
@@ -174,7 +176,7 @@ func (s *Server) patchMessage(c *gin.Context) {
 	}
 	ctx, cancel := context.WithTimeout(s.appCtx, 30*time.Second)
 	defer cancel()
-	message, err := s.messages.Patch(ctx, id, ports.MessagePatch{IsRead: input.IsRead, IsStarred: input.IsStarred}, input.Archive)
+	message, err := s.messages.Patch(ctx, id, ports.MessagePatch{IsRead: input.IsRead, IsStarred: input.IsStarred}, input.Archive, input.Junk)
 	if err != nil {
 		writeError(c, err)
 		return

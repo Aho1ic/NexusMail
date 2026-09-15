@@ -216,6 +216,43 @@ describe('mark the current view read', () => {
     expect(await screen.findByRole('status')).toHaveTextContent('标记已读失败：文件夹不存在')
   })
 
+  // The reported defect: clicking an unread row draws it read, then any feed
+  // load that still races the slow IMAP flag write used to paint the row and the
+  // badge unread again. Pending mark-reads must survive that reload.
+  it('keeps an opened unread row read across a reload that still reports it unread', async () => {
+    unreadTotal = 9
+    await mount()
+    expect(screen.getByText('9')).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: /First mail/ }))
+    await waitFor(() => expect(screen.getByText('8')).toBeInTheDocument())
+    await waitFor(() => expect(calls).toContain('PATCH /api/v1/messages/1'))
+
+    // The fake still holds the pre-PATCH row, which is what a quiet refresh or a
+    // manual refresh looks like while SetFlags is in flight.
+    fireEvent.click(screen.getByRole('button', { name: '刷新' }))
+
+    await waitFor(() => expect(screen.getByRole('button', { name: /First mail/ })).toBeInTheDocument())
+    expect(screen.queryByText('9')).not.toBeInTheDocument()
+    expect(screen.getByText('8')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /First mail/ })).not.toHaveTextContent('未读')
+  })
+
+  it('does not let a pending mark-read from one view lower another view unread badge', async () => {
+    unreadTotal = 9
+    await mount()
+    fireEvent.click(screen.getByRole('button', { name: /First mail/ }))
+    await waitFor(() => expect(screen.getByText('8')).toBeInTheDocument())
+
+    // Switch to the archive mailbox: its server total is independent, and the
+    // pending id from All Inboxes must not draw it down.
+    fireEvent.click(within(screen.getByRole('complementary')).getByRole('button', { name: 'Mail' }))
+    fireEvent.click(await screen.findByRole('button', { name: '归档' }))
+
+    await waitFor(() => expect(screen.getByRole('button', { name: /First mail/ })).toBeInTheDocument())
+    expect(screen.getByText('9')).toBeInTheDocument()
+  })
+
   it('returns to login when marking a message read rejects the session', async () => {
     await mount()
     const originalFetch = fetch

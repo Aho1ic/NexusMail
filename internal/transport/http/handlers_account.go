@@ -48,7 +48,8 @@ func (s *Server) deleteSession(c *gin.Context) {
 	if token, err := c.Cookie(sessionservice.CookieName); err == nil {
 		_ = s.sessions.Delete(c.Request.Context(), token)
 	}
-	http.SetCookie(c.Writer, &http.Cookie{Name: sessionservice.CookieName, Value: "", Path: "/", HttpOnly: true, MaxAge: -1, SameSite: http.SameSiteStrictMode})
+	secure := strings.HasPrefix(s.cfg.PublicURL, "https://")
+	http.SetCookie(c.Writer, &http.Cookie{Name: sessionservice.CookieName, Value: "", Path: "/", HttpOnly: true, Secure: secure, MaxAge: -1, SameSite: http.SameSiteStrictMode})
 	c.Status(http.StatusNoContent)
 }
 
@@ -149,6 +150,10 @@ func (s *Server) deleteAccount(c *gin.Context) {
 	if err := s.accounts.Delete(c.Request.Context(), id); err != nil {
 		writeError(c, err)
 		return
+	}
+	// Drop any in-memory OAuth access token so it cannot outlive the deleted row.
+	if s.oauth != nil {
+		s.oauth.DropAccountTokens(id)
 	}
 	c.Status(http.StatusNoContent)
 }

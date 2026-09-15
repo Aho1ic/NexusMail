@@ -312,6 +312,15 @@ func (m *Manager) Configured(provider string) bool {
 	return err == nil
 }
 
+// DropAccountTokens forgets the in-memory access token for an account. Called
+// when the account is deleted so a live token cannot outlive the row it
+// belongs to.
+func (m *Manager) DropAccountTokens(accountID int64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.tokens, accountID)
+}
+
 // mailScopes lists the scope each provider must grant for IMAP and SMTP access.
 var mailScopes = map[string]string{
 	"gmail":   "https://mail.google.com/",

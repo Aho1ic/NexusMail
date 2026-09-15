@@ -95,14 +95,7 @@ func (w *Worker) Start(ctx context.Context) {
 }
 
 func (w *Worker) Queue(ctx context.Context, id int64) error {
-	draft, _, err := w.repo.GetDraft(ctx, id)
-	if err != nil {
-		return err
-	}
-	if draft.Status != "draft" && draft.Status != "failed" && draft.Status != "unknown" {
-		return ports.Conflictf("draft cannot be queued in its current state")
-	}
-	if err := w.repo.SetDraftDelivery(ctx, id, "queued", draft.AttemptCount, nil, nil, nil, nil); err != nil {
+	if err := w.repo.QueueDraftDelivery(ctx, id); err != nil {
 		return err
 	}
 	w.events.Publish(ports.Event{Type: "OUTBOX_UPDATED", Data: map[string]any{"draft_id": id, "status": "queued"}})

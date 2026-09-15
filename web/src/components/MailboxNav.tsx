@@ -23,7 +23,12 @@ type Props = {
 }
 
 export function MailboxNav({ visible, accounts, mailboxes, selectedAccount, selectedMailbox, unreadCount, foldersCollapsed, starredActive, onCompose, onSelectAll, onSelectStarred, onSelectAccount, onSelectMailbox, onShowOutbox, onShowAccounts, onShowSettings, onLogout }: Props) {
-  return <aside className={`${visible ? 'flex' : 'hidden'} md:flex pane-dark w-full md:w-[260px] shrink-0 flex-col overflow-hidden bg-pine text-white`}>
+  // Static from lg, an overlay below it. Three fixed panes need 1024px before the
+  // reading pane gets a usable measure — at 768px the nav and the list left it
+  // 100px, so every subject wrapped one character at a time. In that band the nav
+  // floats over the panes instead of taking a column from them. Below md it covers
+  // the shell, which is what it already did.
+  return <aside className={`${visible ? 'flex' : 'hidden'} lg:flex pane-dark absolute inset-y-0 left-0 z-30 w-full shrink-0 flex-col overflow-hidden bg-pine text-white max-lg:shadow-glass-dark md:w-[300px] lg:static lg:z-auto lg:w-[260px]`}>
     <div className="p-6"><Brand light /></div>
     <button onClick={onCompose} className="mx-5 mt-3 flex items-center justify-center gap-2 rounded-card bg-coral px-5 py-3.5 text-sm font-semibold shadow-lift-3 transition hover:-translate-y-0.5 hover:shadow-lift-4"><SquarePen size={18} />写邮件</button>
     <nav className="mt-8 flex-1 overflow-y-auto px-3">

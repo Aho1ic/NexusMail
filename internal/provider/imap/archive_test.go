@@ -4,6 +4,7 @@ package imap
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -171,22 +172,34 @@ func TestArchiveKeepsOtherPendingDeletes(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := h.supervisor.Archive(ctx, messageID); err != nil {
-		t.Fatalf("archive: %v", err)
+	// Without UIDPLUS and with another \Deleted UID present, a plain EXPUNGE
+	// would destroy that client's pending delete. The archive must refuse and
+	// leave both the remote message and the local mapping alone.
+	err = h.supervisor.Archive(ctx, messageID)
+	if err == nil {
+		t.Fatal("archive succeeded without UIDPLUS while another \\Deleted message was pending; expected a conflict")
 	}
-	// The pending delete must survive. The archived copy must still have been made.
+	if !strings.Contains(err.Error(), "UIDPLUS") && !strings.Contains(err.Error(), "pending") && !strings.Contains(err.Error(), "archive left message") {
+		t.Fatalf("archive error = %v, want a refusal naming the unsafe expunge", err)
+	}
+	// The pending delete must survive and the source mailbox must still hold
+	// the message we refused to move.
 	uids := remoteUIDs(t, other, "INBOX")
 	found := false
+	sourceHeld := false
 	for _, uid := range uids {
 		if uid == pending {
 			found = true
+		}
+		if uint32(uid) == location.UID {
+			sourceHeld = true
 		}
 	}
 	if !found {
 		t.Fatalf("another client's pending \\Deleted message was expunged; INBOX UIDs = %v", uids)
 	}
-	if archived := remoteUIDs(t, other, "Archive"); len(archived) != 1 {
-		t.Fatalf("archive mailbox holds %d messages remotely, want 1", len(archived))
+	if !sourceHeld {
+		t.Fatalf("source message left INBOX despite the archive refusing; INBOX UIDs = %v", uids)
 	}
 }
 

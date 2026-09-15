@@ -179,6 +179,26 @@ func TestListMessagesFilters(t *testing.T) {
 	h.expectError(h.do(http.MethodGet, "/api/v1/messages?is_starred=maybe", nil), 400, "invalid_filter")
 }
 
+// Sender narrows the feed for the stack pane. The match is case-insensitive over
+// the stored address string; a needle nobody holds must return an empty page.
+func TestListMessagesFiltersBySender(t *testing.T) {
+	h := newHarness(t)
+	fixture := h.seedFeed(3)
+	missing := h.listMessagePage("?sender=" + url.QueryEscape("zzz-no-such@example.com"))
+	if len(missing.Items) != 0 {
+		t.Fatalf("sender=nobody returned %d items, want 0", len(missing.Items))
+	}
+	if len(fixture.ids) == 0 {
+		t.Fatal("seeded no messages")
+	}
+	if got := len(h.listMessagePage("?sender=example.com").Items); got == 0 {
+		t.Fatal("sender=example.com matched nothing for seeded example.com mail")
+	}
+	if got := len(h.listMessagePage("?sender=qqq").Items); got != 0 {
+		t.Fatalf("sender=qqq returned %d items, want 0", got)
+	}
+}
+
 func (h *harness) seedAccount2() domain.Account {
 	h.t.Helper()
 	now := time.Now().UnixMilli()

@@ -436,6 +436,35 @@ func (s *Store) SetDraftDelivery(ctx context.Context, id int64, status string, a
 	}).Error
 }
 
+// QueueDraftDelivery moves a draft into the outbox only when it is still in a
+// queueable status. A concurrent ClaimSendableDraft can flip the row to
+// "sending" between the caller's status check and this write; without the
+// predicate the queue would overwrite that claim and the ticker could send the
+// same draft twice. attempt_count is left alone on this path: the worker owns
+// it, and writing a value read before the claim would regress a retry that
+// already happened.
+func (s *Store) QueueDraftDelivery(ctx context.Context, id int64) error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	var count int64
+	if err := s.db.WithContext(ctx).Model(&domain.Draft{}).Where("id = ?", id).Count(&count).Error; err != nil {
+		return err
+	}
+	if count == 0 {
+		return ports.NotFoundf("draft %d not found", id)
+	}
+	result := s.db.WithContext(ctx).Model(&domain.Draft{}).
+		Where("id = ? AND status IN ('draft', 'failed', 'unknown')", id).
+		Updates(map[string]any{"status": "queued", "updated_at": time.Now().UnixMilli()})
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected == 0 {
+		return ports.Conflictf("draft cannot be queued in its current state")
+	}
+	return nil
+}
+
 func (s *Store) CreateSentMessage(ctx context.Context, message *domain.Message, draftID int64) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()

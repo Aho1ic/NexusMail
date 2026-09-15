@@ -120,6 +120,8 @@ func (s *Server) routes() *gin.Engine {
 	protected.POST("/messages/mark-read", s.markMessagesRead)
 	protected.GET("/messages/:id", s.getMessage)
 	protected.PATCH("/messages/:id", s.patchMessage)
+	protected.POST("/messages/:id/translate", s.translateMessage)
+	protected.GET("/messages/:id/calendar", s.messageCalendar)
 	protected.GET("/messages/:id/attachments/:attachment_id", s.downloadAttachment)
 	protected.GET("/drafts", s.listDrafts)
 	protected.POST("/drafts", s.createDraft)

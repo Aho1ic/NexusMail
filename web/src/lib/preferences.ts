@@ -5,6 +5,11 @@ export type Preferences = {
   verificationCodeNotifications: boolean
   autoLoadRemoteImages: boolean
   keyboardShortcuts: boolean
+  // Collapse every loaded message from one sender into one stack row.
+  stackBySender: boolean
+  // Gmail-style consecutive runs only; overrides stackBySender when both are on.
+  // Opening a consecutive stack also marks its unread mail read.
+  stackConsecutive: boolean
   // account id (as string) -> #rrggbb. Colours are identity chrome, not session
   // state, so they ride with the other preferences in localStorage rather than
   // earning a server round-trip and a contract field.
@@ -20,6 +25,8 @@ export const defaultPreferences: Preferences = {
   verificationCodeNotifications: true,
   autoLoadRemoteImages: false,
   keyboardShortcuts: true,
+  stackBySender: false,
+  stackConsecutive: false,
   accountColors: {},
 }
 
@@ -53,6 +60,8 @@ export function loadPreferences(): Preferences {
       verificationCodeNotifications: coerce(parsed?.verificationCodeNotifications, defaultPreferences.verificationCodeNotifications),
       autoLoadRemoteImages: coerce(parsed?.autoLoadRemoteImages, defaultPreferences.autoLoadRemoteImages),
       keyboardShortcuts: coerce(parsed?.keyboardShortcuts, defaultPreferences.keyboardShortcuts),
+      stackBySender: coerce(parsed?.stackBySender, defaultPreferences.stackBySender),
+      stackConsecutive: coerce(parsed?.stackConsecutive, defaultPreferences.stackConsecutive),
       accountColors: coerceColors(parsed?.accountColors),
     }
   } catch { return defaultPreferences }

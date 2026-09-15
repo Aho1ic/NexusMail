@@ -11,6 +11,7 @@ type RemoteMutator interface {
 	SetFlags(context.Context, int64, *bool, *bool) error
 	SetSeenBulk(context.Context, []int64) ([]int64, error)
 	Archive(context.Context, int64) error
+	MarkJunk(context.Context, int64) error
 }
 
 // Store is the slice of persistence this service uses. It is declared here rather
@@ -41,8 +42,8 @@ func (s *Service) Get(ctx context.Context, id int64) (domain.Message, []domain.A
 	return s.repo.GetMessage(ctx, id)
 }
 
-func (s *Service) Patch(ctx context.Context, id int64, patch ports.MessagePatch, archive bool) (domain.Message, error) {
-	if patch.IsRead == nil && patch.IsStarred == nil && !archive {
+func (s *Service) Patch(ctx context.Context, id int64, patch ports.MessagePatch, archive, junk bool) (domain.Message, error) {
+	if patch.IsRead == nil && patch.IsStarred == nil && !archive && !junk {
 		// Classified so the transport answers 400 with this text. An unclassified
 		// error would be reported as a redacted 500, telling a client that sent
 		// {} nothing about what was wrong with the request.
@@ -66,6 +67,11 @@ func (s *Service) Patch(ctx context.Context, id int64, patch ports.MessagePatch,
 		}
 		if archive {
 			if err := s.remote.Archive(ctx, id); err != nil {
+				return domain.Message{}, err
+			}
+		}
+		if junk {
+			if err := s.remote.MarkJunk(ctx, id); err != nil {
 				return domain.Message{}, err
 			}
 		}

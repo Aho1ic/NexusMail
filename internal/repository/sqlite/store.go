@@ -75,6 +75,11 @@ type Store struct {
 	// front of a query that costs milliseconds.
 	unreadMu    sync.Mutex
 	unreadCache map[unreadCacheKey]unreadCacheEntry
+	// unreadGen is bumped on every invalidate. A reader that started a count
+	// before a write must not publish that stale total into the cache after
+	// the write has already invalidated — without this the badge could stick
+	// for unreadCacheTTL even though both pre- and post-write invalidates ran.
+	unreadGen uint64
 }
 
 func Open(path string) (*Store, error) {
@@ -595,6 +600,7 @@ type unreadCacheKey struct {
 	hasMailboxID bool
 	folder       string
 	query        string
+	sender       string
 	isRead       bool
 	hasIsRead    bool
 	isStarred    bool
@@ -602,7 +608,7 @@ type unreadCacheKey struct {
 }
 
 func newUnreadCacheKey(filter ports.MessageFilter) unreadCacheKey {
-	key := unreadCacheKey{folder: filter.Folder, query: filter.Query}
+	key := unreadCacheKey{folder: filter.Folder, query: filter.Query, sender: filter.Sender}
 	if filter.AccountID != nil {
 		key.accountID, key.hasAccountID = *filter.AccountID, true
 	}
@@ -627,6 +633,7 @@ func (s *Store) cachedUnreadTotal(ctx context.Context, filter ports.MessageFilte
 	key := newUnreadCacheKey(filter)
 	s.unreadMu.Lock()
 	entry, ok := s.unreadCache[key]
+	gen := s.unreadGen
 	s.unreadMu.Unlock()
 	if ok && time.Now().Before(entry.expiresAt) {
 		return entry.count, true, nil
@@ -638,6 +645,11 @@ func (s *Store) cachedUnreadTotal(ctx context.Context, filter ports.MessageFilte
 	now := time.Now()
 	s.unreadMu.Lock()
 	defer s.unreadMu.Unlock()
+	// A write that landed while we were counting has already invalidated; do
+	// not re-seed the cache with the pre-write total.
+	if s.unreadGen != gen {
+		return count, false, nil
+	}
 	if len(s.unreadCache) >= unreadCacheEntries {
 		s.dropExpiredUnreadLocked(now)
 		if len(s.unreadCache) >= unreadCacheEntries {
@@ -669,6 +681,7 @@ func (s *Store) dropExpiredUnreadLocked(now time.Time) {
 func (s *Store) invalidateUnreadCache() {
 	s.unreadMu.Lock()
 	defer s.unreadMu.Unlock()
+	s.unreadGen++
 	clear(s.unreadCache)
 }
 
@@ -711,6 +724,9 @@ func (s *Store) feedQuery(ctx context.Context, filter ports.MessageFilter, limit
 	if filter.IsRead != nil {
 		query = query.Where("messages.is_read = ?", *filter.IsRead)
 	}
+	if filter.Sender != "" {
+		query = applySenderFilter(query, filter.Sender)
+	}
 	if filter.Query != "" {
 		query = applyMessageSearch(query, filter.Query)
 	}
@@ -738,10 +754,24 @@ func (s *Store) unreadTotal(ctx context.Context, filter ports.MessageFilter) (in
 // renders what this builds rather than a copy of it.
 func (s *Store) unreadQuery(ctx context.Context, filter ports.MessageFilter) *gorm.DB {
 	query := applyMessageScope(s.db.WithContext(ctx).Model(&domain.Message{}), filter)
+	if filter.Sender != "" {
+		query = applySenderFilter(query, filter.Sender)
+	}
 	if filter.Query != "" {
 		query = applyMessageSearch(query, filter.Query)
 	}
 	return query.Where("messages.is_read = 0 AND messages.direction = 'incoming'")
+}
+
+// applySenderFilter matches one mailbox address across the JSON address list and
+// the display sender string. The LIKE is parameterised; % and _ in the address
+// are escaped so a crafted sender cannot widen the match.
+func applySenderFilter(query *gorm.DB, sender string) *gorm.DB {
+	like := "%" + escapeLike(strings.ToLower(sender)) + "%"
+	return query.Where(
+		"(LOWER(messages.from_json) LIKE ? ESCAPE '\\' OR LOWER(messages.sender) LIKE ? ESCAPE '\\')",
+		like, like,
+	)
 }
 
 // applyMessageSearch applies the FTS or LIKE predicate shared by the message feed
@@ -852,8 +882,12 @@ func (s *Store) UpdateMessages(ctx context.Context, ids []int64, patch ports.Mes
 	}
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
+	// Invalidate both before and after the write. A concurrent ListMessages that
+	// lands between the pre-write clear and the commit recounts the old set and
+	// repopulates the cache for unreadCacheTTL — the badge then shows the
+	// pre-mark-read total while the feed already shows the row as read.
 	s.invalidateUnreadCache()
-	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		for start := 0; start < len(ids); start += sqliteParameterChunk {
 			end := min(start+sqliteParameterChunk, len(ids))
 			if err := tx.Model(&domain.Message{}).Where("id IN ?", ids[start:end]).Updates(updates).Error; err != nil {
@@ -862,6 +896,10 @@ func (s *Store) UpdateMessages(ctx context.Context, ids []int64, patch ports.Mes
 		}
 		return nil
 	})
+	if err == nil {
+		s.invalidateUnreadCache()
+	}
+	return err
 }
 
 func (s *Store) GetMessage(ctx context.Context, id int64) (domain.Message, []domain.Attachment, error) {
@@ -877,6 +915,8 @@ func (s *Store) GetMessage(ctx context.Context, id int64) (domain.Message, []dom
 func (s *Store) UpdateMessage(ctx context.Context, id int64, patch ports.MessagePatch) (domain.Message, error) {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
+	// Same double-invalidate as UpdateMessages: a reader that recounts during the
+	// write window must not leave a pre-write total in the cache after the commit.
 	s.invalidateUnreadCache()
 	updates := map[string]any{"updated_at": time.Now().UnixMilli()}
 	if patch.IsRead != nil {
@@ -888,6 +928,7 @@ func (s *Store) UpdateMessage(ctx context.Context, id int64, patch ports.Message
 	if err := s.db.WithContext(ctx).Model(&domain.Message{}).Where("id = ?", id).Updates(updates).Error; err != nil {
 		return domain.Message{}, err
 	}
+	s.invalidateUnreadCache()
 	return s.messageByID(ctx, id)
 }
 

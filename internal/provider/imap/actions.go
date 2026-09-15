@@ -87,7 +87,26 @@ func (s *Supervisor) SetFlags(ctx context.Context, messageID int64, isRead, isSt
 
 func (s *Supervisor) Archive(ctx context.Context, messageID int64) error {
 	return s.onMessageConn(ctx, messageID, func(rt *runtime, client *imapclient.Client, location ports.MessageLocation) error {
-		return s.archiveOn(ctx, rt, client, messageID, location)
+		destination, err := s.ensureArchiveMailbox(ctx, rt, client)
+		if err != nil {
+			return err
+		}
+		return s.moveToMailbox(ctx, client, messageID, location, destination)
+	})
+}
+
+// MarkJunk moves a message into the account's junk/spam folder, creating one on
+// the provider when the account has none — the same contract as Archive.
+func (s *Supervisor) MarkJunk(ctx context.Context, messageID int64) error {
+	return s.onMessageConn(ctx, messageID, func(rt *runtime, client *imapclient.Client, location ports.MessageLocation) error {
+		destination, err := s.ensureJunkMailbox(ctx, rt, client)
+		if err != nil {
+			return err
+		}
+		if destination.ID == location.Mailbox.ID {
+			return nil
+		}
+		return s.moveToMailbox(ctx, client, messageID, location, destination)
 	})
 }
 
@@ -96,6 +115,10 @@ func (s *Supervisor) archiveOn(ctx context.Context, rt *runtime, client *imapcli
 	if err != nil {
 		return err
 	}
+	return s.moveToMailbox(ctx, client, messageID, location, destination)
+}
+
+func (s *Supervisor) moveToMailbox(ctx context.Context, client *imapclient.Client, messageID int64, location ports.MessageLocation, destination domain.Mailbox) error {
 	if destination.ID == location.Mailbox.ID {
 		return nil
 	}
@@ -145,8 +168,13 @@ func (s *Supervisor) archiveOn(ctx context.Context, rt *runtime, client *imapcli
 			return err
 		}
 	default:
-		slog.Warn("archive left message on server: mailbox has other \\Deleted messages and provider lacks UIDPLUS",
-			"account_id", location.Account.ID, "mailbox", location.Mailbox.RemoteName, "uid", location.UID)
+		// Plain EXPUNGE is unsafe here. Leaving the message on the server while
+		// recording a local archive makes the two clients disagree — the user
+		// filed it here and still sees it in the provider's webmail. Fail instead
+		// so the UI can report the truth and the location mapping stays put.
+		// (The COPY already happened; the source still holds the message with
+		// \Deleted until a later safe expunge or UIDPLUS pass.)
+		return ports.Conflictf("archive left message on server: mailbox has other \\Deleted messages and provider lacks UIDPLUS")
 	}
 	var destinationUID *uint32
 	if copyData != nil {
@@ -254,6 +282,54 @@ func archiveCreateOptions(client *imapclient.Client) *goimap.CreateOptions {
 		return nil
 	}
 	return &goimap.CreateOptions{SpecialUse: []goimap.MailboxAttr{goimap.MailboxAttrArchive}}
+}
+
+var junkCandidateNames = []string{"Junk", "Spam", "垃圾邮件"}
+
+func (s *Supervisor) ensureJunkMailbox(ctx context.Context, rt *runtime, client *imapclient.Client) (domain.Mailbox, error) {
+	if mailbox, err := s.repo.GetMailboxByRole(ctx, rt.account.ID, "junk"); err == nil {
+		return mailbox, nil
+	} else if !errors.Is(err, ports.ErrNotFound) {
+		return domain.Mailbox{}, err
+	}
+	items, err := s.refreshMailboxCatalog(ctx, rt, client)
+	if err != nil {
+		return domain.Mailbox{}, err
+	}
+	if mailbox, err := s.repo.GetMailboxByRole(ctx, rt.account.ID, "junk"); err == nil {
+		return mailbox, nil
+	} else if !errors.Is(err, ports.ErrNotFound) {
+		return domain.Mailbox{}, err
+	}
+	var createErrs []error
+	for _, name := range junkCandidateNames {
+		for _, candidate := range archivePaths(name, items) {
+			options := junkCreateOptions(client)
+			if err := client.Create(candidate, options).Wait(); err != nil {
+				createErrs = append(createErrs, fmt.Errorf("create %q: %w", candidate, err))
+				continue
+			}
+			slog.Info("created junk mailbox", "account_id", rt.account.ID, "mailbox", candidate)
+			if _, err := s.refreshMailboxCatalog(ctx, rt, client); err != nil {
+				return domain.Mailbox{}, err
+			}
+			if mailbox, err := s.repo.GetMailboxByRole(ctx, rt.account.ID, "junk"); err == nil {
+				return mailbox, nil
+			}
+			return domain.Mailbox{}, fmt.Errorf("created junk mailbox %q but it did not classify as junk", candidate)
+		}
+	}
+	if len(createErrs) > 0 {
+		return domain.Mailbox{}, ports.Unavailablef("junk mailbox is unavailable: %w", errors.Join(createErrs...))
+	}
+	return domain.Mailbox{}, ports.Unavailablef("junk mailbox is unavailable")
+}
+
+func junkCreateOptions(client *imapclient.Client) *goimap.CreateOptions {
+	if !client.Caps().Has(goimap.Cap("CREATE-SPECIAL-USE")) {
+		return nil
+	}
+	return &goimap.CreateOptions{SpecialUse: []goimap.MailboxAttr{goimap.MailboxAttrJunk}}
 }
 
 // isNoselect reports whether the provider declared this LIST entry unselectable,

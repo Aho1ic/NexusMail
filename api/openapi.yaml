@@ -250,6 +250,7 @@ paths:
         - { in: query, name: folder, schema: { type: string } }
         - { in: query, name: is_read, schema: { type: boolean } }
         - { in: query, name: is_starred, description: Only starred (favourited) messages; the starred view spans every account and folder, schema: { type: boolean } }
+        - { in: query, name: sender, description: Narrow to one sender mailbox address (case-insensitive substring match on from_json/sender); used by the sender-stack pane, schema: { type: string } }
         - { in: query, name: query, schema: { type: string } }
         - { in: query, name: cursor, schema: { type: string } }
         - in: query
@@ -292,6 +293,7 @@ paths:
         - { in: query, name: folder, schema: { type: string } }
         - { in: query, name: is_starred, schema: { type: boolean } }
         - { in: query, name: query, description: Same full-text term as the feed; restricts the pass to the matching messages, schema: { type: string } }
+        - { in: query, name: sender, description: Same sender filter as the feed, schema: { type: string } }
       responses:
         '200':
           description: Number of messages marked read
@@ -336,6 +338,7 @@ paths:
                 is_read: { type: boolean }
                 is_starred: { type: boolean }
                 archive: { type: boolean }
+                junk: { type: boolean, description: Move the message to the account's junk/spam mailbox }
       responses:
         '200':
           description: Updated message
@@ -345,6 +348,55 @@ paths:
         '503': { $ref: '#/components/responses/Error' }
         '401': { $ref: '#/components/responses/Error' }
         '403': { $ref: '#/components/responses/Error' }
+  /api/v1/messages/{id}/calendar:
+    get:
+      summary: Download/open one message as a calendar event (ICS)
+      description: >-
+        Serves text/calendar inline so a macOS browser can hand the event to
+        Calendar.app with fields pre-filled. Answers 400 when the message has
+        no usable date and no received_at.
+      parameters: [ { $ref: '#/components/parameters/ID' } ]
+      responses:
+        '200':
+          description: ICS payload
+          content:
+            text/calendar:
+              schema: { type: string }
+        '400': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/Error' }
+  /api/v1/messages/{id}/translate:
+    post:
+      summary: Translate a message body for display
+      description: >-
+        Requires NEXUSMAIL_TRANSLATE_URL on the gateway. Without it the call is
+        400 translate_not_configured. The message row is never rewritten; the
+        translation is returned for the client to show beside the original.
+      parameters: [ { $ref: '#/components/parameters/ID' } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [target_lang]
+              properties:
+                target_lang: { type: string, example: zh-CN }
+      responses:
+        '200':
+          description: Translation result
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [text]
+                properties:
+                  text: { type: string }
+                  detected_source_lang: { type: string }
+        '400': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+        '502': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/Error' }
   /api/v1/messages/{id}/attachments/{attachment_id}:
     get:
       summary: Fetch and stream an attachment

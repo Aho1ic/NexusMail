@@ -79,6 +79,9 @@ func (f *fakeRemote) Archive(context.Context, int64) error {
 	f.archiveCalls++
 	return f.archiveErr
 }
+func (f *fakeRemote) MarkJunk(context.Context, int64) error {
+	return f.archiveErr
+}
 
 type recorder struct{ events []ports.Event }
 
@@ -122,7 +125,7 @@ func TestPatchRejectsEmptyPatch(t *testing.T) {
 	events := &recorder{}
 	service := New(store, remote, events)
 
-	_, err := service.Patch(context.Background(), 1, ports.MessagePatch{}, false)
+	_, err := service.Patch(context.Background(), 1, ports.MessagePatch{}, false, false)
 	if !errors.Is(err, ports.ErrInvalidInput) {
 		t.Fatalf("err = %v, want ErrInvalidInput", err)
 	}
@@ -148,7 +151,7 @@ func TestPatchDoesNotWriteLocallyWhenRemoteFails(t *testing.T) {
 			store := &fakeStore{}
 			events := &recorder{}
 			service := New(store, tc.remote, events)
-			if _, err := service.Patch(context.Background(), 9, tc.patch, tc.arch); err == nil {
+			if _, err := service.Patch(context.Background(), 9, tc.patch, tc.arch, false); err == nil {
 				t.Fatal("expected the remote failure to surface")
 			}
 			if store.patchedID != 0 {
@@ -167,7 +170,7 @@ func TestPatchAppliesFlagsThenArchiveThenPublishes(t *testing.T) {
 	events := &recorder{}
 	service := New(store, remote, events)
 
-	got, err := service.Patch(context.Background(), 9, ports.MessagePatch{IsRead: ptr(true), IsStarred: ptr(false)}, true)
+	got, err := service.Patch(context.Background(), 9, ports.MessagePatch{IsRead: ptr(true), IsStarred: ptr(false)}, true, false)
 	if err != nil || got.ID != 9 {
 		t.Fatalf("Patch = %+v, %v", got, err)
 	}
@@ -190,7 +193,7 @@ func TestPatchAppliesFlagsThenArchiveThenPublishes(t *testing.T) {
 func TestPatchArchiveOnlySkipsSetFlags(t *testing.T) {
 	remote := &fakeRemote{}
 	service := New(&fakeStore{}, remote, &recorder{})
-	if _, err := service.Patch(context.Background(), 4, ports.MessagePatch{}, true); err != nil {
+	if _, err := service.Patch(context.Background(), 4, ports.MessagePatch{}, true, false); err != nil {
 		t.Fatal(err)
 	}
 	if remote.flagCalls != 0 {
@@ -203,7 +206,7 @@ func TestPatchWithoutRemoteStillWritesLocally(t *testing.T) {
 	store := &fakeStore{message: domain.Message{ID: 3}}
 	events := &recorder{}
 	service := New(store, nil, events)
-	if _, err := service.Patch(context.Background(), 3, ports.MessagePatch{IsStarred: ptr(true)}, false); err != nil {
+	if _, err := service.Patch(context.Background(), 3, ports.MessagePatch{IsStarred: ptr(true)}, false, false); err != nil {
 		t.Fatal(err)
 	}
 	if store.patchedID != 3 || len(events.events) != 1 {
@@ -220,7 +223,7 @@ func TestPatchSkipsTheProviderForOutgoingMail(t *testing.T) {
 	events := &recorder{}
 	service := New(store, remote, events)
 
-	if _, err := service.Patch(context.Background(), 12, ports.MessagePatch{IsStarred: ptr(true)}, false); err != nil {
+	if _, err := service.Patch(context.Background(), 12, ports.MessagePatch{IsStarred: ptr(true)}, false, false); err != nil {
 		t.Fatal(err)
 	}
 	if remote.flagCalls != 0 || remote.archiveCalls != 0 {
@@ -237,7 +240,7 @@ func TestPatchPropagatesAMissingMessage(t *testing.T) {
 	store := &fakeStore{getErr: ports.NotFoundf("no such message")}
 	remote := &fakeRemote{}
 	service := New(store, remote, &recorder{})
-	if _, err := service.Patch(context.Background(), 1, ports.MessagePatch{IsRead: ptr(true)}, false); !errors.Is(err, ports.ErrNotFound) {
+	if _, err := service.Patch(context.Background(), 1, ports.MessagePatch{IsRead: ptr(true)}, false, false); !errors.Is(err, ports.ErrNotFound) {
 		t.Fatalf("err = %v, want ErrNotFound", err)
 	}
 	if remote.flagCalls != 0 {
@@ -248,7 +251,7 @@ func TestPatchPropagatesAMissingMessage(t *testing.T) {
 func TestPatchDoesNotPublishWhenTheWriteFails(t *testing.T) {
 	events := &recorder{}
 	service := New(&fakeStore{patchErr: errors.New("busy")}, nil, events)
-	if _, err := service.Patch(context.Background(), 1, ports.MessagePatch{IsRead: ptr(true)}, false); err == nil {
+	if _, err := service.Patch(context.Background(), 1, ports.MessagePatch{IsRead: ptr(true)}, false, false); err == nil {
 		t.Fatal("expected the write error to surface")
 	}
 	if len(events.events) != 0 {
