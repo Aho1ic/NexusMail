@@ -36,25 +36,25 @@ export function SenderThreadPane({ label, email, messages, loading, error, onBac
       {!loading && !error && messages.length === 0 && <p className="mt-8 text-center text-sm text-black/40">没有找到该发件人的邮件。</p>}
       <div role="list" aria-label={`${label} 的邮件`} className="mx-auto max-w-3xl">
         {messages.map(message => (
-          <button
-            key={message.id}
-            role="listitem"
-            onClick={() => onOpen(message)}
-            className="row-lift mb-1.5 w-full rounded-card bg-white p-4 text-left hover:bg-sage/40"
-          >
-            <div className="flex items-start justify-between gap-3">
-              <div className={`truncate text-sm ${!message.is_read ? 'font-bold' : 'font-medium text-black/70'}`}>{message.subject || '（无主题）'}</div>
-              <time className="shrink-0 text-[10px] text-black/35" title={formatFullDate(message.received_at)}>{formatDate(message.received_at)}</time>
-            </div>
-            {!message.is_read && <span className="sr-only">未读</span>}
-            <p className="mt-1.5 line-clamp-2 text-xs leading-5 text-black/45">{message.snippet || '正文尚未同步'}</p>
-            <div className="mt-2 flex items-center gap-2 text-black/25">
-              <span className="truncate text-[10px] text-black/30">{senderLabel(message)}</span>
-              {message.has_attachments && <Paperclip size={12} />}
-              {message.is_starred && <Star size={12} className="fill-amber-400 text-amber-400" />}
-              {!message.is_read && <span className="ml-auto h-2 w-2 rounded-full bg-coral" aria-hidden />}
-            </div>
-          </button>
+          <div role="listitem" key={message.id}>
+            <button
+              onClick={() => onOpen(message)}
+              className="row-lift mb-1.5 w-full rounded-card bg-white p-4 text-left hover:bg-sage/40"
+            >
+              <div className="flex items-start justify-between gap-3">
+                <div className={`truncate text-sm ${!message.is_read ? 'font-bold' : 'font-medium text-black/70'}`}>{message.subject || '（无主题）'}</div>
+                <time className="shrink-0 text-[10px] text-black/35" title={formatFullDate(message.received_at)}>{formatDate(message.received_at)}</time>
+              </div>
+              {!message.is_read && <span className="sr-only">未读</span>}
+              <p className="mt-1.5 line-clamp-2 text-xs leading-5 text-black/45">{message.snippet || '正文尚未同步'}</p>
+              <div className="mt-2 flex items-center gap-2 text-black/25">
+                <span className="truncate text-[10px] text-black/30">{senderLabel(message)}</span>
+                {message.has_attachments && <Paperclip size={12} />}
+                {message.is_starred && <Star size={12} className="fill-amber-400 text-amber-400" />}
+                {!message.is_read && <span className="ml-auto h-2 w-2 rounded-full bg-coral" aria-hidden />}
+              </div>
+            </button>
+          </div>
         ))}
       </div>
     </div>
