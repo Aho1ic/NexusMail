@@ -199,6 +199,21 @@ describe('the keyboard hook in isolation', () => {
     expect(archive).toHaveBeenCalledTimes(1)
   })
 
+  // Cmd/Ctrl+C is copy and Cmd+E is a system/browser binding; the single-key
+  // shortcuts must never steal them, or editing a selection would open the
+  // composer and a fat-fingered Cmd+E would archive the open mail.
+  it('ignores keys held with a modifier', () => {
+    const { open, compose, archive } = probe(true, inbox[1])
+    fireEvent.keyDown(window, { key: 'c', metaKey: true })
+    fireEvent.keyDown(window, { key: 'c', ctrlKey: true })
+    fireEvent.keyDown(window, { key: 'e', metaKey: true })
+    fireEvent.keyDown(window, { key: 'j', ctrlKey: true })
+    fireEvent.keyDown(window, { key: 'e', altKey: true })
+    expect(open).not.toHaveBeenCalled()
+    expect(compose).not.toHaveBeenCalled()
+    expect(archive).not.toHaveBeenCalled()
+  })
+
   it('composes whether or not anything is selected', () => {
     const { compose } = probe(true, null)
     fireEvent.keyDown(window, { key: 'c' })

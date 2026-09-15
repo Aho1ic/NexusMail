@@ -203,6 +203,22 @@ function MailboxApp({ onLogout }: { onLogout: () => void }) {
   // A stack belongs to one view. Leaving it must not keep the previous sender's
   // list on the reading pane under a different folder title.
   useEffect(() => { setStackFocus(null); setSelected(null); setDetails(null) }, [starredView, selectedAccount, selectedMailbox])
+  // Keep an open sender stack in step with the feed: a quiet refresh or a
+  // mark-read elsewhere must not leave a stale snapshot of read flags or hide
+  // mail that just arrived from that sender in the loaded page.
+  useEffect(() => {
+    setStackFocus(current => {
+      if (!current) return current
+      const byID = new Map(messages.map(item => [item.id, item]))
+      const extra = messages.filter(item => senderEmail(item) === current.email && !current.messages.some(row => row.id === item.id))
+      const updated = current.messages.map(item => byID.get(item.id) ?? item)
+      const next = extra.length > 0 ? [...updated, ...extra].sort((a, b) => b.received_at - a.received_at) : updated
+      if (next.length === current.messages.length && next.every((item, index) => item.is_read === current.messages[index].is_read && item.id === current.messages[index].id)) {
+        return current
+      }
+      return { ...current, messages: next }
+    })
+  }, [messages])
   // Only the folder list is loaded here. Clearing the selected mailbox belongs to
   // the two handlers that change the account, which do it in the same render — an
   // effect would clear it one render late and spend a feed request on a mailbox the
