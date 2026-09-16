@@ -1,4 +1,4 @@
-import { ArrowLeft, Paperclip, Star } from 'lucide-react'
+import { ArrowLeft, LoaderCircle, Paperclip, Star } from 'lucide-react'
 import { formatDate, formatFullDate } from '../lib/format'
 import { senderLabel } from '../lib/sender'
 import type { Message } from '../types'
@@ -15,6 +15,11 @@ type Props = {
 
 // The reading pane while a sender stack is open: one list of that sender's mail,
 // then a click opens the real detail the pane normally shows.
+//
+// Loading keeps the already-shown rows in place and only swaps in a quiet
+// header spinner. A full-width "loading…" paragraph that mounts above the list
+// (and unmounts when the fetch lands) pushed every row down and back up — the
+// vertical smear the user saw when opening a stack.
 export function SenderThreadPane({ label, email, messages, loading, error, onBack, onOpen }: Props) {
   return <>
     <header className="flex items-center justify-between border-b border-black/5 px-5 py-4">
@@ -22,21 +27,23 @@ export function SenderThreadPane({ label, email, messages, loading, error, onBac
       <div className="min-w-0 flex-1 px-3 text-center">
         <p className="text-[10px] font-bold uppercase tracking-[.2em] text-pine/40">Sender stack</p>
         <h1 className="truncate font-serif text-xl">{label}</h1>
-        <p className="truncate text-[11px] text-black/40">{email}</p>
+        <p className="flex min-w-0 items-center justify-center gap-1.5 truncate text-[11px] text-black/40">
+          <span className="truncate">{email}</span>
+          {loading && <LoaderCircle size={12} className="shrink-0 animate-spin text-pine/40" aria-label="正在同步" />}
+        </p>
       </div>
       <span className="w-9" aria-hidden />
     </header>
     <div className="no-scrollbar flex-1 overflow-y-auto px-4 py-4 xl:px-8">
-      {loading && <p className="mt-8 text-center text-sm text-black/40">正在加载该发件人的邮件…</p>}
-      {!loading && error && <div role="alert" className="mx-auto mt-8 max-w-md rounded-card bg-red-50 p-4 text-sm text-red-700 shadow-lift-1">
+      {error && <div role="alert" className="mx-auto mb-3 max-w-md rounded-card bg-red-50 p-4 text-sm text-red-700 shadow-lift-1">
         <p className="font-semibold">加载失败</p>
         <p className="mt-1 leading-5">{error}</p>
         <p className="mt-2 text-xs text-red-700/60">下方仍显示已加载的部分邮件。</p>
       </div>}
       {!loading && !error && messages.length === 0 && <p className="mt-8 text-center text-sm text-black/40">没有找到该发件人的邮件。</p>}
-      <div role="list" aria-label={`${label} 的邮件`} className="mx-auto max-w-3xl">
+      <div role="list" aria-label={`${label} 的邮件`} className="sender-thread-list mx-auto max-w-3xl">
         {messages.map(message => (
-          <div role="listitem" key={message.id}>
+          <div role="listitem" key={message.id} className="sender-thread-item">
             <button
               onClick={() => onOpen(message)}
               className="row-lift mb-1.5 w-full rounded-card bg-white p-4 text-left hover:bg-sage/40"

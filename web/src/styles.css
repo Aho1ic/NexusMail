@@ -71,6 +71,31 @@
   .menu-item { @apply flex w-full cursor-pointer items-center gap-2.5 px-3.5 py-2.5 text-left text-sm text-black/75 transition-colors hover:bg-sage/70 hover:text-pine; }
   .menu-item-danger { @apply flex w-full cursor-pointer items-center gap-2.5 px-3.5 py-2.5 text-left text-sm font-semibold text-red-600 transition-colors hover:bg-red-50; }
 
+  /* Sender-stack list: fade + settle instead of a vertical jump when the
+     server page replaces the local subset. Stagger is tiny so the pane never
+     feels slow — it only kills the "rows slid down" smear. */
+  .sender-thread-list { animation: thread-settle 220ms ease-out both; }
+  .sender-thread-item { animation: thread-row 260ms ease-out both; }
+  .sender-thread-item:nth-child(1) { animation-delay: 0ms; }
+  .sender-thread-item:nth-child(2) { animation-delay: 20ms; }
+  .sender-thread-item:nth-child(3) { animation-delay: 40ms; }
+  .sender-thread-item:nth-child(4) { animation-delay: 60ms; }
+  .sender-thread-item:nth-child(5) { animation-delay: 80ms; }
+  .sender-thread-item:nth-child(n+6) { animation-delay: 100ms; }
+
+  @keyframes thread-settle {
+    from { opacity: 0.72; }
+    to { opacity: 1; }
+  }
+  @keyframes thread-row {
+    from { opacity: 0; transform: translateY(6px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .sender-thread-list, .sender-thread-item { animation: none; }
+  }
+
   /* The global 8px scrollbar is right for panes and wrong for a 40px-tall chip
      row, where it parks a permanent bar under the labels. */
   .no-scrollbar { scrollbar-width: none; }

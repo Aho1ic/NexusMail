@@ -60,6 +60,7 @@ test('opens a sender stack and then an individual message', async ({ page }) => 
   const stack = page.getByRole('button', { name: 'Sender 的 2 封邮件' })
   await expect(stack).toBeVisible()
   await stack.click()
+  await expect(stack).toHaveAttribute('aria-current', 'true')
 
   await expect(page.getByText('Sender stack')).toBeVisible()
   await expect(page.getByRole('button', { name: /A-2/ })).toBeVisible()

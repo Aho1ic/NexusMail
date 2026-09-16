@@ -52,27 +52,35 @@ export function MessageList({ visible, title, entries, accountMap, selected, sel
 
 function StackRow({ entry, account, accountColors, active, onClick }: { entry: Extract<ListEntry, { kind: 'stack' }>; account?: Account; accountColors?: Record<string, string>; active: boolean; onClick: () => void }) {
   const latest = entry.latest
-  return <div className="relative mb-2">
-    <div aria-hidden className={`absolute inset-x-1 top-1 bottom-0 rounded-card border border-black/5 ${entry.unread ? 'bg-white' : 'bg-paper'}`} />
-    <button onClick={onClick} aria-label={`${entry.label} 的 ${entry.messages.length} 封邮件`} className={`relative w-full rounded-card p-4 text-left ${active ? 'bg-sage shadow-lift-2 transition' : entry.unread ? 'bg-white shadow-lift-1' : 'row-lift bg-[#fbfaf6] hover:bg-white'}`}>
+  return <div className={`relative mb-2 ${active ? 'is-active' : ''}`}>
+    {/* The layered cards sell "stack". When the row is selected the sheet under
+        the button must not fight the sage fill — recolour it so the active state
+        reads as one solid selected row, not a white card in front of green. */}
+    <div aria-hidden className={`absolute inset-x-1 top-1 bottom-0 rounded-card border transition-colors ${active ? 'border-pine/15 bg-sage/70' : entry.unread ? 'border-black/5 bg-white' : 'border-black/5 bg-paper'}`} />
+    <button
+      onClick={onClick}
+      aria-label={`${entry.label} 的 ${entry.messages.length} 封邮件`}
+      aria-current={active ? 'true' : undefined}
+      className={`relative z-10 w-full rounded-card p-4 text-left transition-colors ${active ? 'bg-sage shadow-lift-2' : entry.unread ? 'bg-white shadow-lift-1' : 'row-lift bg-[#fbfaf6] hover:bg-white'}`}
+    >
       <div className="flex items-start justify-between gap-3">
         <div className="flex min-w-0 items-center gap-2">
           <Layers size={15} className="shrink-0 text-pine/50" />
-          <div className={`truncate text-sm ${entry.unread ? 'font-bold' : 'font-medium text-black/65'}`}>{entry.label}</div>
+          <div className={`truncate text-sm ${active || !entry.unread ? 'font-medium text-black/70' : 'font-bold'}`}>{entry.label}</div>
         </div>
         <div className="flex shrink-0 items-center gap-1.5">
           <time className="text-[10px] text-black/35">{formatDate(latest.received_at)}</time>
-          <span className={`h-2 w-2 rounded-full ${entry.unread ? 'bg-coral' : 'invisible'}`} aria-hidden />
+          <span className={`h-2 w-2 rounded-full ${entry.unread && !active ? 'bg-coral' : 'invisible'}`} aria-hidden />
         </div>
       </div>
       {entry.unread > 0 && <span className="sr-only">{entry.unread} 封未读</span>}
-      <div className="mt-1 truncate text-sm font-semibold text-black/70">{entry.messages.length} 封邮件 · {latest.subject || '（无主题）'}</div>
+      <div className={`mt-1 truncate text-sm ${active ? 'font-medium text-black/75' : 'font-semibold text-black/70'}`}>{entry.messages.length} 封邮件 · {latest.subject || '（无主题）'}</div>
       <p className="mt-1.5 line-clamp-2 text-xs leading-5 text-black/40">{latest.snippet || '正文尚未同步'}</p>
       <div className="mt-3 flex items-center justify-between">
         {account
           ? <span style={chipStyle(accountColor(account.id, accountColors))} className="rounded-full px-2 py-1 text-[9px] font-bold tracking-wide">{account.display_name || providerLabel(account.provider)}</span>
           : <span className="rounded-full bg-black/[.04] px-2 py-1 text-[9px] font-bold tracking-wide text-black/35">Mail</span>}
-        <span className="rounded-full bg-pine/10 px-2 py-1 text-[9px] font-bold tracking-wide text-pine">{entry.messages.length}</span>
+        <span className={`rounded-full px-2 py-1 text-[9px] font-bold tracking-wide ${active ? 'bg-white/70 text-pine' : 'bg-pine/10 text-pine'}`}>{entry.messages.length}</span>
       </div>
     </button>
   </div>
@@ -96,7 +104,7 @@ function MessageRow({ message, account, accountColors, active, revealed, onClick
     const centered = box.scrollTop + rowRect.top - boxRect.top - (boxRect.height - rowRect.height) / 2
     box.scrollTop = Math.max(centered, 0)
   }, [revealed])
-  return <button ref={node} onClick={onClick} data-revealed={revealed ? '' : undefined} style={{ contentVisibility: 'auto', containIntrinsicSize: '144px' }} className={`group relative mb-1 w-full rounded-card p-4 text-left ${active ? 'bg-sage shadow-lift-2 transition' : 'row-lift hover:bg-white'} ${!message.is_read ? 'bg-white' : ''} ${revealed ? 'ring-2 ring-coral' : ''}`}>
+  return <button ref={node} onClick={onClick} data-revealed={revealed ? '' : undefined} style={{ contentVisibility: 'auto', containIntrinsicSize: '144px' }} className={`group relative mb-1 w-full rounded-card p-4 text-left ${active ? 'bg-sage shadow-lift-2 transition' : !message.is_read ? 'bg-white' : 'row-lift hover:bg-white'} ${revealed ? 'ring-2 ring-coral' : ''}`}>
     <div className="flex items-start justify-between gap-3"><div className={`truncate text-sm ${!message.is_read ? 'font-bold' : 'font-medium text-black/65'}`}>{displaySender(message.sender)}</div><div className="flex shrink-0 items-center gap-1.5"><time className="text-[10px] text-black/35">{formatDate(message.received_at)}</time><span className={`h-2 w-2 rounded-full ${message.is_read ? 'invisible' : 'bg-coral'}`} aria-hidden /></div></div>
     {!message.is_read && <span className="sr-only">未读</span>}
     <div className={`mt-1 truncate text-sm ${!message.is_read ? 'font-semibold' : 'text-black/55'}`}>{message.subject || '（无主题）'}</div>
